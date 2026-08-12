@@ -65,6 +65,7 @@ dashboard so the whole system fits in a single indicator slot.
 | Input | Default | Purpose |
 |---|---|---|
 | `Show VWAP ±1σ bands` | `true` | Plot the ±1σ bands and their fill. |
+| `London VWAP warm-up (bars)` | `6` | Keep using the CME anchor until the London anchor has this many confirmed bars. A freshly re-anchored VWAP sits on price with σ ≈ 0, which would make the VWAP component random exactly during the London open. |
 
 ### EMAs / HTF regime
 | Input | Default | Purpose |
@@ -124,8 +125,8 @@ dashboard so the whole system fits in a single indicator slot.
 
 | Component | Points | Requirement |
 |---|---|---|
-| Anchored VWAP | 2 | Price on the correct side **and** VWAP sloping the right way. |
-| HTF regime | 2 | 1H EMA 21/50 stacked (with separation) **and** 15m EMA 21 aligned. |
+| Anchored VWAP | 2 | Price on the correct side **and** VWAP sloping the right way (slope taken per-anchor). |
+| HTF regime | 2 | 1H EMA 21/50 stacked, separated by > `minSepATR × ATR(1H)`, sloping over `slopeLookback`, **and** 15m EMA 21 aligned. |
 | Structure | 2 | **London:** 2 consecutive closes beyond the Asia range. **Asia:** 2 consecutive closes beyond the session VWAP. |
 | RVOL | 1 | Time-of-day relative volume above threshold. |
 | Cumulative delta | 2 | CVD on the correct side of its EMA **and** the current bar's delta agreeing. |
@@ -139,6 +140,11 @@ exceeds the opposite side's**, subject to gating (below).
   (failed breakout); the mirror applies to shorts.
 - **Range-expansion filter:** session range ÷ 20-day ADR. ≥ 0.50 = expansion,
   0.30–0.50 = neutral, < 0.30 = **rotation → all signals suppressed**.
+  **Applied during London only.** The session range accumulates from the 18:00
+  CME open, so during Asia only a couple of hours have elapsed and the ratio is
+  inherently small — testing it there would flag nearly every session as rotation
+  and suppress Asia permanently. Asia passes this gate unconditionally; the
+  dashboard still shows the day type during Asia, marked `(info)`.
 - **Gating:** signals fire only when inside an *enabled* trade window, before the
   cutoff, the expansion filter passes, and the bar is confirmed
   (`barstate.isconfirmed`).
@@ -192,6 +198,13 @@ Cells are color-coded green / red / gray by state.
   it reflects yesterday's 20-day average, not an intraday update.
 - **Session strings are timezone-sensitive.** Changing the timezone input without
   adjusting the session windows will shift what counts as "Asia" or "London".
+- **Asia has no range-expansion gate.** Because the rotation test is meaningless
+  that early in the session (see above), Asia signals are *not* filtered for
+  rotation days. Asia is the rotational session by thesis, so treat Asia signals
+  as inherently lower-conviction than London ones.
+- **The London VWAP anchor is delayed by design.** For the first `londonVwapWarmup`
+  bars after 03:00 the script is still reading the CME-anchored VWAP, so the VWAP
+  component reflects the whole overnight session rather than the London open.
 - **Everything is an untested hypothesis.** Thresholds, weights, and windows are
   starting guesses, not optimized or validated parameters.
 
