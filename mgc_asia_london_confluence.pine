@@ -1,0 +1,532 @@
+//@version=6
+// =============================================================================
+// MGC Asia/London Confluence Indicator
+// -----------------------------------------------------------------------------
+// DISCLAIMER: This script is NOT financial advice. It is a research/education
+// tool. Every parameter and threshold in it is an UNTESTED HYPOTHESIS about how
+// Micro Gold behaves across the Asia and London sessions. Nothing here is
+// validated, back-tested, or guaranteed. Trade your own money at your own risk.
+//
+// Instrument: Micro Gold (MGC, 10 troy oz, COMEX). Tick 0.10 = $1.00/contract.
+// Intended chart: 5-minute. Intended plan: TradingView PLUS (not Premium).
+//
+// KEY APPROXIMATION: This plan cannot use request.footprint() (Premium/Ultimate
+// only), so "delta" is NOT true order flow. It is approximated from 1-minute
+// intrabars using the tick rule (intrabar close > open => buy volume,
+// close < open => sell volume, equal => split 50/50, i.e. net 0). Treat CVD as
+// a rough participation proxy, not real bid/ask delta.
+//
+// NO REPAINTING: every request.security() / request.security_lower_tf() uses
+// lookahead = barmerge.lookahead_off, and all confirmation logic is gated on
+// barstate.isconfirmed.
+// =============================================================================
+
+indicator("MGC Asia/London Confluence", shorttitle="MGC A/L", overlay=true, max_boxes_count=50, max_lines_count=50, max_labels_count=100)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// ---- General / instrument ----------------------------------------------------
+grpInst      = "Instrument"
+dollarPerTick = input.float(1.0, "$ per tick (MGC=1.0, GC=10.0)", minval=0.0, group=grpInst, tooltip="Dollar value of one minimum tick move. MGC = $1.00 per 0.10 move. Change to reuse on GC.")
+
+// ---- Timezone / sessions -----------------------------------------------------
+grpSess = "Sessions"
+tz        = input.string("America/New_York", "Session timezone", options=["America/New_York", "America/Chicago"], group=grpSess)
+asiaRangeSess   = input.session("1800-0200", "Asia RANGE build (CME open -> Tokyo close)", group=grpSess, tooltip="Builds the range. NOT a trade window.")
+asiaTradeSess   = input.session("2000-0200", "Asia TRADE window (after Shanghai open)", group=grpSess)
+londonTradeSess = input.session("0300-0700", "London TRADE window (London open onward)", group=grpSess)
+noNewAfterSess  = input.session("0700-0715", "No-new-entries cutoff window", group=grpSess, tooltip="Hard cutoff: no new entries once this window begins.")
+enableAsia   = input.bool(true,  "Enable Asia trade window",   group=grpSess)
+enableLondon = input.bool(true,  "Enable London trade window", group=grpSess)
+
+// ---- Scoring thresholds ------------------------------------------------------
+grpScore = "Scoring"
+signalThreshold = input.int(6, "Signal score (>=)", minval=1, maxval=10, group=grpScore)
+strongThreshold = input.int(8, "Strong score (>=)", minval=1, maxval=10, group=grpScore)
+
+// ---- Anchored VWAP -----------------------------------------------------------
+grpVwap = "Anchored VWAP"
+showVwapBands = input.bool(true, "Show VWAP +/-1 sigma bands", group=grpVwap)
+
+// ---- EMAs / HTF regime -------------------------------------------------------
+grpEma = "EMAs / HTF regime"
+emaFastLen   = input.int(21, "Fast EMA length", minval=1, group=grpEma)
+emaSlowLen   = input.int(50, "Slow EMA length", minval=1, group=grpEma)
+minSepATR    = input.float(0.15, "Min EMA separation (x ATR)", minval=0.0, step=0.01, group=grpEma, tooltip="Fast/slow EMAs must be separated by more than this * ATR. Avoids crossover whipsaw.")
+slopeLookback = input.int(5, "EMA slope lookback (bars)", minval=1, group=grpEma)
+htfRegimeTF  = input.timeframe("60", "HTF regime timeframe", group=grpEma)
+htfConfirmTF = input.timeframe("15", "HTF confirm timeframe", group=grpEma)
+
+// ---- RVOL --------------------------------------------------------------------
+grpRvol = "RVOL (time-of-day)"
+rvolThreshold = input.float(1.5, "RVOL threshold", minval=0.0, step=0.1, group=grpRvol)
+rvolN         = input.int(20, "RVOL EWMA period (N)", minval=1, group=grpRvol, tooltip="alpha = 2/(N+1). Baseline is an EWMA of volume at each clock-minute across sessions.")
+
+// ---- Delta / CVD -------------------------------------------------------------
+grpDelta = "Delta / CVD"
+deltaTF        = input.timeframe("1", "Delta lower timeframe", group=grpDelta, tooltip="Seconds are unreliable on Plus; default 1m gives ~5 intrabars on a 5m chart.")
+cvdEmaLen      = input.int(21, "CVD EMA length", minval=1, group=grpDelta)
+deltaDivLookback = input.int(10, "Delta-divergence lookback (bars)", minval=2, group=grpDelta)
+
+// ---- RSI / divergence --------------------------------------------------------
+grpRsi = "RSI / divergence"
+rsiLen      = input.int(14, "RSI length", minval=1, group=grpRsi)
+pivotLeft   = input.int(5, "Pivot left bars",  minval=1, group=grpRsi)
+pivotRight  = input.int(2, "Pivot right bars", minval=1, group=grpRsi, tooltip="Divergence confirms pivotRight bars late by construction.")
+maxBarsBetween = input.int(40, "Max bars between pivots", minval=1, group=grpRsi)
+
+// ---- Range expansion / trend-day filter -------------------------------------
+grpExp = "Range expansion filter"
+expansionRatio = input.float(0.50, "Expansion day ratio (>=)", minval=0.0, step=0.05, group=grpExp, tooltip="Session range / 20-day ADR at or above this = expansion day.")
+rotationRatio  = input.float(0.30, "Rotation day ratio (<)",   minval=0.0, step=0.05, group=grpExp, tooltip="Below this = rotation day; ALL signals suppressed.")
+adrDays        = input.int(20, "ADR lookback (days)", minval=1, group=grpExp)
+
+// ---- Position sizing / risk --------------------------------------------------
+grpRisk = "Risk / sizing (Topstep 150K)"
+atrLen        = input.int(14, "ATR length", minval=1, group=grpRisk)
+stopMult      = input.float(1.5, "Stop = ATR x", minval=0.1, step=0.1, group=grpRisk)
+riskUSD       = input.float(300.0, "Risk per trade ($)", minval=0.0, group=grpRisk, tooltip="~0.67% of the ~$4,500 trailing drawdown buffer.")
+maxContracts  = input.int(20, "Max contracts", minval=1, group=grpRisk)
+dailyLossLimit = input.float(3000.0, "Daily loss limit ($, incl. unrealized)", minval=0.0, group=grpRisk)
+trailingDD     = input.float(4500.0, "Trailing max drawdown ($, EOD balance)", minval=0.0, group=grpRisk)
+
+// ---- Alerts ------------------------------------------------------------------
+grpAlerts = "Alerts"
+debounceBars = input.int(6, "Signal debounce (bars)", minval=1, group=grpAlerts, tooltip="Suppress repeat signals on the same side within this many bars.")
+
+// =============================================================================
+// SESSION STATE
+// =============================================================================
+// In-session detection: time(tf, session, tz) returns na when outside session.
+inRange       = not na(time(timeframe.period, asiaRangeSess,   tz))
+inAsiaTrade   = not na(time(timeframe.period, asiaTradeSess,   tz))
+inLondonTrade = not na(time(timeframe.period, londonTradeSess, tz))
+inCutoff      = not na(time(timeframe.period, noNewAfterSess,  tz))
+
+// Session-edge triggers (the "session and not session[1]" idiom).
+cmeReset    = inRange       and not inRange[1]        // first bar of 18:00 CME open
+londonReset = inLondonTrade and not inLondonTrade[1]  // first bar of 03:00 London open
+
+// Track whether London has begun this CME-day; controls which anchored VWAP is active.
+var bool londonStarted = false
+if cmeReset
+    londonStarted := false
+if londonReset
+    londonStarted := true
+
+// =============================================================================
+// CORE SERIES
+// =============================================================================
+atrVal = ta.atr(atrLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+// Chart EMAs (plotted for context). Trend logic uses slope + separation on the
+// HTF regime below, never raw chart crossovers (which whipsaw on MGC in Asia).
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+// =============================================================================
+// ANCHORED VWAP (reusable, reset-condition driven)
+// Bands from cumulative variance: Sum(p^2 v)/Sum(v) - vwap^2, floored at 0.
+// NOTE: Pine has no compound assignment (+=), so accumulators use x := x + ...
+// =============================================================================
+f_anchoredVwap(bool resetCond, float src, float vol) =>
+    var float sumPV  = 0.0
+    var float sumV   = 0.0
+    var float sumP2V = 0.0
+    if resetCond
+        sumPV  := 0.0
+        sumV   := 0.0
+        sumP2V := 0.0
+    v = na(vol) ? 0.0 : vol
+    sumPV  := sumPV  + src * v
+    sumV   := sumV   + v
+    sumP2V := sumP2V + src * src * v
+    float vwap = sumV > 0 ? sumPV / sumV : src
+    float variance = sumV > 0 ? math.max(sumP2V / sumV - vwap * vwap, 0.0) : 0.0
+    float sd = math.sqrt(variance)
+    [vwap, sd]
+
+srcVwap = hlc3
+[cmeVwap, cmeSd]       = f_anchoredVwap(cmeReset,    srcVwap, volume)
+[londonVwap, londonSd] = f_anchoredVwap(londonReset, srcVwap, volume)
+
+// Use the London-anchored VWAP once London begins, else the CME-anchored one.
+activeVwap = londonStarted ? londonVwap : cmeVwap
+activeSd   = londonStarted ? londonSd   : cmeSd
+vwapUpper  = activeVwap + activeSd
+vwapLower  = activeVwap - activeSd
+
+// =============================================================================
+// ASIA RANGE (box + extending high/low lines)
+// =============================================================================
+var float asiaHigh = na
+var float asiaLow  = na
+if cmeReset
+    asiaHigh := high
+    asiaLow  := low
+else if inRange
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow  := na(asiaLow)  ? low  : math.min(asiaLow,  low)
+
+// Drawing objects (created once per CME-day, updated each bar).
+var box  asiaBox    = na
+var line asiaHiLine = na
+var line asiaLoLine = na
+var int  rangeStartIdx = na
+
+if cmeReset
+    rangeStartIdx := bar_index
+    asiaBox    := box.new(bar_index, high, bar_index, low, border_color=color.new(color.gray, 40), bgcolor=color.new(color.gray, 88))
+    asiaHiLine := line.new(bar_index, high, bar_index, high, color=color.new(color.teal, 0), width=1)
+    asiaLoLine := line.new(bar_index, low,  bar_index, low,  color=color.new(color.orange, 0), width=1)
+
+// While the range is building, grow the box; afterwards extend the lines.
+if not na(asiaBox) and not na(asiaHigh)
+    if inRange
+        box.set_top(asiaBox, asiaHigh)
+        box.set_bottom(asiaBox, asiaLow)
+        box.set_right(asiaBox, bar_index)
+        line.set_xy1(asiaHiLine, rangeStartIdx, asiaHigh)
+        line.set_xy2(asiaHiLine, bar_index, asiaHigh)
+        line.set_xy1(asiaLoLine, rangeStartIdx, asiaLow)
+        line.set_xy2(asiaLoLine, bar_index, asiaLow)
+    else
+        // Range frozen; keep extending the H/L lines into London.
+        line.set_x2(asiaHiLine, bar_index)
+        line.set_x2(asiaLoLine, bar_index)
+
+// =============================================================================
+// RVOL (time-of-day EWMA baseline). Read BEFORE write so the current bar never
+// contributes to its own baseline. map keyed on clock-minute of the session tz.
+// =============================================================================
+var map<int, float> rvolMap = map.new<int, float>()
+int  clockKey  = hour(time, tz) * 60 + minute(time, tz)
+float rvolBaseline = map.contains(rvolMap, clockKey) ? map.get(rvolMap, clockKey) : na
+float rvol = (not na(rvolBaseline) and rvolBaseline > 0) ? volume / rvolBaseline : na
+
+// Update the EWMA AFTER reading (only on confirmed bars to avoid intrabar noise).
+if barstate.isconfirmed
+    float alpha = 2.0 / (rvolN + 1)
+    float newAvg = na(rvolBaseline) ? volume : alpha * volume + (1.0 - alpha) * rvolBaseline
+    map.put(rvolMap, clockKey, newAvg)
+
+rvolHigh = not na(rvol) and rvol >= rvolThreshold
+
+// =============================================================================
+// DELTA / CVD (tick-rule approximation from 1m intrabars)
+// Intrabar: close>open => +volume (buy), close<open => -volume (sell), eq => 0.
+// This is an APPROXIMATION, not true order flow.
+// =============================================================================
+deltaArr = request.security_lower_tf(syminfo.tickerid, deltaTF, close > open ? volume : (close < open ? -volume : 0.0))
+// Guard array access with a size check.
+float barDelta = array.size(deltaArr) > 0 ? array.sum(deltaArr) : 0.0
+
+var float cvd = 0.0
+if cmeReset
+    cvd := 0.0
+cvd := cvd + barDelta
+cvdEma = ta.ema(cvd, cvdEmaLen)
+
+// Delta-divergence veto: price makes an N-bar high while CVD falls => failed
+// breakout, zero the long score; mirror for shorts.
+bool newHigh   = high >= ta.highest(high, deltaDivLookback)
+bool newLow    = low  <= ta.lowest(low,  deltaDivLookback)
+bool cvdFalling = cvd < cvd[1]
+bool cvdRising  = cvd > cvd[1]
+bool longVeto  = newHigh and cvdFalling
+bool shortVeto = newLow  and cvdRising
+
+// =============================================================================
+// HTF REGIME (1H EMA21/50 stacked + 15m EMA21 aligned). All lookahead_off.
+// =============================================================================
+ema1hFast = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+ema1hSlow = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaSlowLen), lookahead=barmerge.lookahead_off)
+// 1H fast-EMA slope measured over slopeLookback bars (slope, not a crossover).
+ema1hRising  = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) > ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
+ema1hFalling = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) < ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
+// 15m fast EMA must agree in direction.
+ema15Rising  = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen) > ta.ema(close, emaFastLen)[1], lookahead=barmerge.lookahead_off)
+ema15Falling = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen) < ta.ema(close, emaFastLen)[1], lookahead=barmerge.lookahead_off)
+
+// Separation measured against chart ATR; require the 1H stack to be genuine
+// (stacked + separated + sloping) AND the 15m EMA aligned.
+htfSep = math.abs(ema1hFast - ema1hSlow)
+regimeBull = ema1hFast > ema1hSlow and htfSep > minSepATR * atrVal and ema1hRising  and ema15Rising
+regimeBear = ema1hFast < ema1hSlow and htfSep > minSepATR * atrVal and ema1hFalling and ema15Falling
+
+// =============================================================================
+// 20-DAY ADR / RANGE EXPANSION FILTER (no repaint: use [1] on the daily SMA)
+// =============================================================================
+adr = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrDays)[1], lookahead=barmerge.lookahead_off)
+
+// Session range = high-to-low since the CME open.
+var float sessHigh = na
+var float sessLow  = na
+if cmeReset
+    sessHigh := high
+    sessLow  := low
+else
+    sessHigh := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow  := na(sessLow)  ? low  : math.min(sessLow,  low)
+
+float sessRange = (na(sessHigh) or na(sessLow)) ? na : sessHigh - sessLow
+float rangeRatio = (not na(sessRange) and not na(adr) and adr > 0) ? sessRange / adr : na
+
+bool isExpansion = not na(rangeRatio) and rangeRatio >= expansionRatio
+bool isRotation  = not na(rangeRatio) and rangeRatio <  rotationRatio
+string dayType   = na(rangeRatio) ? "n/a" : isExpansion ? "EXPANSION" : isRotation ? "ROTATION" : "NEUTRAL"
+
+// =============================================================================
+// RSI DIVERGENCE via pivots (hidden = continuation -> scores;
+// regular = exhaustion -> EXIT/TRAIL warning only, never scores).
+// Confirms pivotRight bars late by construction.
+// =============================================================================
+phRSI = ta.pivothigh(rsiVal, pivotLeft, pivotRight)
+plRSI = ta.pivotlow(rsiVal,  pivotLeft, pivotRight)
+
+var float prevPHprice = na
+var float prevPHrsi   = na
+var int   prevPHbar   = na
+var float prevPLprice = na
+var float prevPLrsi   = na
+var int   prevPLbar   = na
+
+bool hiddenBull = false   // price higher low  + RSI lower low  => uptrend continuation (scores long)
+bool hiddenBear = false   // price lower high  + RSI higher high => downtrend continuation (scores short)
+bool regBear    = false   // price higher high + RSI lower high  => bearish exhaustion (exit/trail only)
+bool regBull    = false   // price lower low   + RSI higher low  => bullish exhaustion (exit/trail only)
+
+// Pivot HIGH bar sits pivotRight bars back.
+if not na(phRSI)
+    float curPrice = high[pivotRight]
+    float curRSI   = phRSI
+    int   curBar   = bar_index - pivotRight
+    if not na(prevPHrsi) and (curBar - prevPHbar) <= maxBarsBetween
+        if curPrice > prevPHprice and curRSI < prevPHrsi
+            regBear := true
+        if curPrice < prevPHprice and curRSI > prevPHrsi
+            hiddenBear := true
+    prevPHprice := curPrice
+    prevPHrsi   := curRSI
+    prevPHbar   := curBar
+
+// Pivot LOW bar sits pivotRight bars back.
+if not na(plRSI)
+    float curPrice = low[pivotRight]
+    float curRSI   = plRSI
+    int   curBar   = bar_index - pivotRight
+    if not na(prevPLrsi) and (curBar - prevPLbar) <= maxBarsBetween
+        if curPrice > prevPLprice and curRSI < prevPLrsi
+            hiddenBull := true
+        if curPrice < prevPLprice and curRSI > prevPLrsi
+            regBull := true
+    prevPLprice := curPrice
+    prevPLrsi   := curRSI
+    prevPLbar   := curBar
+
+// =============================================================================
+// CONFLUENCE SCORING (per side). Max 10: VWAP 2, HTF 2, Structure 2, RVOL 1,
+// CVD 2, RSI 1.
+// =============================================================================
+// --- VWAP (2): price on the right side AND VWAP sloping the right way.
+bool vwapBull = close > activeVwap and activeVwap > activeVwap[1]
+bool vwapBear = close < activeVwap and activeVwap < activeVwap[1]
+
+// --- Structure (2): London = 2 closes beyond Asia range;
+//                    Asia   = 2 closes beyond the active session VWAP.
+bool structBull = false
+bool structBear = false
+if londonStarted
+    structBull := not na(asiaHigh) and close > asiaHigh and close[1] > asiaHigh
+    structBear := not na(asiaLow)  and close < asiaLow  and close[1] < asiaLow
+else
+    structBull := close > activeVwap and close[1] > activeVwap[1]
+    structBear := close < activeVwap and close[1] < activeVwap[1]
+
+// --- CVD (2): CVD on the right side of its EMA AND current bar delta agreeing.
+bool cvdBull = cvd > cvdEma and barDelta > 0
+bool cvdBear = cvd < cvdEma and barDelta < 0
+
+// --- RSI (1): momentum OR hidden divergence.
+bool rsiBull = rsiVal > 50 or hiddenBull
+bool rsiBear = rsiVal < 50 or hiddenBear
+
+// --- Assemble.
+int bullScore = 0
+bullScore := bullScore + (vwapBull   ? 2 : 0)
+bullScore := bullScore + (regimeBull ? 2 : 0)
+bullScore := bullScore + (structBull ? 2 : 0)
+bullScore := bullScore + (rvolHigh   ? 1 : 0)
+bullScore := bullScore + (cvdBull    ? 2 : 0)
+bullScore := bullScore + (rsiBull    ? 1 : 0)
+
+int bearScore = 0
+bearScore := bearScore + (vwapBear   ? 2 : 0)
+bearScore := bearScore + (regimeBear ? 2 : 0)
+bearScore := bearScore + (structBear ? 2 : 0)
+bearScore := bearScore + (rvolHigh   ? 1 : 0)
+bearScore := bearScore + (cvdBear    ? 2 : 0)
+bearScore := bearScore + (rsiBear    ? 1 : 0)
+
+// Delta-divergence veto zeroes the offending side.
+if longVeto
+    bullScore := 0
+if shortVeto
+    bearScore := 0
+
+// =============================================================================
+// POSITION SIZING (Topstep)
+// =============================================================================
+float stopDist       = atrVal * stopMult
+float stopTicks      = syminfo.mintick > 0 ? stopDist / syminfo.mintick : na
+float riskPerContract = (not na(stopTicks)) ? stopTicks * dollarPerTick : na
+int   contracts      = (not na(riskPerContract) and riskPerContract > 0) ? int(math.floor(riskUSD / riskPerContract)) : 0
+contracts := int(math.min(contracts, maxContracts))
+float actualRisk     = contracts * (na(riskPerContract) ? 0.0 : riskPerContract)
+
+float entryPrice = close
+float longStop  = close - stopDist
+float longT1    = close + stopDist        // 1R
+float longT2    = close + 2.0 * stopDist  // 2R
+float shortStop = close + stopDist
+float shortT1   = close - stopDist
+float shortT2   = close - 2.0 * stopDist
+
+// =============================================================================
+// GATING + SIGNALS
+// =============================================================================
+bool inEnabledWindow = (enableAsia and inAsiaTrade) or (enableLondon and inLondonTrade)
+bool notCutoff       = not inCutoff
+bool expansionPass   = not na(rangeRatio) and not isRotation   // rotation days suppressed
+bool baseGate        = inEnabledWindow and notCutoff and expansionPass and barstate.isconfirmed
+
+bool longRaw  = baseGate and bullScore >= signalThreshold and bullScore > bearScore
+bool shortRaw = baseGate and bearScore >= signalThreshold and bearScore > bullScore
+
+// Debounce: suppress repeats within debounceBars on the same side.
+var int lastLongBar  = na
+var int lastShortBar = na
+bool longOK  = na(lastLongBar)  or (bar_index - lastLongBar)  >= debounceBars
+bool shortOK = na(lastShortBar) or (bar_index - lastShortBar) >= debounceBars
+
+bool longSignal  = longRaw  and longOK
+bool shortSignal = shortRaw and shortOK
+if longSignal
+    lastLongBar := bar_index
+if shortSignal
+    lastShortBar := bar_index
+
+bool longStrong  = longSignal  and bullScore >= strongThreshold
+bool shortStrong = shortSignal and bearScore >= strongThreshold
+
+// =============================================================================
+// PLOTS (global scope only)
+// =============================================================================
+plot(emaFast, "EMA fast", color=color.new(color.aqua, 0), linewidth=1)
+plot(emaSlow, "EMA slow", color=color.new(color.blue, 0), linewidth=2)
+
+plot(activeVwap, "Anchored VWAP", color=color.new(color.yellow, 0), linewidth=2)
+pUpper = plot(showVwapBands ? vwapUpper : na, "VWAP +1s", color=color.new(color.yellow, 60))
+pLower = plot(showVwapBands ? vwapLower : na, "VWAP -1s", color=color.new(color.yellow, 60))
+fill(pUpper, pLower, color=showVwapBands ? color.new(color.yellow, 92) : na, title="VWAP band fill")
+
+// Session background shading (priority: London > Asia trade > range build).
+color bgCol = na
+if inLondonTrade
+    bgCol := color.new(color.green, 90)
+else if inAsiaTrade
+    bgCol := color.new(color.orange, 90)
+else if inRange
+    bgCol := color.new(color.gray, 92)
+bgcolor(bgCol, title="Session shading")
+
+// Signal markers.
+plotshape(longSignal  and not longStrong,  title="Long signal",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0),  size=size.small)
+plotshape(longStrong,                       title="Long STRONG",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),   size=size.normal)
+plotshape(shortSignal and not shortStrong,  title="Short signal",  style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),    size=size.small)
+plotshape(shortStrong,                       title="Short STRONG",  style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.normal)
+
+// Exhaustion warnings (X-cross), never contribute to entry score.
+plotshape(regBear, title="Bearish exhaustion (exit/trail)", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(regBull, title="Bullish exhaustion (exit/trail)", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+
+// =============================================================================
+// DASHBOARD (top-right, only on the last bar)
+// =============================================================================
+string curSession = inLondonTrade ? "LONDON trade" : inAsiaTrade ? "ASIA trade" : inRange ? "ASIA range build" : inCutoff ? "CUTOFF" : "Out of session"
+
+var table dash = table.new(position.top_right, 2, 15, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+
+f_cell(int col, int row, string txt, color bg) =>
+    table.cell(dash, col, row, txt, text_color=color.white, bgcolor=bg, text_size=size.small)
+
+color cGray  = color.new(color.gray, 30)
+color cGreen = color.new(color.green, 20)
+color cRed   = color.new(color.red, 20)
+
+if barstate.islast
+    f_cell(0, 0, "MGC A/L Confluence", cGray)
+    f_cell(1, 0, curSession, cGray)
+
+    f_cell(0, 1, "Bull score", cGray)
+    f_cell(1, 1, str.tostring(bullScore) + " / 10", bullScore >= signalThreshold ? cGreen : cGray)
+
+    f_cell(0, 2, "Bear score", cGray)
+    f_cell(1, 2, str.tostring(bearScore) + " / 10", bearScore >= signalThreshold ? cRed : cGray)
+
+    f_cell(0, 3, "1H regime", cGray)
+    f_cell(1, 3, regimeBull ? "BULL" : regimeBear ? "BEAR" : "flat", regimeBull ? cGreen : regimeBear ? cRed : cGray)
+
+    f_cell(0, 4, "VWAP state", cGray)
+    f_cell(1, 4, close > activeVwap ? "above" : close < activeVwap ? "below" : "at", close > activeVwap ? cGreen : close < activeVwap ? cRed : cGray)
+
+    f_cell(0, 5, "RVOL", cGray)
+    f_cell(1, 5, na(rvol) ? "n/a" : str.tostring(rvol, "#.##") + "x", rvolHigh ? cGreen : cGray)
+
+    f_cell(0, 6, "CVD", cGray)
+    f_cell(1, 6, str.tostring(cvd, "#") + (cvd > cvdEma ? " >EMA" : " <EMA"), cvd > cvdEma ? cGreen : cRed)
+
+    f_cell(0, 7, "Range/ADR", cGray)
+    f_cell(1, 7, na(rangeRatio) ? "n/a" : str.tostring(rangeRatio * 100, "#") + "%", isExpansion ? cGreen : isRotation ? cRed : cGray)
+
+    f_cell(0, 8, "Day type", cGray)
+    f_cell(1, 8, dayType, isExpansion ? cGreen : isRotation ? cRed : cGray)
+
+    f_cell(0, 9, "ATR stop (ticks)", cGray)
+    f_cell(1, 9, na(stopTicks) ? "n/a" : str.tostring(stopTicks, "#.#"), cGray)
+
+    f_cell(0, 10, "Position size", cGray)
+    f_cell(1, 10, str.tostring(contracts) + " contr", contracts > 0 ? cGreen : cRed)
+
+    f_cell(0, 11, "$ risk if filled", cGray)
+    f_cell(1, 11, "$" + str.tostring(actualRisk, "#.##"), actualRisk <= riskUSD ? cGreen : cRed)
+
+    f_cell(0, 12, "Veto", cGray)
+    f_cell(1, 12, longVeto ? "LONG vetoed" : shortVeto ? "SHORT vetoed" : "none", (longVeto or shortVeto) ? cRed : cGray)
+
+    f_cell(0, 13, "Windows", cGray)
+    f_cell(1, 13, (enableAsia ? "A" : "-") + " / " + (enableLondon ? "L" : "-"), cGray)
+
+    // Topstep limits context: risk as % of trailing DD buffer, plus daily loss cap.
+    f_cell(0, 14, "Risk vs limits", cGray)
+    f_cell(1, 14, (trailingDD > 0 ? str.tostring(actualRisk / trailingDD * 100, "#.#") + "% of DD" : "n/a") + " | lim $" + str.tostring(dailyLossLimit, "#"), actualRisk <= dailyLossLimit ? cGray : cRed)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+// Dynamic alert() message on fired signals, once per bar close.
+if longSignal
+    string msg = str.format("MGC LONG | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bullScore, str.tostring(entryPrice, format.mintick), str.tostring(longStop, format.mintick), str.tostring(longT1, format.mintick), str.tostring(longT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
+    alert(msg, alert.freq_once_per_bar_close)
+if shortSignal
+    string msg = str.format("MGC SHORT | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bearScore, str.tostring(entryPrice, format.mintick), str.tostring(shortStop, format.mintick), str.tostring(shortT1, format.mintick), str.tostring(shortT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
+    alert(msg, alert.freq_once_per_bar_close)
+
+// Static alertcondition() declarations.
+alertcondition(longSignal,  title="MGC Long signal",             message="MGC LONG confluence signal")
+alertcondition(shortSignal, title="MGC Short signal",            message="MGC SHORT confluence signal")
+alertcondition(regBear,     title="MGC Bearish exhaustion",      message="MGC bearish exhaustion (regular divergence) - exit/trail warning")
+alertcondition(regBull,     title="MGC Bullish exhaustion",      message="MGC bullish exhaustion (regular divergence) - exit/trail warning")
