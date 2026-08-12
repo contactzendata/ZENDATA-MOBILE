@@ -183,6 +183,9 @@ Cells are color-coded green / red / gray by state.
 - **Divergence confirms late.** Regular/hidden divergence relies on
   `ta.pivothigh`/`ta.pivotlow`, which confirm `pivotRight` bars (default 2) after
   the pivot. Signals that depend on a pivot are therefore inherently delayed.
+- **Divergence is price-anchored.** Swings are detected on **price** (high/low),
+  and the RSI value is sampled at that same pivot bar. Detecting swings on the
+  RSI series instead would yield a different, generally noisier divergence set.
 - **RVOL baseline warms up.** The time-of-day EWMA needs several sessions before the
   per-clock-minute baseline is meaningful; early on, RVOL may read `n/a`.
 - **ADR / daily data.** The 20-day ADR uses completed daily bars (no look-ahead), so

@@ -217,10 +217,17 @@ rvolHigh = not na(rvol) and rvol >= rvolThreshold
 
 // =============================================================================
 // DELTA / CVD (tick-rule approximation from 1m intrabars)
-// Intrabar: close>open => +volume (buy), close<open => -volume (sell), eq => 0.
+// Intrabar: close>open => +volume (buy), close<open => -volume (sell),
+// equal => split 50/50 (i.e. net contribution 0).
 // This is an APPROXIMATION, not true order flow.
+// The expression is wrapped in a named helper rather than passed as an inline
+// nested ternary -- request.security_lower_tf() is more reliably parsed with a
+// function call as its expression argument.
 // =============================================================================
-deltaArr = request.security_lower_tf(syminfo.tickerid, deltaTF, close > open ? volume : (close < open ? -volume : 0.0))
+f_intrabarDelta() =>
+    close > open ? volume : close < open ? -volume : 0.0
+
+deltaArr = request.security_lower_tf(syminfo.tickerid, deltaTF, f_intrabarDelta())
 // Guard array access with a size check.
 float barDelta = array.size(deltaArr) > 0 ? array.sum(deltaArr) : 0.0
 
@@ -283,9 +290,14 @@ string dayType   = na(rangeRatio) ? "n/a" : isExpansion ? "EXPANSION" : isRotati
 // RSI DIVERGENCE via pivots (hidden = continuation -> scores;
 // regular = exhaustion -> EXIT/TRAIL warning only, never scores).
 // Confirms pivotRight bars late by construction.
+//
+// PRICE-ANCHORED: swings are detected on PRICE (high/low), and the RSI value is
+// then read at that same pivot bar. This is deliberate -- pivoting on the RSI
+// series instead would detect oscillator swings and produce a different (and
+// generally noisier) set of divergences.
 // =============================================================================
-phRSI = ta.pivothigh(rsiVal, pivotLeft, pivotRight)
-plRSI = ta.pivotlow(rsiVal,  pivotLeft, pivotRight)
+phPrice = ta.pivothigh(high, pivotLeft, pivotRight)
+plPrice = ta.pivotlow(low,   pivotLeft, pivotRight)
 
 var float prevPHprice = na
 var float prevPHrsi   = na
@@ -300,9 +312,9 @@ bool regBear    = false   // price higher high + RSI lower high  => bearish exha
 bool regBull    = false   // price lower low   + RSI higher low  => bullish exhaustion (exit/trail only)
 
 // Pivot HIGH bar sits pivotRight bars back.
-if not na(phRSI)
-    float curPrice = high[pivotRight]
-    float curRSI   = phRSI
+if not na(phPrice)
+    float curPrice = phPrice              // == high[pivotRight]
+    float curRSI   = rsiVal[pivotRight]   // RSI sampled AT the price-pivot bar
     int   curBar   = bar_index - pivotRight
     if not na(prevPHrsi) and (curBar - prevPHbar) <= maxBarsBetween
         if curPrice > prevPHprice and curRSI < prevPHrsi
@@ -314,9 +326,9 @@ if not na(phRSI)
     prevPHbar   := curBar
 
 // Pivot LOW bar sits pivotRight bars back.
-if not na(plRSI)
-    float curPrice = low[pivotRight]
-    float curRSI   = plRSI
+if not na(plPrice)
+    float curPrice = plPrice              // == low[pivotRight]
+    float curRSI   = rsiVal[pivotRight]   // RSI sampled AT the price-pivot bar
     int   curBar   = bar_index - pivotRight
     if not na(prevPLrsi) and (curBar - prevPLbar) <= maxBarsBetween
         if curPrice > prevPLprice and curRSI < prevPLrsi
