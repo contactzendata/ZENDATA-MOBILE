@@ -58,7 +58,7 @@ dashboard so the whole system fits in a single indicator slot.
 ### Scoring
 | Input | Default | Purpose |
 |---|---|---|
-| `Signal score (>=)` | `6` | Minimum score to fire a signal. |
+| `Signal score (>=)` | `7` | Minimum score to fire a signal. Raised from 6 after chart review — 6 produced 20+ signals across 3 sessions. |
 | `Strong score (>=)` | `8` | Score at/above which a signal is marked "strong". |
 | `Asia structure lookback` | `12` | During Asia, structure = 2 consecutive closes beyond the prior N-bar extreme. Deliberately *not* a second VWAP test — see below. |
 
@@ -118,7 +118,8 @@ dashboard so the whole system fits in a single indicator slot.
 ### Alerts
 | Input | Default | Purpose |
 |---|---|---|
-| `Signal debounce (bars)` | `6` | Suppress repeat same-side signals within this many bars. |
+| `Signal debounce (bars)` | `6` | Applied **both** per-side and across sides — after any signal, neither direction may fire for this many bars. |
+| `Exhaustion suppression (bars)` | `10` | After a bearish exhaustion, block longs for this many bars; after a bullish exhaustion, block shorts. |
 
 ---
 
@@ -163,7 +164,10 @@ observe genuinely different things.
   trend continuation → **contributes to the entry score.**
 - **Regular divergence** (price higher-high + RSI lower-high, or the mirror) =
   exhaustion → plotted as an **X-cross exit/trail warning with its own alert**, and
-  **never contributes to the entry score.**
+  **never contributes to the entry score.** It does, however, act as a **gate**:
+  a bearish exhaustion blocks new longs for `exhaustBars` bars, and a bullish
+  exhaustion blocks new shorts. Warning-only was not enough — chart review found a
+  long firing at the exact swing high that had just printed a bearish exhaustion.
 
 ---
 
@@ -182,9 +186,15 @@ filled**, so you can sanity-check before entering.
 ## Dashboard (top-right)
 
 Rendered on the last bar only: current session, bull/bear score, 1H regime, VWAP
-state, RVOL, CVD vs its EMA, range/ADR %, day type, ATR stop in ticks, position
-size, dollar risk if filled, any active veto, and which windows are enabled.
+state and active anchor, RVOL, CVD vs its EMA, range/ADR %, day type, ATR stop in
+ticks, position size, dollar risk if filled, any active delta veto, any active
+exhaustion block, which windows are enabled, and risk against the Topstep limits.
 Cells are color-coded green / red / gray by state.
+
+> Implementation note: the `table.cell()` calls are written inline rather than
+> wrapped in a helper function. `table.cell()` expects `simple int` for `column`
+> and `row`; passing those through a user-defined function's parameters makes them
+> series-qualified, which can compile but render nothing.
 
 ---
 
