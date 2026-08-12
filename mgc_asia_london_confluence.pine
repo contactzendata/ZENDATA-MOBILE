@@ -45,6 +45,7 @@ enableLondon = input.bool(true,  "Enable London trade window", group=grpSess)
 grpScore = "Scoring"
 signalThreshold = input.int(6, "Signal score (>=)", minval=1, maxval=10, group=grpScore)
 strongThreshold = input.int(8, "Strong score (>=)", minval=1, maxval=10, group=grpScore)
+asiaStructLen   = input.int(12, "Asia structure lookback (bars)", minval=2, group=grpScore, tooltip="During Asia, structure = 2 consecutive closes beyond the prior N-bar extreme. Deliberately NOT a second VWAP test: a VWAP-based structure rule would be collinear with the VWAP component and let one observation pay out 4 points.")
 
 // ---- Anchored VWAP -----------------------------------------------------------
 grpVwap = "Anchored VWAP"
@@ -258,21 +259,37 @@ f_intrabarDelta() =>
     close > open ? volume : close < open ? -volume : 0.0
 
 deltaArr = request.security_lower_tf(syminfo.tickerid, deltaTF, f_intrabarDelta())
-// Guard array access with a size check.
-float barDelta = array.size(deltaArr) > 0 ? array.sum(deltaArr) : 0.0
+// Guard array access with BOTH an na check and a size check -- the call can
+// return na (not merely an empty array) when no intrabar data is available,
+// and array.size(na) throws.
+float barDelta = (not na(deltaArr) and array.size(deltaArr) > 0) ? array.sum(deltaArr) : 0.0
 
 var float cvd = 0.0
 if cmeReset
     cvd := 0.0
 cvd := cvd + barDelta
-cvdEma = ta.ema(cvd, cvdEmaLen)
+
+// CVD EMA is reset with the session too. ta.ema() cannot be reset, so it would
+// carry the PRIOR session's CVD level (potentially tens of thousands) across the
+// 18:00 boundary and hold the CVD component wrong for ~cvdEmaLen bars into the
+// new session. Same cross-reset bug class as the VWAP slope; hand-rolled here.
+var float cvdEma = na
+float cvdAlpha = 2.0 / (cvdEmaLen + 1)
+if cmeReset
+    cvdEma := cvd
+else
+    cvdEma := na(cvdEma) ? cvd : cvdAlpha * cvd + (1.0 - cvdAlpha) * cvdEma
 
 // Delta-divergence veto: price makes an N-bar high while CVD falls => failed
 // breakout, zero the long score; mirror for shorts.
+// cvd[1] straddles the 18:00 reset on the first bars of a session (yesterday's
+// closing CVD vs today's near-zero), so the slope needs >= 2 bars of this
+// session's anchor to be meaningful -- same guard as the VWAP slopes.
+bool cvdSlopeValid = barsSinceCmeAnchor >= 2
 bool newHigh   = high >= ta.highest(high, deltaDivLookback)
 bool newLow    = low  <= ta.lowest(low,  deltaDivLookback)
-bool cvdFalling = cvd < cvd[1]
-bool cvdRising  = cvd > cvd[1]
+bool cvdFalling = cvdSlopeValid and cvd < cvd[1]
+bool cvdRising  = cvdSlopeValid and cvd > cvd[1]
 bool longVeto  = newHigh and cvdFalling
 bool shortVeto = newLow  and cvdRising
 
@@ -284,9 +301,13 @@ ema1hSlow = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaSlo
 // 1H fast-EMA slope measured over slopeLookback bars (slope, not a crossover).
 ema1hRising  = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) > ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
 ema1hFalling = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) < ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
-// 15m fast EMA must agree in direction.
-ema15Rising  = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen) > ta.ema(close, emaFastLen)[1], lookahead=barmerge.lookahead_off)
-ema15Falling = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen) < ta.ema(close, emaFastLen)[1], lookahead=barmerge.lookahead_off)
+// 15m ALIGNMENT: price relative to the 15m EMA21. A 1-bar slope on the 15m EMA
+// was far too noisy -- it flipped on single-bar wiggles and randomly zeroed the
+// entire 2-point HTF component. "Aligned" means price is on the correct side of
+// the 15m EMA, which is what this now tests.
+ema15 = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+ema15Bull = not na(ema15) and close > ema15
+ema15Bear = not na(ema15) and close < ema15
 
 // 1H ATR -- the separation test must compare a 1H distance against a 1H ATR.
 // Comparing 1H EMA separation against the 5m ATR (~$0.12 on MGC) made the
@@ -297,8 +318,8 @@ atr1h = request.security(syminfo.tickerid, htfRegimeTF, ta.atr(atrLen), lookahea
 // 15m EMA aligned. Separation is scaled by the 1H ATR.
 htfSep = math.abs(ema1hFast - ema1hSlow)
 htfSeparated = not na(atr1h) and htfSep > minSepATR * atr1h
-regimeBull = ema1hFast > ema1hSlow and htfSeparated and ema1hRising  and ema15Rising
-regimeBear = ema1hFast < ema1hSlow and htfSeparated and ema1hFalling and ema15Falling
+regimeBull = ema1hFast > ema1hSlow and htfSeparated and ema1hRising  and ema15Bull
+regimeBear = ema1hFast < ema1hSlow and htfSeparated and ema1hFalling and ema15Bear
 
 // =============================================================================
 // 20-DAY ADR / RANGE EXPANSION FILTER (no repaint: use [1] on the daily SMA)
@@ -385,21 +406,29 @@ if not na(plPrice)
 bool vwapBull = close > activeVwap and vwapRising
 bool vwapBear = close < activeVwap and vwapFalling
 
-// --- Structure (2): London = 2 closes beyond Asia range;
-//                    Asia   = 2 closes beyond the session VWAP.
-// The Asia branch references cmeVwap EXPLICITLY (not activeVwap): pre-London the
-// CME anchor is always the active one, and naming it directly guarantees the
-// close[1]/vwap[1] pair never straddles an anchor switch. Guarded on >= 2 bars
-// of CME-anchor history so the 18:00 reset bar can't compare against yesterday.
+// --- Structure (2): London = 2 closes beyond the Asia range;
+//                    Asia   = 2 closes beyond the prior N-bar extreme.
+//
+// COLLINEARITY: the Asia branch used to be "2 closes beyond the session VWAP",
+// which measured almost exactly the same thing as the VWAP component above. One
+// observation (price above a rising VWAP) therefore paid out 4 of the 6 points
+// needed to fire, with no HTF or CVD agreement required. The Asia structure test
+// is now a breakout of the prior N-bar extreme -- an independent observation.
+//
+// ta.highest/ta.lowest are evaluated at GLOBAL scope, not inside the if/else:
+// ta.* functions must run on every bar or their internal state desyncs.
+// The [1] excludes the current bar, so this is the extreme price had to beat.
+float priorHiN = ta.highest(high, asiaStructLen)[1]
+float priorLoN = ta.lowest(low,  asiaStructLen)[1]
+
 bool structBull = false
 bool structBear = false
 if londonStarted
     structBull := not na(asiaHigh) and close > asiaHigh and close[1] > asiaHigh
     structBear := not na(asiaLow)  and close < asiaLow  and close[1] < asiaLow
 else
-    bool cmeVwapReady = barsSinceCmeAnchor >= 2
-    structBull := cmeVwapReady and close > cmeVwap and close[1] > cmeVwap[1]
-    structBear := cmeVwapReady and close < cmeVwap and close[1] < cmeVwap[1]
+    structBull := not na(priorHiN) and close > priorHiN and close[1] > priorHiN[1]
+    structBear := not na(priorLoN) and close < priorLoN and close[1] < priorLoN[1]
 
 // --- CVD (2): CVD on the right side of its EMA AND current bar delta agreeing.
 bool cvdBull = cvd > cvdEma and barDelta > 0

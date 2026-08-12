@@ -60,6 +60,7 @@ dashboard so the whole system fits in a single indicator slot.
 |---|---|---|
 | `Signal score (>=)` | `6` | Minimum score to fire a signal. |
 | `Strong score (>=)` | `8` | Score at/above which a signal is marked "strong". |
+| `Asia structure lookback` | `12` | During Asia, structure = 2 consecutive closes beyond the prior N-bar extreme. Deliberately *not* a second VWAP test — see below. |
 
 ### Anchored VWAP
 | Input | Default | Purpose |
@@ -126,14 +127,22 @@ dashboard so the whole system fits in a single indicator slot.
 | Component | Points | Requirement |
 |---|---|---|
 | Anchored VWAP | 2 | Price on the correct side **and** VWAP sloping the right way (slope taken per-anchor). |
-| HTF regime | 2 | 1H EMA 21/50 stacked, separated by > `minSepATR × ATR(1H)`, sloping over `slopeLookback`, **and** 15m EMA 21 aligned. |
-| Structure | 2 | **London:** 2 consecutive closes beyond the Asia range. **Asia:** 2 consecutive closes beyond the session VWAP. |
+| HTF regime | 2 | 1H EMA 21/50 stacked, separated by > `minSepATR × ATR(1H)`, sloping over `slopeLookback`, **and** price on the correct side of the 15m EMA 21. |
+| Structure | 2 | **London:** 2 consecutive closes beyond the Asia range. **Asia:** 2 consecutive closes beyond the prior `asiaStructLen`-bar extreme. |
 | RVOL | 1 | Time-of-day relative volume above threshold. |
 | Cumulative delta | 2 | CVD on the correct side of its EMA **and** the current bar's delta agreeing. |
 | RSI | 1 | RSI > 50 (long) / < 50 (short), **or** hidden divergence active. |
 
 A signal fires at **score ≥ 6** ("strong" at ≥ 8) **and only when that side's score
 exceeds the opposite side's**, subject to gating (below).
+
+**On component independence:** the Asia structure test uses an N-bar breakout
+rather than a VWAP test on purpose. A VWAP-based structure rule would measure
+nearly the same thing as the VWAP component, so a single observation (price above
+a rising VWAP) would pay out 4 of the 6 points needed to fire — reaching the
+threshold with no HTF or CVD agreement at all. Keep this in mind if you retune the
+component weights: the score is only meaningful to the extent the six components
+observe genuinely different things.
 
 ### Vetoes and filters
 - **Delta-divergence veto:** a new N-bar high while CVD falls zeroes the long score
