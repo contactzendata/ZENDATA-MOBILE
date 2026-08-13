@@ -39,7 +39,7 @@ asiaTradeSess   = input.session("2000-0200", "Asia TRADE window (after Shanghai 
 londonTradeSess = input.session("0300-0700", "London TRADE window (London open onward)", group=grpSess)
 noNewAfterSess  = input.session("0700-0715", "No-new-entries cutoff window", group=grpSess, tooltip="Hard cutoff: no new entries once this window begins.")
 enableAsia   = input.bool(true,  "Enable Asia trade window",   group=grpSess)
-enableLondon = input.bool(true,  "Enable London trade window", group=grpSess)
+enableLondon = input.bool(false, "Enable London trade window", group=grpSess, tooltip="Default OFF: London was tested at ~$10 average trade over 11 trades and did not clear the cost hurdle. Retained for future re-testing rather than removed.")
 
 // ---- Scoring thresholds ------------------------------------------------------
 grpScore = "Scoring"
@@ -96,9 +96,9 @@ trailingDD     = input.float(4500.0, "Trailing max drawdown ($, EOD balance)", m
 
 // ---- Alerts ------------------------------------------------------------------
 grpAlerts = "Alerts"
-debounceBars = input.int(6, "Signal debounce (bars)", minval=1, group=grpAlerts, tooltip="Applied BOTH per-side and across sides: after any signal, no signal of either direction may fire for this many bars. The cross-side leg is what prevents long/short pairs at the same price.")
+debounceBars = input.int(12, "Signal debounce (bars)", minval=1, group=grpAlerts, tooltip="Applied BOTH per-side and across sides: after any signal, no signal of either direction may fire for this many bars. The cross-side leg is what prevents long/short pairs at the same price. Default raised 6 -> 12 (~1h on a 5m chart) so re-entries need an hour of separation, targeting trend-stacking without blanket-blocking the session.")
 exhaustBars  = input.int(25, "Exhaustion suppression (bars)", minval=1, group=grpAlerts, tooltip="After a bearish exhaustion (regular divergence at a high), block LONG entries for this many bars; after a bullish exhaustion, block SHORTS. Exhaustion still never contributes to the entry score. NOTE: see the SHORT-SIDE ASYMMETRY comment in the gating section -- a long window here suppresses shorts during sustained selloffs, which is when bullish regular divergences fire most often.")
-oneSignalPerSession = input.bool(true, "One signal per session per side", group=grpAlerts, tooltip="Allow at most one long and one short per TRADE session (Asia window, London window), reset at each trade-window open -- not at the 18:00 CME open. Without this, a 6-bar debounce lets a single trend re-signal every 30 minutes; chart review counted 8-9 longs climbing one move.")
+maxSignalsPerSession = input.int(2, "Max signals per direction per session", minval=1, group=grpAlerts, tooltip="Cap on how many LONG (and, separately, how many SHORT) signals may fire per TRADE session (Asia window, London window), reset at each trade-window open -- not at the 18:00 CME open. Replaces the indicator's hard one-per-side cap, which diagnostics showed was killing ~98.6% of raw London signals. At the default 2 a session can re-signal once after the debounce window, without a single trend stacking 8-9 entries.")
 
 // =============================================================================
 // SESSION STATE
@@ -540,17 +540,19 @@ if regBull
 bool longExhaustBlock  = not na(lastRegBearBar) and (bar_index - lastRegBearBar) < exhaustBars
 bool shortExhaustBlock = not na(lastRegBullBar) and (bar_index - lastRegBullBar) < exhaustBars
 
-// ONE SIGNAL PER SESSION PER SIDE: a 6-bar debounce only spaces signals out; it
-// does not stop a trend re-signalling every 30 minutes. Chart review counted 8-9
-// longs climbing a single move -- that is one trade, not eight. Flags reset at
-// each TRADE-window open, so Asia and London each get their own allowance.
-var bool longFiredSession  = false
-var bool shortFiredSession = false
+// PER-SESSION SIGNAL CAP: at most maxSignalsPerSession LONG and, separately, the
+// same number of SHORT signals per TRADE session. Counters reset at each
+// TRADE-window open, so Asia and London each get their own allowance. Replaces
+// the old hard one-per-side boolean; combined with the (now 12-bar) debounce,
+// re-signals still need an hour of separation, so this admits a second leg --
+// not trend-stacking. (Synced from mgc_asia_london_strategy.pine, the tested file.)
+var int longCountSession  = 0
+var int shortCountSession = 0
 if tradeSessionStart
-    longFiredSession  := false
-    shortFiredSession := false
-bool onceLongOK  = not oneSignalPerSession or not longFiredSession
-bool onceShortOK = not oneSignalPerSession or not shortFiredSession
+    longCountSession  := 0
+    shortCountSession := 0
+bool onceLongOK  = longCountSession  < maxSignalsPerSession
+bool onceShortOK = shortCountSession < maxSignalsPerSession
 
 // DEBOUNCE, two layers:
 //   per-side  -- no repeat long within debounceBars of the last long (etc.)
@@ -576,13 +578,13 @@ bool shortSignal = shortRaw and shortOK and anyOK and not shortExhaustBlock and 
 // longRaw and shortRaw are mutually exclusive (each requires its side to strictly
 // exceed the other), so at most one of these branches runs on any bar.
 if longSignal
-    lastLongBar      := bar_index
-    lastSignalBar    := bar_index
-    longFiredSession := true
+    lastLongBar       := bar_index
+    lastSignalBar     := bar_index
+    longCountSession  := longCountSession + 1
 if shortSignal
     lastShortBar      := bar_index
     lastSignalBar     := bar_index
-    shortFiredSession := true
+    shortCountSession := shortCountSession + 1
 
 bool longStrong  = longSignal  and bullScore >= strongThreshold
 bool shortStrong = shortSignal and bearScore >= strongThreshold
@@ -697,8 +699,8 @@ if barstate.islast
     table.cell(dash, 1, 15, longExhaustBlock and shortExhaustBlock ? "BOTH" : longExhaustBlock ? "LONGS" : shortExhaustBlock ? "SHORTS" : "none", text_color=cText, bgcolor=(longExhaustBlock or shortExhaustBlock) ? cRed : cGray, text_size=size.small)
 
     // Once-per-session allowance: shows when the session limit is the blocker.
-    table.cell(dash, 0, 16, "Fired (session)", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 16, not oneSignalPerSession ? "limit off" : (longFiredSession ? "L" : "-") + " / " + (shortFiredSession ? "S" : "-"), text_color=cText, bgcolor=(oneSignalPerSession and (longFiredSession or shortFiredSession)) ? cRed : cGray, text_size=size.small)
+    table.cell(dash, 0, 16, "Signals (session)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 16, str.tostring(longCountSession) + "/" + str.tostring(maxSignalsPerSession) + " L, " + str.tostring(shortCountSession) + "/" + str.tostring(maxSignalsPerSession) + " S", text_color=cText, bgcolor=(longCountSession >= maxSignalsPerSession or shortCountSession >= maxSignalsPerSession) ? cRed : cGray, text_size=size.small)
 
     table.cell(dash, 0, 17, "Windows", text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(dash, 1, 17, (enableAsia ? "A" : "-") + " / " + (enableLondon ? "L" : "-"), text_color=cText, bgcolor=cGray, text_size=size.small)
