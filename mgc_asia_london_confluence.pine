@@ -97,7 +97,8 @@ trailingDD     = input.float(4500.0, "Trailing max drawdown ($, EOD balance)", m
 // ---- Alerts ------------------------------------------------------------------
 grpAlerts = "Alerts"
 debounceBars = input.int(6, "Signal debounce (bars)", minval=1, group=grpAlerts, tooltip="Applied BOTH per-side and across sides: after any signal, no signal of either direction may fire for this many bars. The cross-side leg is what prevents long/short pairs at the same price.")
-exhaustBars  = input.int(10, "Exhaustion suppression (bars)", minval=1, group=grpAlerts, tooltip="After a bearish exhaustion (regular divergence at a high), block LONG entries for this many bars; after a bullish exhaustion, block SHORTS. Exhaustion still never contributes to the entry score.")
+exhaustBars  = input.int(25, "Exhaustion suppression (bars)", minval=1, group=grpAlerts, tooltip="After a bearish exhaustion (regular divergence at a high), block LONG entries for this many bars; after a bullish exhaustion, block SHORTS. Exhaustion still never contributes to the entry score. NOTE: see the SHORT-SIDE ASYMMETRY comment in the gating section -- a long window here suppresses shorts during sustained selloffs, which is when bullish regular divergences fire most often.")
+oneSignalPerSession = input.bool(true, "One signal per session per side", group=grpAlerts, tooltip="Allow at most one long and one short per TRADE session (Asia window, London window), reset at each trade-window open -- not at the 18:00 CME open. Without this, a 6-bar debounce lets a single trend re-signal every 30 minutes; chart review counted 8-9 longs climbing one move.")
 
 // =============================================================================
 // SESSION STATE
@@ -109,8 +110,14 @@ inLondonTrade = not na(time(timeframe.period, londonTradeSess, tz))
 inCutoff      = not na(time(timeframe.period, noNewAfterSess,  tz))
 
 // Session-edge triggers (the "session and not session[1]" idiom).
-cmeReset    = inRange       and not inRange[1]        // first bar of 18:00 CME open
-londonReset = inLondonTrade and not inLondonTrade[1]  // first bar of 03:00 London open
+cmeReset       = inRange       and not inRange[1]        // first bar of 18:00 CME open
+londonReset    = inLondonTrade and not inLondonTrade[1]  // first bar of 03:00 London open
+asiaTradeStart = inAsiaTrade   and not inAsiaTrade[1]    // first bar of 20:00 Asia trade window
+
+// TRADE-session boundary: the open of either TRADE window. Deliberately NOT the
+// 18:00 CME open -- the once-per-session signal limit must give the Asia window
+// and the London window one signal each, not one signal for the whole CME day.
+tradeSessionStart = asiaTradeStart or londonReset
 
 // Track whether London has begun this CME-day.
 var bool londonStarted = false
@@ -504,6 +511,26 @@ bool shortRaw = baseGate and bearScore >= signalThreshold and bearScore > bullSc
 // SHORTS. Recorded before the block is evaluated so the firing bar is itself
 // blocked. This is a GATE, not a score contribution -- exhaustion still never
 // adds points to either side.
+//
+// !! SHORT-SIDE ASYMMETRY -- READ BEFORE TUNING exhaustBars !!
+// The bull/bear component pairs are all structurally symmetric (audited: vwap,
+// regime, struct, cvd, rsi, and the shared rvol). The short side nonetheless
+// fires far less often, for two reasons, and only the second is tunable here:
+//
+//   (a) regimeBear needs 1H EMA21 < EMA50. In an instrument that trends up for
+//       months, that condition is simply rare, so the bear side routinely runs
+//       2 points short of the bull side. Not a bug -- market state.
+//
+//   (b) THIS GATE. regBull means "price lower low + RSI higher low", which is
+//       exactly what a sustained selloff prints over and over as RSI sits
+//       oversold and ticks up against each new low. Every occurrence blocks
+//       SHORTS for exhaustBars bars. At 25 bars those windows overlap and the
+//       short side gets gated out of precisely the selloff it should be
+//       trading. Raising exhaustBars trades long-side safety at highs for
+//       short-side blindness in downtrends -- it is not a symmetric knob.
+//
+// The dashboard prints per-component masks for BOTH sides plus the live exhaust
+// block, so which of these is binding is visible on-chart rather than inferred.
 var int lastRegBearBar = na
 var int lastRegBullBar = na
 if regBear
@@ -512,6 +539,18 @@ if regBull
     lastRegBullBar := bar_index
 bool longExhaustBlock  = not na(lastRegBearBar) and (bar_index - lastRegBearBar) < exhaustBars
 bool shortExhaustBlock = not na(lastRegBullBar) and (bar_index - lastRegBullBar) < exhaustBars
+
+// ONE SIGNAL PER SESSION PER SIDE: a 6-bar debounce only spaces signals out; it
+// does not stop a trend re-signalling every 30 minutes. Chart review counted 8-9
+// longs climbing a single move -- that is one trade, not eight. Flags reset at
+// each TRADE-window open, so Asia and London each get their own allowance.
+var bool longFiredSession  = false
+var bool shortFiredSession = false
+if tradeSessionStart
+    longFiredSession  := false
+    shortFiredSession := false
+bool onceLongOK  = not oneSignalPerSession or not longFiredSession
+bool onceShortOK = not oneSignalPerSession or not shortFiredSession
 
 // DEBOUNCE, two layers:
 //   per-side  -- no repeat long within debounceBars of the last long (etc.)
@@ -525,17 +564,25 @@ bool longOK  = na(lastLongBar)   or (bar_index - lastLongBar)   >= debounceBars
 bool shortOK = na(lastShortBar)  or (bar_index - lastShortBar)  >= debounceBars
 bool anyOK   = na(lastSignalBar) or (bar_index - lastSignalBar) >= debounceBars
 
-bool longSignal  = longRaw  and longOK  and anyOK and not longExhaustBlock
-bool shortSignal = shortRaw and shortOK and anyOK and not shortExhaustBlock
+// ORDERING INVARIANT: every suppression term (exhaustion, once-per-session,
+// both debounce layers) is folded into longSignal/shortSignal HERE, and the
+// state writes below are gated on those final values. A signal that is
+// suppressed for ANY reason therefore never stamps lastLongBar / lastShortBar /
+// lastSignalBar and never consumes the once-per-session allowance -- suppression
+// can only remove signals, never silently eat a later valid one.
+bool longSignal  = longRaw  and longOK  and anyOK and not longExhaustBlock  and onceLongOK
+bool shortSignal = shortRaw and shortOK and anyOK and not shortExhaustBlock and onceShortOK
 
 // longRaw and shortRaw are mutually exclusive (each requires its side to strictly
 // exceed the other), so at most one of these branches runs on any bar.
 if longSignal
-    lastLongBar   := bar_index
-    lastSignalBar := bar_index
+    lastLongBar      := bar_index
+    lastSignalBar    := bar_index
+    longFiredSession := true
 if shortSignal
-    lastShortBar  := bar_index
-    lastSignalBar := bar_index
+    lastShortBar      := bar_index
+    lastSignalBar     := bar_index
+    shortFiredSession := true
 
 bool longStrong  = longSignal  and bullScore >= strongThreshold
 bool shortStrong = shortSignal and bearScore >= strongThreshold
@@ -576,13 +623,21 @@ plotshape(regBull, title="Bullish exhaustion (exit/trail)", style=shape.xcross, 
 // =============================================================================
 string curSession = inLondonTrade ? "LONDON trade" : inAsiaTrade ? "ASIA trade" : inRange ? "ASIA range build" : inCutoff ? "CUTOFF" : "Out of session"
 
+// Per-component masks, printed for BOTH sides so the blocking component is
+// readable directly off the chart. Letter = component contributed, dash = did
+// not. Order/weights: V=VWAP(2) H=HTF regime(2) S=Structure(2) R=RVOL(1)
+// C=CVD(2) I=RSI(1). Compare the two rows to see where the bear side is losing
+// its points -- H is the usual culprit while 1H EMA21 sits above EMA50.
+string bullParts = (vwapBull ? "V" : "-") + (regimeBull ? "H" : "-") + (structBull ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBull ? "C" : "-") + (rsiBull ? "I" : "-")
+string bearParts = (vwapBear ? "V" : "-") + (regimeBear ? "H" : "-") + (structBear ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBear ? "C" : "-") + (rsiBear ? "I" : "-")
+
 // The table.cell() calls below are INLINED rather than wrapped in a helper
 // function. table.cell()'s `column` and `row` parameters expect simple int;
 // routing them through a user-defined function's parameters (f_cell(int col,
 // int row, ...)) makes them series-qualified inside the function body, which is
 // why the previous helper-based version could compile yet render nothing.
 // Inlined literal indices are the canonical, unambiguous form.
-var table dash = table.new(position.top_right, 2, 16, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+var table dash = table.new(position.top_right, 2, 19, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
 
 color cGray  = color.new(color.gray, 30)
 color cGreen = color.new(color.green, 20)
@@ -599,47 +654,58 @@ if barstate.islast
     table.cell(dash, 0, 2, "Bear score", text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(dash, 1, 2, str.tostring(bearScore) + " / 10", text_color=cText, bgcolor=bearScore >= signalThreshold ? cRed : cGray, text_size=size.small)
 
-    table.cell(dash, 0, 3, "1H regime", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 3, regimeBull ? "BULL" : regimeBear ? "BEAR" : "flat", text_color=cText, bgcolor=regimeBull ? cGreen : regimeBear ? cRed : cGray, text_size=size.small)
+    // Component masks: V=VWAP H=HTF S=Struct R=RVOL C=CVD I=RSI. Compare rows.
+    table.cell(dash, 0, 3, "Bull VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 3, bullParts, text_color=cText, bgcolor=cGray, text_size=size.small)
 
-    table.cell(dash, 0, 4, "VWAP (anchor)", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 4, (close > activeVwap ? "above" : close < activeVwap ? "below" : "at") + " (" + (useLondonVwap ? "LON" : "CME") + ")", text_color=cText, bgcolor=close > activeVwap ? cGreen : close < activeVwap ? cRed : cGray, text_size=size.small)
+    table.cell(dash, 0, 4, "Bear VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 4, bearParts, text_color=cText, bgcolor=cGray, text_size=size.small)
 
-    table.cell(dash, 0, 5, "RVOL", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 5, na(rvol) ? "n/a" : str.tostring(rvol, "#.##") + "x", text_color=cText, bgcolor=rvolHigh ? cGreen : cGray, text_size=size.small)
+    table.cell(dash, 0, 5, "1H regime", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 5, regimeBull ? "BULL" : regimeBear ? "BEAR" : "flat", text_color=cText, bgcolor=regimeBull ? cGreen : regimeBear ? cRed : cGray, text_size=size.small)
 
-    table.cell(dash, 0, 6, "CVD", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 6, str.tostring(cvd, "#") + (cvd > cvdEma ? " >EMA" : " <EMA"), text_color=cText, bgcolor=cvd > cvdEma ? cGreen : cRed, text_size=size.small)
+    table.cell(dash, 0, 6, "VWAP (anchor)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 6, (close > activeVwap ? "above" : close < activeVwap ? "below" : "at") + " (" + (useLondonVwap ? "LON" : "CME") + ")", text_color=cText, bgcolor=close > activeVwap ? cGreen : close < activeVwap ? cRed : cGray, text_size=size.small)
 
-    table.cell(dash, 0, 7, "Range/ADR", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 7, na(rangeRatio) ? "n/a" : str.tostring(rangeRatio * 100, "#") + "%", text_color=cText, bgcolor=isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
+    table.cell(dash, 0, 7, "RVOL", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 7, na(rvol) ? "n/a" : str.tostring(rvol, "#.##") + "x", text_color=cText, bgcolor=rvolHigh ? cGreen : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 8, "CVD", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(cvd, "#") + (cvd > cvdEma ? " >EMA" : " <EMA"), text_color=cText, bgcolor=cvd > cvdEma ? cGreen : cRed, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Range/ADR", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 9, na(rangeRatio) ? "n/a" : str.tostring(rangeRatio * 100, "#") + "%", text_color=cText, bgcolor=isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
 
     // During Asia the rotation filter is informational only (see gating above).
-    table.cell(dash, 0, 8, "Day type", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 8, londonStarted ? dayType : dayType + " (info)", text_color=cText, bgcolor=not londonStarted ? cGray : isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
+    table.cell(dash, 0, 10, "Day type", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 10, londonStarted ? dayType : dayType + " (info)", text_color=cText, bgcolor=not londonStarted ? cGray : isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
 
-    table.cell(dash, 0, 9, "ATR stop (ticks)", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 9, na(stopTicks) ? "n/a" : str.tostring(stopTicks, "#.#"), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 0, 11, "ATR stop (ticks)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 11, na(stopTicks) ? "n/a" : str.tostring(stopTicks, "#.#"), text_color=cText, bgcolor=cGray, text_size=size.small)
 
-    table.cell(dash, 0, 10, "Position size", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 10, str.tostring(contracts) + " contr", text_color=cText, bgcolor=contracts > 0 ? cGreen : cRed, text_size=size.small)
+    table.cell(dash, 0, 12, "Position size", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 12, str.tostring(contracts) + " contr", text_color=cText, bgcolor=contracts > 0 ? cGreen : cRed, text_size=size.small)
 
-    table.cell(dash, 0, 11, "$ risk if filled", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 11, "$" + str.tostring(actualRisk, "#.##"), text_color=cText, bgcolor=actualRisk <= riskUSD ? cGreen : cRed, text_size=size.small)
+    table.cell(dash, 0, 13, "$ risk if filled", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 13, "$" + str.tostring(actualRisk, "#.##"), text_color=cText, bgcolor=actualRisk <= riskUSD ? cGreen : cRed, text_size=size.small)
 
-    table.cell(dash, 0, 12, "Delta veto", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 12, longVeto ? "LONG vetoed" : shortVeto ? "SHORT vetoed" : "none", text_color=cText, bgcolor=(longVeto or shortVeto) ? cRed : cGray, text_size=size.small)
+    table.cell(dash, 0, 14, "Delta veto", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 14, longVeto ? "LONG vetoed" : shortVeto ? "SHORT vetoed" : "none", text_color=cText, bgcolor=(longVeto or shortVeto) ? cRed : cGray, text_size=size.small)
 
-    // Exhaustion now GATES entries, so its state belongs on the dashboard.
-    table.cell(dash, 0, 13, "Exhaust block", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 13, longExhaustBlock and shortExhaustBlock ? "BOTH" : longExhaustBlock ? "LONGS" : shortExhaustBlock ? "SHORTS" : "none", text_color=cText, bgcolor=(longExhaustBlock or shortExhaustBlock) ? cRed : cGray, text_size=size.small)
+    // Exhaustion GATES entries, so its live state belongs on the dashboard.
+    table.cell(dash, 0, 15, "Exhaust block", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 15, longExhaustBlock and shortExhaustBlock ? "BOTH" : longExhaustBlock ? "LONGS" : shortExhaustBlock ? "SHORTS" : "none", text_color=cText, bgcolor=(longExhaustBlock or shortExhaustBlock) ? cRed : cGray, text_size=size.small)
 
-    table.cell(dash, 0, 14, "Windows", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 14, (enableAsia ? "A" : "-") + " / " + (enableLondon ? "L" : "-"), text_color=cText, bgcolor=cGray, text_size=size.small)
+    // Once-per-session allowance: shows when the session limit is the blocker.
+    table.cell(dash, 0, 16, "Fired (session)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 16, not oneSignalPerSession ? "limit off" : (longFiredSession ? "L" : "-") + " / " + (shortFiredSession ? "S" : "-"), text_color=cText, bgcolor=(oneSignalPerSession and (longFiredSession or shortFiredSession)) ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 17, "Windows", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 17, (enableAsia ? "A" : "-") + " / " + (enableLondon ? "L" : "-"), text_color=cText, bgcolor=cGray, text_size=size.small)
 
     // Topstep limits context: risk as % of trailing DD buffer, plus daily loss cap.
-    table.cell(dash, 0, 15, "Risk vs limits", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(dash, 1, 15, (trailingDD > 0 ? str.tostring(actualRisk / trailingDD * 100, "#.#") + "% of DD" : "n/a") + " | lim $" + str.tostring(dailyLossLimit, "#"), text_color=cText, bgcolor=actualRisk <= dailyLossLimit ? cGray : cRed, text_size=size.small)
+    table.cell(dash, 0, 18, "Risk vs limits", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 18, (trailingDD > 0 ? str.tostring(actualRisk / trailingDD * 100, "#.#") + "% of DD" : "n/a") + " | lim $" + str.tostring(dailyLossLimit, "#"), text_color=cText, bgcolor=actualRisk <= dailyLossLimit ? cGray : cRed, text_size=size.small)
 
 // =============================================================================
 // ALERTS

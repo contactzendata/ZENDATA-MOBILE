@@ -119,7 +119,8 @@ dashboard so the whole system fits in a single indicator slot.
 | Input | Default | Purpose |
 |---|---|---|
 | `Signal debounce (bars)` | `6` | Applied **both** per-side and across sides — after any signal, neither direction may fire for this many bars. |
-| `Exhaustion suppression (bars)` | `10` | After a bearish exhaustion, block longs for this many bars; after a bullish exhaustion, block shorts. |
+| `Exhaustion suppression (bars)` | `25` | After a bearish exhaustion, block longs for this many bars; after a bullish exhaustion, block shorts. **Not a symmetric knob** — see the short-side note below. |
+| `One signal per session per side` | `true` | At most one long and one short per **trade** window (Asia, London), reset at each trade-window open. |
 
 ---
 
@@ -217,6 +218,23 @@ Cells are color-coded green / red / gray by state.
   it reflects yesterday's 20-day average, not an intraday update.
 - **Session strings are timezone-sensitive.** Changing the timezone input without
   adjusting the session windows will shift what counts as "Asia" or "London".
+- **The short side fires much less often than the long side.** The bull/bear
+  component pairs are structurally symmetric in code (audited: VWAP, regime,
+  structure, CVD, RSI, and the shared RVOL). Two things still bias the count:
+  1. `regimeBear` requires 1H EMA 21 < EMA 50. In an instrument that trends up
+     for months that is simply rare, so the bear side routinely runs 2 points
+     behind. Market state, not a defect.
+  2. **The exhaustion gate.** `regBull` means "price lower low + RSI higher low",
+     which is exactly what a sustained selloff prints repeatedly as RSI sits
+     oversold and ticks up against each new low. Each occurrence blocks shorts
+     for `exhaustBars` bars; at 25 those windows overlap and the short side gets
+     gated out of the very selloff it should be trading. Raising `exhaustBars`
+     buys long-side safety at highs and pays for it with short-side blindness in
+     downtrends.
+
+  The dashboard prints per-component masks for **both** sides (`Bull VHSRCI` /
+  `Bear VHSRCI`, letter = contributed, dash = did not) plus the live exhaustion
+  block, so which of these is binding is readable on-chart rather than guessed.
 - **Asia has no range-expansion gate.** Because the rotation test is meaningless
   that early in the session (see above), Asia signals are *not* filtered for
   rotation days. Asia is the rotational session by thesis, so treat Asia signals
