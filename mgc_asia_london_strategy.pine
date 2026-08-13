@@ -1,0 +1,943 @@
+//@version=6
+// =============================================================================
+// MGC Asia/London STRATEGY  (backtestable execution layer)
+// -----------------------------------------------------------------------------
+// DISCLAIMER: This script is NOT financial advice. It is a research/education
+// tool. Every parameter and threshold in it is an UNTESTED HYPOTHESIS about how
+// Micro Gold behaves across the Asia and London sessions. Nothing here is
+// validated, back-tested, or guaranteed. Trade your own money at your own risk.
+//
+// Instrument: Micro Gold (MGC, 10 troy oz, COMEX). Tick 0.10 = $1.00/contract.
+// Intended chart: 5-minute. Intended plan: TradingView PLUS (not Premium).
+//
+// KEY APPROXIMATION: This plan cannot use request.footprint() (Premium/Ultimate
+// only), so "delta" is NOT true order flow. It is approximated from 1-minute
+// intrabars using the tick rule (intrabar close > open => buy volume,
+// close < open => sell volume, equal => split 50/50, i.e. net 0). Treat CVD as
+// a rough participation proxy, not real bid/ask delta.
+//
+// NO REPAINTING: every request.security() / request.security_lower_tf() uses
+// lookahead = barmerge.lookahead_off, and all confirmation logic is gated on
+// barstate.isconfirmed.
+//
+// -----------------------------------------------------------------------------
+// RELATIONSHIP TO THE INDICATOR (read this):
+// This file is the backtestable strategy() twin of mgc_asia_london_confluence.pine.
+// EVERY signal-generation line below (sessions, anchored VWAPs + per-anchor slope
+// selection, Asia range, time-of-day RVOL, tick-rule CVD, price-anchored RSI
+// divergence, 1H/15m regime + 1H-ATR separation, range-expansion filter, the
+// six-component scoring, delta-divergence veto, exhaustion suppression,
+// per-session cap, and BOTH debounce layers) is COPIED VERBATIM from the
+// indicator so longSignal / shortSignal are byte-identical. Only an EXECUTION
+// LAYER (entries, exits, Topstep model, session A/B) has been ADDED. No signal
+// logic has been changed.
+//
+// The single deliberate exception is the sessionMode wiring: sessionMode selects
+// which of the EXISTING enableAsia / enableLondon gates are active. With
+// sessionMode = "Both" (the default) the effective gates equal the raw inputs,
+// so signals are byte-identical to the indicator run with the same
+// enableAsia / enableLondon settings. See "SESSION ISOLATION" below.
+// =============================================================================
+
+strategy("MGC Asia/London Strategy", shorttitle="MGC A/L Strat",
+     overlay = true,
+     initial_capital = 150000,
+     default_qty_type = strategy.fixed,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.62,
+     slippage = 2,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_boxes_count = 50, max_lines_count = 50, max_labels_count = 100)
+
+// =============================================================================
+// INPUTS  (signal inputs below are IDENTICAL to the indicator)
+// =============================================================================
+
+// ---- General / instrument ----------------------------------------------------
+grpInst      = "Instrument"
+dollarPerTick = input.float(1.0, "$ per tick (MGC=1.0, GC=10.0)", minval=0.0, group=grpInst, tooltip="Dollar value of one minimum tick move. MGC = $1.00 per 0.10 move. Change to reuse on GC.")
+
+// ---- Timezone / sessions -----------------------------------------------------
+grpSess = "Sessions"
+tz        = input.string("America/New_York", "Session timezone", options=["America/New_York", "America/Chicago"], group=grpSess)
+asiaRangeSess   = input.session("1800-0200", "Asia RANGE build (CME open -> Tokyo close)", group=grpSess, tooltip="Builds the range. NOT a trade window.")
+asiaTradeSess   = input.session("2000-0200", "Asia TRADE window (after Shanghai open)", group=grpSess)
+londonTradeSess = input.session("0300-0700", "London TRADE window (London open onward)", group=grpSess)
+noNewAfterSess  = input.session("0700-0715", "No-new-entries cutoff window", group=grpSess, tooltip="Hard cutoff: no new entries once this window begins.")
+enableAsia   = input.bool(true,  "Enable Asia trade window",   group=grpSess)
+enableLondon = input.bool(true,  "Enable London trade window", group=grpSess)
+
+// ---- Scoring thresholds ------------------------------------------------------
+grpScore = "Scoring"
+signalThreshold = input.int(7, "Signal score (>=)", minval=1, maxval=10, group=grpScore, tooltip="Raised from 6 to 7 after chart review: 6 produced 20+ signals across 3 sessions.")
+strongThreshold = input.int(8, "Strong score (>=)", minval=1, maxval=10, group=grpScore)
+asiaStructLen   = input.int(12, "Asia structure lookback (bars)", minval=2, group=grpScore, tooltip="During Asia, structure = 2 consecutive closes beyond the prior N-bar extreme. Deliberately NOT a second VWAP test: a VWAP-based structure rule would be collinear with the VWAP component and let one observation pay out 4 points.")
+
+// ---- Anchored VWAP -----------------------------------------------------------
+grpVwap = "Anchored VWAP"
+showVwapBands = input.bool(true, "Show VWAP +/-1 sigma bands", group=grpVwap)
+londonVwapWarmup = input.int(6, "London VWAP warm-up (confirmed bars)", minval=2, group=grpVwap, tooltip="Keep using the CME-anchored VWAP until the London anchor has at least this many confirmed bars. A freshly re-anchored VWAP sits on top of price with sigma ~ 0, which would make the VWAP component random exactly during the London open.")
+
+// ---- EMAs / HTF regime -------------------------------------------------------
+grpEma = "EMAs / HTF regime"
+emaFastLen   = input.int(21, "Fast EMA length", minval=1, group=grpEma)
+emaSlowLen   = input.int(50, "Slow EMA length", minval=1, group=grpEma)
+minSepATR    = input.float(0.15, "Min EMA separation (x ATR)", minval=0.0, step=0.01, group=grpEma, tooltip="Fast/slow EMAs must be separated by more than this * ATR. Avoids crossover whipsaw.")
+slopeLookback = input.int(5, "EMA slope lookback (bars)", minval=1, group=grpEma)
+htfRegimeTF  = input.timeframe("60", "HTF regime timeframe", group=grpEma)
+htfConfirmTF = input.timeframe("15", "HTF confirm timeframe", group=grpEma)
+
+// ---- RVOL --------------------------------------------------------------------
+grpRvol = "RVOL (time-of-day)"
+rvolThreshold = input.float(1.5, "RVOL threshold", minval=0.0, step=0.1, group=grpRvol)
+rvolN         = input.int(20, "RVOL EWMA period (N)", minval=1, group=grpRvol, tooltip="alpha = 2/(N+1). Baseline is an EWMA of volume at each clock-minute across sessions.")
+
+// ---- Delta / CVD -------------------------------------------------------------
+grpDelta = "Delta / CVD"
+deltaTF        = input.timeframe("1", "Delta lower timeframe", group=grpDelta, tooltip="Seconds are unreliable on Plus; default 1m gives ~5 intrabars on a 5m chart.")
+cvdEmaLen      = input.int(21, "CVD EMA length", minval=1, group=grpDelta)
+deltaDivLookback = input.int(10, "Delta-divergence lookback (bars)", minval=2, group=grpDelta)
+
+// ---- RSI / divergence --------------------------------------------------------
+grpRsi = "RSI / divergence"
+rsiLen      = input.int(14, "RSI length", minval=1, group=grpRsi)
+pivotLeft   = input.int(5, "Pivot left bars",  minval=1, group=grpRsi)
+pivotRight  = input.int(2, "Pivot right bars", minval=1, group=grpRsi, tooltip="Divergence confirms pivotRight bars late by construction.")
+maxBarsBetween = input.int(40, "Max bars between pivots", minval=1, group=grpRsi)
+
+// ---- Range expansion / trend-day filter -------------------------------------
+grpExp = "Range expansion filter"
+expansionRatio = input.float(0.50, "Expansion day ratio (>=)", minval=0.0, step=0.05, group=grpExp, tooltip="Session range / 20-day ADR at or above this = expansion day.")
+rotationRatio  = input.float(0.30, "Rotation day ratio (<)",   minval=0.0, step=0.05, group=grpExp, tooltip="Below this = rotation day; ALL signals suppressed.")
+adrDays        = input.int(20, "ADR lookback (days)", minval=1, group=grpExp)
+
+// ---- Position sizing / risk --------------------------------------------------
+grpRisk = "Risk / sizing (Topstep 150K)"
+atrLen        = input.int(14, "ATR length", minval=1, group=grpRisk)
+stopMult      = input.float(1.5, "Stop = ATR x", minval=0.1, step=0.1, group=grpRisk)
+riskUSD       = input.float(300.0, "Risk per trade ($)", minval=0.0, group=grpRisk, tooltip="~0.67% of the ~$4,500 trailing drawdown buffer.")
+maxContracts  = input.int(20, "Max contracts", minval=1, group=grpRisk)
+dailyLossLimit = input.float(3000.0, "Daily loss limit ($, incl. unrealized)", minval=0.0, group=grpRisk)
+trailingDD     = input.float(4500.0, "Trailing max drawdown ($, EOD balance)", minval=0.0, group=grpRisk)
+
+// ---- Alerts ------------------------------------------------------------------
+grpAlerts = "Alerts"
+debounceBars = input.int(6, "Signal debounce (bars)", minval=1, group=grpAlerts, tooltip="Applied BOTH per-side and across sides: after any signal, no signal of either direction may fire for this many bars. The cross-side leg is what prevents long/short pairs at the same price.")
+exhaustBars  = input.int(25, "Exhaustion suppression (bars)", minval=1, group=grpAlerts, tooltip="After a bearish exhaustion (regular divergence at a high), block LONG entries for this many bars; after a bullish exhaustion, block SHORTS. Exhaustion still never contributes to the entry score. NOTE: see the SHORT-SIDE ASYMMETRY comment in the gating section -- a long window here suppresses shorts during sustained selloffs, which is when bullish regular divergences fire most often.")
+oneSignalPerSession = input.bool(true, "One signal per session per side", group=grpAlerts, tooltip="Allow at most one long and one short per TRADE session (Asia window, London window), reset at each trade-window open -- not at the 18:00 CME open. Without this, a 6-bar debounce lets a single trend re-signal every 30 minutes; chart review counted 8-9 longs climbing one move.")
+
+// =============================================================================
+// STRATEGY-ONLY INPUTS  (execution layer -- NOT part of signal generation)
+// =============================================================================
+
+// ---- Session isolation (A/B testing) ----------------------------------------
+grpAB = "Session isolation (A/B)"
+sessionMode = input.string("Both", "Session mode", options=["Both", "Asia only", "London only"], group=grpAB, tooltip="Wires into the EXISTING enableAsia / enableLondon gates. 'Both' = use the raw enable inputs (byte-identical to the indicator). Run three backtests (Both / Asia only / London only) to split performance by session.")
+showSessionTable = input.bool(true, "Show per-session P&L table (bonus)", group=grpAB, tooltip="Maintains running per-session trade / win / gross-P&L counters, attributed by ENTRY session, and prints them on the last bar. Purely a read-out; touches no signal logic.")
+
+// ---- Exit management ---------------------------------------------------------
+grpExit = "Exits"
+scaleT1Pct    = input.float(50.0, "Scale-out % at T1 (1R)", minval=0.0, maxval=100.0, step=5.0, group=grpExit, tooltip="Percent of the position to close at the 1R target. 0 = no scale-out (whole position rides to the runner exit).")
+moveBEafterT1 = input.bool(true, "Move stop to breakeven after T1", group=grpExit)
+runnerExit    = input.bool(true, "Runner exits at T2 (2R)", group=grpExit, tooltip="If off, the remainder rides on the stop / exhaustion / session-flatten only.")
+exhaustExit   = input.bool(true, "Exhaustion exit (close longs on regBear, shorts on regBull)", group=grpExit, tooltip="This is what the indicator's exhaustion X-cross markers were always for.")
+
+// ---- Topstep realism model ---------------------------------------------------
+// Reuses the existing `dailyLossLimit` and `trailingDD` inputs (Risk group,
+// verbatim from the indicator) and adds only the max-trades-per-day cap, so
+// there is a single authoritative control for each Topstep figure.
+grpTop = "Topstep model"
+maxTradesPerDay = input.int(3, "Max trades per day", minval=1, group=grpTop, tooltip="No new entries once this many trades have been taken since the 18:00 CME session open.")
+
+// =============================================================================
+// SESSION STATE   (verbatim from indicator)
+// =============================================================================
+// In-session detection: time(tf, session, tz) returns na when outside session.
+inRange       = not na(time(timeframe.period, asiaRangeSess,   tz))
+inAsiaTrade   = not na(time(timeframe.period, asiaTradeSess,   tz))
+inLondonTrade = not na(time(timeframe.period, londonTradeSess, tz))
+inCutoff      = not na(time(timeframe.period, noNewAfterSess,  tz))
+
+// Session-edge triggers (the "session and not session[1]" idiom).
+cmeReset       = inRange       and not inRange[1]        // first bar of 18:00 CME open
+londonReset    = inLondonTrade and not inLondonTrade[1]  // first bar of 03:00 London open
+asiaTradeStart = inAsiaTrade   and not inAsiaTrade[1]    // first bar of 20:00 Asia trade window
+
+// TRADE-session boundary: the open of either TRADE window. Deliberately NOT the
+// 18:00 CME open -- the once-per-session signal limit must give the Asia window
+// and the London window one signal each, not one signal for the whole CME day.
+tradeSessionStart = asiaTradeStart or londonReset
+
+// Track whether London has begun this CME-day.
+var bool londonStarted = false
+if cmeReset
+    londonStarted := false
+if londonReset
+    londonStarted := true
+
+// Bars elapsed since each VWAP anchor was reset. Used for (a) the London VWAP
+// warm-up gate and (b) slope validity -- a slope needs >= 2 bars of the SAME
+// anchor, otherwise it would difference across an anchor boundary.
+var int barsSinceCmeAnchor    = 0
+var int barsSinceLondonAnchor = 0
+if cmeReset
+    barsSinceCmeAnchor := 0
+if londonReset
+    barsSinceLondonAnchor := 0
+if barstate.isconfirmed
+    barsSinceCmeAnchor := barsSinceCmeAnchor + 1
+    if londonStarted
+        barsSinceLondonAnchor := barsSinceLondonAnchor + 1
+
+// The London anchor only takes over once it has enough data to be meaningful.
+useLondonVwap = londonStarted and barsSinceLondonAnchor >= londonVwapWarmup
+
+// =============================================================================
+// CORE SERIES   (verbatim)
+// =============================================================================
+atrVal = ta.atr(atrLen)
+rsiVal = ta.rsi(close, rsiLen)
+
+// Chart EMAs (plotted for context). Trend logic uses slope + separation on the
+// HTF regime below, never raw chart crossovers (which whipsaw on MGC in Asia).
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+// =============================================================================
+// ANCHORED VWAP (reusable, reset-condition driven)   (verbatim)
+// Bands from cumulative variance: Sum(p^2 v)/Sum(v) - vwap^2, floored at 0.
+// NOTE: Pine has no compound assignment (+=), so accumulators use x := x + ...
+// =============================================================================
+f_anchoredVwap(bool resetCond, float src, float vol) =>
+    var float sumPV  = 0.0
+    var float sumV   = 0.0
+    var float sumP2V = 0.0
+    if resetCond
+        sumPV  := 0.0
+        sumV   := 0.0
+        sumP2V := 0.0
+    v = na(vol) ? 0.0 : vol
+    sumPV  := sumPV  + src * v
+    sumV   := sumV   + v
+    sumP2V := sumP2V + src * src * v
+    float vwap = sumV > 0 ? sumPV / sumV : src
+    float variance = sumV > 0 ? math.max(sumP2V / sumV - vwap * vwap, 0.0) : 0.0
+    float sd = math.sqrt(variance)
+    [vwap, sd]
+
+srcVwap = hlc3
+[cmeVwap, cmeSd]       = f_anchoredVwap(cmeReset,    srcVwap, volume)
+[londonVwap, londonSd] = f_anchoredVwap(londonReset, srcVwap, volume)
+
+// Use the London-anchored VWAP once it has warmed up, else the CME-anchored one.
+activeVwap = useLondonVwap ? londonVwap : cmeVwap
+activeSd   = useLondonVwap ? londonSd   : cmeSd
+vwapUpper  = activeVwap + activeSd
+vwapLower  = activeVwap - activeSd
+
+// VWAP SLOPE -- computed PER ANCHOR, then selected. Differencing the blended
+// `activeVwap` series (activeVwap > activeVwap[1]) would be wrong on the bar the
+// anchor switches, because activeVwap[1] still holds the OTHER anchor's value.
+// Selecting the slope instead of slope-ing the selection removes that entirely.
+// Each slope also requires >= 2 bars of its own anchor to be valid.
+cmeVwapRising     = barsSinceCmeAnchor    >= 2 and cmeVwap    > cmeVwap[1]
+cmeVwapFalling    = barsSinceCmeAnchor    >= 2 and cmeVwap    < cmeVwap[1]
+londonVwapRising  = barsSinceLondonAnchor >= 2 and londonVwap > londonVwap[1]
+londonVwapFalling = barsSinceLondonAnchor >= 2 and londonVwap < londonVwap[1]
+vwapRising  = useLondonVwap ? londonVwapRising  : cmeVwapRising
+vwapFalling = useLondonVwap ? londonVwapFalling : cmeVwapFalling
+
+// =============================================================================
+// ASIA RANGE (box + extending high/low lines)   (verbatim)
+// =============================================================================
+var float asiaHigh = na
+var float asiaLow  = na
+if cmeReset
+    asiaHigh := high
+    asiaLow  := low
+else if inRange
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow  := na(asiaLow)  ? low  : math.min(asiaLow,  low)
+
+// Drawing objects (created once per CME-day, updated each bar).
+var box  asiaBox    = na
+var line asiaHiLine = na
+var line asiaLoLine = na
+var int  rangeStartIdx = na
+
+if cmeReset
+    rangeStartIdx := bar_index
+    asiaBox    := box.new(bar_index, high, bar_index, low, border_color=color.new(color.gray, 40), bgcolor=color.new(color.gray, 88))
+    asiaHiLine := line.new(bar_index, high, bar_index, high, color=color.new(color.teal, 0), width=1)
+    asiaLoLine := line.new(bar_index, low,  bar_index, low,  color=color.new(color.orange, 0), width=1)
+
+// While the range is building, grow the box; afterwards extend the lines.
+if not na(asiaBox) and not na(asiaHigh)
+    if inRange
+        box.set_top(asiaBox, asiaHigh)
+        box.set_bottom(asiaBox, asiaLow)
+        box.set_right(asiaBox, bar_index)
+        line.set_xy1(asiaHiLine, rangeStartIdx, asiaHigh)
+        line.set_xy2(asiaHiLine, bar_index, asiaHigh)
+        line.set_xy1(asiaLoLine, rangeStartIdx, asiaLow)
+        line.set_xy2(asiaLoLine, bar_index, asiaLow)
+    else
+        // Range frozen; keep extending the H/L lines into London.
+        line.set_x2(asiaHiLine, bar_index)
+        line.set_x2(asiaLoLine, bar_index)
+
+// =============================================================================
+// RVOL (time-of-day EWMA baseline). Read BEFORE write so the current bar never
+// contributes to its own baseline. map keyed on clock-minute of the session tz.
+// (verbatim)
+// =============================================================================
+var map<int, float> rvolMap = map.new<int, float>()
+int  clockKey  = hour(time, tz) * 60 + minute(time, tz)
+float rvolBaseline = map.contains(rvolMap, clockKey) ? map.get(rvolMap, clockKey) : na
+float rvol = (not na(rvolBaseline) and rvolBaseline > 0) ? volume / rvolBaseline : na
+
+// Update the EWMA AFTER reading (only on confirmed bars to avoid intrabar noise).
+if barstate.isconfirmed
+    float alpha = 2.0 / (rvolN + 1)
+    float newAvg = na(rvolBaseline) ? volume : alpha * volume + (1.0 - alpha) * rvolBaseline
+    map.put(rvolMap, clockKey, newAvg)
+
+rvolHigh = not na(rvol) and rvol >= rvolThreshold
+
+// =============================================================================
+// DELTA / CVD (tick-rule approximation from 1m intrabars)   (verbatim)
+// Intrabar: close>open => +volume (buy), close<open => -volume (sell),
+// equal => split 50/50 (i.e. net contribution 0).
+// This is an APPROXIMATION, not true order flow.
+// The expression is wrapped in a named helper rather than passed as an inline
+// nested ternary -- request.security_lower_tf() is more reliably parsed with a
+// function call as its expression argument.
+// =============================================================================
+f_intrabarDelta() =>
+    close > open ? volume : close < open ? -volume : 0.0
+
+deltaArr = request.security_lower_tf(syminfo.tickerid, deltaTF, f_intrabarDelta())
+// Guard array access with BOTH an na check and a size check -- the call can
+// return na (not merely an empty array) when no intrabar data is available,
+// and array.size(na) throws.
+float barDelta = (not na(deltaArr) and array.size(deltaArr) > 0) ? array.sum(deltaArr) : 0.0
+
+var float cvd = 0.0
+if cmeReset
+    cvd := 0.0
+cvd := cvd + barDelta
+
+// CVD EMA is reset with the session too. ta.ema() cannot be reset, so it would
+// carry the PRIOR session's CVD level (potentially tens of thousands) across the
+// 18:00 boundary and hold the CVD component wrong for ~cvdEmaLen bars into the
+// new session. Same cross-reset bug class as the VWAP slope; hand-rolled here.
+var float cvdEma = na
+float cvdAlpha = 2.0 / (cvdEmaLen + 1)
+if cmeReset
+    cvdEma := cvd
+else
+    cvdEma := na(cvdEma) ? cvd : cvdAlpha * cvd + (1.0 - cvdAlpha) * cvdEma
+
+// Delta-divergence veto: price makes an N-bar high while CVD falls => failed
+// breakout, zero the long score; mirror for shorts.
+// cvd[1] straddles the 18:00 reset on the first bars of a session (yesterday's
+// closing CVD vs today's near-zero), so the slope needs >= 2 bars of this
+// session's anchor to be meaningful -- same guard as the VWAP slopes.
+bool cvdSlopeValid = barsSinceCmeAnchor >= 2
+bool newHigh   = high >= ta.highest(high, deltaDivLookback)
+bool newLow    = low  <= ta.lowest(low,  deltaDivLookback)
+bool cvdFalling = cvdSlopeValid and cvd < cvd[1]
+bool cvdRising  = cvdSlopeValid and cvd > cvd[1]
+bool longVeto  = newHigh and cvdFalling
+bool shortVeto = newLow  and cvdRising
+
+// =============================================================================
+// HTF REGIME (1H EMA21/50 stacked + 15m EMA21 aligned). All lookahead_off.
+// (verbatim)
+// =============================================================================
+ema1hFast = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+ema1hSlow = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaSlowLen), lookahead=barmerge.lookahead_off)
+// 1H fast-EMA slope measured over slopeLookback bars (slope, not a crossover).
+ema1hRising  = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) > ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
+ema1hFalling = request.security(syminfo.tickerid, htfRegimeTF, ta.ema(close, emaFastLen) < ta.ema(close, emaFastLen)[slopeLookback], lookahead=barmerge.lookahead_off)
+// 15m ALIGNMENT: price relative to the 15m EMA21. A 1-bar slope on the 15m EMA
+// was far too noisy -- it flipped on single-bar wiggles and randomly zeroed the
+// entire 2-point HTF component. "Aligned" means price is on the correct side of
+// the 15m EMA, which is what this now tests.
+ema15 = request.security(syminfo.tickerid, htfConfirmTF, ta.ema(close, emaFastLen), lookahead=barmerge.lookahead_off)
+ema15Bull = not na(ema15) and close > ema15
+ema15Bear = not na(ema15) and close < ema15
+
+// 1H ATR -- the separation test must compare a 1H distance against a 1H ATR.
+// Comparing 1H EMA separation against the 5m ATR (~$0.12 on MGC) made the
+// threshold trivially satisfied, i.e. the filter was inert.
+atr1h = request.security(syminfo.tickerid, htfRegimeTF, ta.atr(atrLen), lookahead=barmerge.lookahead_off)
+
+// Require the 1H stack to be genuine (stacked + separated + sloping) AND the
+// 15m EMA aligned. Separation is scaled by the 1H ATR.
+htfSep = math.abs(ema1hFast - ema1hSlow)
+htfSeparated = not na(atr1h) and htfSep > minSepATR * atr1h
+regimeBull = ema1hFast > ema1hSlow and htfSeparated and ema1hRising  and ema15Bull
+regimeBear = ema1hFast < ema1hSlow and htfSeparated and ema1hFalling and ema15Bear
+
+// =============================================================================
+// 20-DAY ADR / RANGE EXPANSION FILTER (no repaint: use [1] on the daily SMA)
+// (verbatim)
+// =============================================================================
+adr = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrDays)[1], lookahead=barmerge.lookahead_off)
+
+// Session range = high-to-low since the CME open.
+var float sessHigh = na
+var float sessLow  = na
+if cmeReset
+    sessHigh := high
+    sessLow  := low
+else
+    sessHigh := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow  := na(sessLow)  ? low  : math.min(sessLow,  low)
+
+float sessRange = (na(sessHigh) or na(sessLow)) ? na : sessHigh - sessLow
+float rangeRatio = (not na(sessRange) and not na(adr) and adr > 0) ? sessRange / adr : na
+
+bool isExpansion = not na(rangeRatio) and rangeRatio >= expansionRatio
+bool isRotation  = not na(rangeRatio) and rangeRatio <  rotationRatio
+string dayType   = na(rangeRatio) ? "n/a" : isExpansion ? "EXPANSION" : isRotation ? "ROTATION" : "NEUTRAL"
+
+// =============================================================================
+// RSI DIVERGENCE via pivots   (verbatim)
+// hidden = continuation -> scores; regular = exhaustion -> EXIT/TRAIL only.
+// PRICE-ANCHORED: swings detected on PRICE (high/low), RSI read at that pivot.
+// =============================================================================
+phPrice = ta.pivothigh(high, pivotLeft, pivotRight)
+plPrice = ta.pivotlow(low,   pivotLeft, pivotRight)
+
+var float prevPHprice = na
+var float prevPHrsi   = na
+var int   prevPHbar   = na
+var float prevPLprice = na
+var float prevPLrsi   = na
+var int   prevPLbar   = na
+
+bool hiddenBull = false   // price higher low  + RSI lower low  => uptrend continuation (scores long)
+bool hiddenBear = false   // price lower high  + RSI higher high => downtrend continuation (scores short)
+bool regBear    = false   // price higher high + RSI lower high  => bearish exhaustion (exit/trail only)
+bool regBull    = false   // price lower low   + RSI higher low  => bullish exhaustion (exit/trail only)
+
+// Pivot HIGH bar sits pivotRight bars back.
+if not na(phPrice)
+    float curPrice = phPrice              // == high[pivotRight]
+    float curRSI   = rsiVal[pivotRight]   // RSI sampled AT the price-pivot bar
+    int   curBar   = bar_index - pivotRight
+    if not na(prevPHrsi) and (curBar - prevPHbar) <= maxBarsBetween
+        if curPrice > prevPHprice and curRSI < prevPHrsi
+            regBear := true
+        if curPrice < prevPHprice and curRSI > prevPHrsi
+            hiddenBear := true
+    prevPHprice := curPrice
+    prevPHrsi   := curRSI
+    prevPHbar   := curBar
+
+// Pivot LOW bar sits pivotRight bars back.
+if not na(plPrice)
+    float curPrice = plPrice              // == low[pivotRight]
+    float curRSI   = rsiVal[pivotRight]   // RSI sampled AT the price-pivot bar
+    int   curBar   = bar_index - pivotRight
+    if not na(prevPLrsi) and (curBar - prevPLbar) <= maxBarsBetween
+        if curPrice > prevPLprice and curRSI < prevPLrsi
+            hiddenBull := true
+        if curPrice < prevPLprice and curRSI > prevPLrsi
+            regBull := true
+    prevPLprice := curPrice
+    prevPLrsi   := curRSI
+    prevPLbar   := curBar
+
+// =============================================================================
+// CONFLUENCE SCORING (per side). Max 10: VWAP 2, HTF 2, Structure 2, RVOL 1,
+// CVD 2, RSI 1.   (verbatim)
+// =============================================================================
+// --- VWAP (2): price on the right side AND VWAP sloping the right way.
+bool vwapBull = close > activeVwap and vwapRising
+bool vwapBear = close < activeVwap and vwapFalling
+
+// --- Structure (2): London = 2 closes beyond the Asia range;
+//                    Asia   = 2 closes beyond the prior N-bar extreme.
+float priorHiN = ta.highest(high, asiaStructLen)[1]
+float priorLoN = ta.lowest(low,  asiaStructLen)[1]
+
+bool structBull = false
+bool structBear = false
+if londonStarted
+    structBull := not na(asiaHigh) and close > asiaHigh and close[1] > asiaHigh
+    structBear := not na(asiaLow)  and close < asiaLow  and close[1] < asiaLow
+else
+    structBull := not na(priorHiN) and close > priorHiN and close[1] > priorHiN[1]
+    structBear := not na(priorLoN) and close < priorLoN and close[1] < priorLoN[1]
+
+// --- CVD (2): CVD on the right side of its EMA AND current bar delta agreeing.
+bool cvdBull = cvd > cvdEma and barDelta > 0
+bool cvdBear = cvd < cvdEma and barDelta < 0
+
+// --- RSI (1): momentum OR hidden divergence.
+bool rsiBull = rsiVal > 50 or hiddenBull
+bool rsiBear = rsiVal < 50 or hiddenBear
+
+// --- Assemble.
+int bullScore = 0
+bullScore := bullScore + (vwapBull   ? 2 : 0)
+bullScore := bullScore + (regimeBull ? 2 : 0)
+bullScore := bullScore + (structBull ? 2 : 0)
+bullScore := bullScore + (rvolHigh   ? 1 : 0)
+bullScore := bullScore + (cvdBull    ? 2 : 0)
+bullScore := bullScore + (rsiBull    ? 1 : 0)
+
+int bearScore = 0
+bearScore := bearScore + (vwapBear   ? 2 : 0)
+bearScore := bearScore + (regimeBear ? 2 : 0)
+bearScore := bearScore + (structBear ? 2 : 0)
+bearScore := bearScore + (rvolHigh   ? 1 : 0)
+bearScore := bearScore + (cvdBear    ? 2 : 0)
+bearScore := bearScore + (rsiBear    ? 1 : 0)
+
+// Delta-divergence veto zeroes the offending side.
+if longVeto
+    bullScore := 0
+if shortVeto
+    bearScore := 0
+
+// =============================================================================
+// POSITION SIZING (Topstep)   (verbatim -- the strategy uses this `contracts`)
+// =============================================================================
+float stopDist       = atrVal * stopMult
+float stopTicks      = syminfo.mintick > 0 ? stopDist / syminfo.mintick : na
+float riskPerContract = (not na(stopTicks)) ? stopTicks * dollarPerTick : na
+int   contracts      = (not na(riskPerContract) and riskPerContract > 0) ? int(math.floor(riskUSD / riskPerContract)) : 0
+contracts := int(math.min(contracts, maxContracts))
+float actualRisk     = contracts * (na(riskPerContract) ? 0.0 : riskPerContract)
+
+float entryPrice = close
+float longStop  = close - stopDist
+float longT1    = close + stopDist        // 1R
+float longT2    = close + 2.0 * stopDist  // 2R
+float shortStop = close + stopDist
+float shortT1   = close - stopDist
+float shortT2   = close - 2.0 * stopDist
+
+// =============================================================================
+// GATING + SIGNALS
+// =============================================================================
+// SESSION ISOLATION: sessionMode selects which of the EXISTING enable gates are
+// active. "Both" leaves them untouched -> byte-identical to the indicator.
+bool enableAsiaEff   = enableAsia   and (sessionMode == "Both" or sessionMode == "Asia only")
+bool enableLondonEff = enableLondon and (sessionMode == "Both" or sessionMode == "London only")
+
+bool inEnabledWindow = (enableAsiaEff and inAsiaTrade) or (enableLondonEff and inLondonTrade)
+bool notCutoff       = not inCutoff
+
+// ROTATION FILTER SCOPE: sessRange accumulates from the 18:00 CME open, so during
+// Asia only a couple of hours have elapsed and range/ADR is inherently small --
+// applying the rotation test there would flag nearly every session as ROTATION
+// and suppress Asia almost permanently. The filter is therefore only applied
+// once London has begun, by which point the session has had time to build range.
+// Asia passes unconditionally.
+bool expansionPass = londonStarted ? (not na(rangeRatio) and not isRotation) : true
+bool baseGate      = inEnabledWindow and notCutoff and expansionPass and barstate.isconfirmed
+
+bool longRaw  = baseGate and bullScore >= signalThreshold and bullScore > bearScore
+bool shortRaw = baseGate and bearScore >= signalThreshold and bearScore > bullScore
+
+// EXHAUSTION SUPPRESSION (verbatim). regBear blocks LONGS; regBull blocks SHORTS.
+var int lastRegBearBar = na
+var int lastRegBullBar = na
+if regBear
+    lastRegBearBar := bar_index
+if regBull
+    lastRegBullBar := bar_index
+bool longExhaustBlock  = not na(lastRegBearBar) and (bar_index - lastRegBearBar) < exhaustBars
+bool shortExhaustBlock = not na(lastRegBullBar) and (bar_index - lastRegBullBar) < exhaustBars
+
+// ONE SIGNAL PER SESSION PER SIDE (verbatim). Flags reset at each TRADE-window open.
+var bool longFiredSession  = false
+var bool shortFiredSession = false
+if tradeSessionStart
+    longFiredSession  := false
+    shortFiredSession := false
+bool onceLongOK  = not oneSignalPerSession or not longFiredSession
+bool onceShortOK = not oneSignalPerSession or not shortFiredSession
+
+// DEBOUNCE, two layers (verbatim): per-side + cross-side.
+var int lastLongBar   = na
+var int lastShortBar  = na
+var int lastSignalBar = na
+bool longOK  = na(lastLongBar)   or (bar_index - lastLongBar)   >= debounceBars
+bool shortOK = na(lastShortBar)  or (bar_index - lastShortBar)  >= debounceBars
+bool anyOK   = na(lastSignalBar) or (bar_index - lastSignalBar) >= debounceBars
+
+// ORDERING INVARIANT (verbatim): every suppression term is folded into
+// longSignal/shortSignal HERE, and the state writes below are gated on those
+// final values, so suppression can only remove signals, never eat a later one.
+bool longSignal  = longRaw  and longOK  and anyOK and not longExhaustBlock  and onceLongOK
+bool shortSignal = shortRaw and shortOK and anyOK and not shortExhaustBlock and onceShortOK
+
+// longRaw and shortRaw are mutually exclusive (each requires its side to strictly
+// exceed the other), so at most one of these branches runs on any bar.
+if longSignal
+    lastLongBar      := bar_index
+    lastSignalBar    := bar_index
+    longFiredSession := true
+if shortSignal
+    lastShortBar      := bar_index
+    lastSignalBar     := bar_index
+    shortFiredSession := true
+
+bool longStrong  = longSignal  and bullScore >= strongThreshold
+bool shortStrong = shortSignal and bearScore >= strongThreshold
+
+// =============================================================================
+// DATA-READINESS GATE  (STRATEGY-ONLY -- gates entries, never signals)
+// -----------------------------------------------------------------------------
+// request.security_lower_tf() has limited historical depth, so on older bars the
+// CVD component returns no data and silently scores zero; the RVOL time-of-day
+// map also needs warm-up. Backtesting across those bars tests a different,
+// WEAKER strategy (effectively 8/10 max score instead of 10). dataReady is true
+// only when BOTH the intrabar delta array is present/non-empty AND the RVOL
+// baseline for the current clock-minute has been populated.
+// =============================================================================
+bool deltaReady = not na(deltaArr) and array.size(deltaArr) > 0
+bool rvolReady  = not na(rvolBaseline)      // map already holds this clock-minute key
+bool dataReady  = deltaReady and rvolReady
+
+// =============================================================================
+// TOPSTEP MODEL  (STRATEGY-ONLY)
+// -----------------------------------------------------------------------------
+// Reset boundary is the 18:00 CME session open (cmeReset), NOT midnight.
+// =============================================================================
+// Intraday P&L from the session open. strategy.equity includes open-trade P&L,
+// so this approximates the real Topstep DLL's unrealized component (a bar-close
+// backtest cannot see true intrabar unrealized excursions).
+var float dayStartEquity = na
+if cmeReset
+    dayStartEquity := strategy.equity
+float dayPnL = na(dayStartEquity) ? 0.0 : strategy.equity - dayStartEquity
+
+// Daily-loss-limit latch: once tripped, no new entries for the rest of the day.
+var bool dllLatched = false
+if cmeReset
+    dllLatched := false
+if not na(dayStartEquity) and dayPnL <= -dailyLossLimit
+    dllLatched := true
+
+// Trades taken this trading day.
+var int tradesToday = 0
+if cmeReset
+    tradesToday := 0
+
+// Trailing drawdown tracker (display only -- trading is NOT halted on it).
+// Peak of END-OF-DAY balances. Positions are flat at the 18:00 CME open (no
+// trade window spans it), so strategy.equity at cmeReset is the realized EOD
+// balance of the day that just ended.
+var float peakEodBalance = strategy.initial_capital
+var float lastEodBalance = strategy.initial_capital
+if cmeReset and bar_index > 0
+    lastEodBalance := strategy.equity
+    peakEodBalance := math.max(peakEodBalance, lastEodBalance)
+float trailThreshold = peakEodBalance - trailingDD
+float distToTrail    = strategy.equity - trailThreshold
+
+// =============================================================================
+// EXECUTION -- ENTRIES  (STRATEGY-ONLY)
+// -----------------------------------------------------------------------------
+// Long on longSignal, short on shortSignal, at the `contracts` size computed by
+// the sizing logic. No entry if contracts < 1 or not dataReady; additionally
+// blocked by the Topstep daily-loss latch and the max-trades-per-day cap.
+// process_orders_on_close = true fills at the signal bar's close.
+// =============================================================================
+bool topstepEntryOK = not dllLatched and tradesToday < maxTradesPerDay
+bool canEnterLong   = longSignal  and dataReady and contracts >= 1 and topstepEntryOK
+bool canEnterShort  = shortSignal and dataReady and contracts >= 1 and topstepEntryOK
+
+// Per-trade levels captured at entry (levels are 1R/2R off the entry-bar close,
+// exactly the indicator's longStop/longT1/longT2 etc.).
+var float tEntry    = na
+var float tStop     = na
+var float tT1       = na
+var float tT2       = na
+var int   tDir      = 0
+var int   tInitSize = 0
+var bool  tT1done   = false
+var string tSessTag = na
+
+if canEnterLong
+    tEntry    := close
+    tStop     := longStop
+    tT1       := longT1
+    tT2       := longT2
+    tDir      := 1
+    tInitSize := contracts
+    tT1done   := false
+    tSessTag  := inLondonTrade ? "L" : "A"
+    tradesToday := tradesToday + 1
+    strategy.entry("L", strategy.long, qty=contracts)
+else if canEnterShort
+    tEntry    := close
+    tStop     := shortStop
+    tT1       := shortT1
+    tT2       := shortT2
+    tDir      := -1
+    tInitSize := contracts
+    tT1done   := false
+    tSessTag  := inLondonTrade ? "L" : "A"
+    tradesToday := tradesToday + 1
+    strategy.entry("R", strategy.short, qty=contracts)
+
+// =============================================================================
+// EXECUTION -- EXITS  (STRATEGY-ONLY)
+// -----------------------------------------------------------------------------
+// 1. Stop at tStop (ATR x stopMult, same as the indicator).
+// 2. Scale scaleT1Pct% out at T1 (1R).
+// 3. Move stop to breakeven after T1 fills (moveBEafterT1).
+// 4. Runner exits at T2 (2R) (runnerExit).
+// 5. Exhaustion exit: close longs on regBear, shorts on regBull (exhaustExit).
+// 6. Session flatten at the cutoff window (non-optional).
+// =============================================================================
+// T1-fill detection: position reduced below its initial size but still open.
+if strategy.position_size != 0
+    tT1done := tT1done or (math.abs(strategy.position_size) < tInitSize)
+
+float remStopL = (tT1done and moveBEafterT1) ? tEntry : tStop
+float remStopS = (tT1done and moveBEafterT1) ? tEntry : tStop
+float runLimitL = runnerExit ? tT2 : na
+float runLimitS = runnerExit ? tT2 : na
+
+// LONG exits
+if strategy.position_size > 0 and tDir == 1
+    if scaleT1Pct > 0 and scaleT1Pct < 100
+        strategy.exit("L-scale", from_entry="L", qty_percent=scaleT1Pct, limit=tT1, stop=tStop)
+        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=remStopL)
+    else if scaleT1Pct >= 100
+        strategy.exit("L-scale", from_entry="L", limit=tT1, stop=tStop)
+    else
+        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=remStopL)
+
+// SHORT exits
+if strategy.position_size < 0 and tDir == -1
+    if scaleT1Pct > 0 and scaleT1Pct < 100
+        strategy.exit("R-scale", from_entry="R", qty_percent=scaleT1Pct, limit=tT1, stop=tStop)
+        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=remStopS)
+    else if scaleT1Pct >= 100
+        strategy.exit("R-scale", from_entry="R", limit=tT1, stop=tStop)
+    else
+        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=remStopS)
+
+// Exhaustion exit (market close on the exhausting divergence).
+if exhaustExit and strategy.position_size > 0 and regBear
+    strategy.close("L", comment="exhaust")
+if exhaustExit and strategy.position_size < 0 and regBull
+    strategy.close("R", comment="exhaust")
+
+// Session flatten -- NON-OPTIONAL. Fires on the first cutoff bar (07:00), whose
+// close is well before the window ends (07:15), so nothing is carried past the
+// session. Topstep's trailing drawdown trails on EOD balance; carrying a
+// position past the session is not the strategy being tested.
+if inCutoff and strategy.position_size != 0
+    strategy.close_all(comment="EOD flatten")
+
+// =============================================================================
+// PER-SESSION P&L (bonus). Attributed by ENTRY session. One position at a time
+// (pyramiding = 0), so we bracket each trade: capture equity at open, difference
+// at flat. This aggregates partial scale-outs into a single per-trade P&L.
+// =============================================================================
+var int   asiaTrades   = 0
+var int   asiaWins     = 0
+var float asiaGross    = 0.0
+var int   londonTrades = 0
+var int   londonWins   = 0
+var float londonGross  = 0.0
+var float tradeStartEq = na
+
+bool justOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+bool justClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if justOpened
+    tradeStartEq := strategy.equity[1]
+if justClosed and not na(tradeStartEq)
+    float tradePnL = strategy.equity - tradeStartEq
+    if tSessTag == "L"
+        londonTrades := londonTrades + 1
+        londonGross  := londonGross + tradePnL
+        if tradePnL > 0
+            londonWins := londonWins + 1
+    else
+        asiaTrades := asiaTrades + 1
+        asiaGross  := asiaGross + tradePnL
+        if tradePnL > 0
+            asiaWins := asiaWins + 1
+
+// =============================================================================
+// PLOTS (global scope only)   (retained from the indicator)
+// =============================================================================
+plot(emaFast, "EMA fast", color=color.new(color.aqua, 0), linewidth=1)
+plot(emaSlow, "EMA slow", color=color.new(color.blue, 0), linewidth=2)
+
+plot(activeVwap, "Anchored VWAP", color=color.new(color.yellow, 0), linewidth=2)
+pUpper = plot(showVwapBands ? vwapUpper : na, "VWAP +1s", color=color.new(color.yellow, 60))
+pLower = plot(showVwapBands ? vwapLower : na, "VWAP -1s", color=color.new(color.yellow, 60))
+fill(pUpper, pLower, color=showVwapBands ? color.new(color.yellow, 92) : na, title="VWAP band fill")
+
+// Session background shading (priority: London > Asia trade > range build).
+color bgCol = na
+if inLondonTrade
+    bgCol := color.new(color.green, 90)
+else if inAsiaTrade
+    bgCol := color.new(color.orange, 90)
+else if inRange
+    bgCol := color.new(color.gray, 92)
+bgcolor(bgCol, title="Session shading")
+
+// DATA-READINESS tint: mark the INVALID region (no CVD / no RVOL baseline) so the
+// valid backtest window is visible. Faint red where NOT dataReady.
+bgcolor(not dataReady ? color.new(color.red, 90) : na, title="Data NOT ready")
+
+// Signal markers (retained -- these are the byte-identical indicator signals).
+plotshape(longSignal  and not longStrong,  title="Long signal",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0),  size=size.small)
+plotshape(longStrong,                       title="Long STRONG",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 0),   size=size.normal)
+plotshape(shortSignal and not shortStrong,  title="Short signal",  style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),    size=size.small)
+plotshape(shortStrong,                       title="Short STRONG",  style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.normal)
+
+// Exhaustion warnings (X-cross), never contribute to entry score.
+plotshape(regBear, title="Bearish exhaustion (exit/trail)", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plotshape(regBull, title="Bullish exhaustion (exit/trail)", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
+
+// =============================================================================
+// DASHBOARD (top-right, only on the last bar)  (indicator rows retained,
+// strategy rows appended)
+// =============================================================================
+string curSession = inLondonTrade ? "LONDON trade" : inAsiaTrade ? "ASIA trade" : inRange ? "ASIA range build" : inCutoff ? "CUTOFF" : "Out of session"
+
+string bullParts = (vwapBull ? "V" : "-") + (regimeBull ? "H" : "-") + (structBull ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBull ? "C" : "-") + (rsiBull ? "I" : "-")
+string bearParts = (vwapBear ? "V" : "-") + (regimeBear ? "H" : "-") + (structBear ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBear ? "C" : "-") + (rsiBear ? "I" : "-")
+
+var table dash = table.new(position.top_right, 2, 25, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+
+color cGray  = color.new(color.gray, 30)
+color cGreen = color.new(color.green, 20)
+color cRed   = color.new(color.red, 20)
+color cText  = color.white
+
+if barstate.islast
+    table.cell(dash, 0, 0, "MGC A/L Strategy", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 0, curSession, text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 1, "Bull score", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(bullScore) + " / 10", text_color=cText, bgcolor=bullScore >= signalThreshold ? cGreen : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Bear score", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(bearScore) + " / 10", text_color=cText, bgcolor=bearScore >= signalThreshold ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Bull VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 3, bullParts, text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Bear VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 4, bearParts, text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 5, "1H regime", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 5, regimeBull ? "BULL" : regimeBear ? "BEAR" : "flat", text_color=cText, bgcolor=regimeBull ? cGreen : regimeBear ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 6, "VWAP (anchor)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 6, (close > activeVwap ? "above" : close < activeVwap ? "below" : "at") + " (" + (useLondonVwap ? "LON" : "CME") + ")", text_color=cText, bgcolor=close > activeVwap ? cGreen : close < activeVwap ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 7, "RVOL", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 7, na(rvol) ? "n/a" : str.tostring(rvol, "#.##") + "x", text_color=cText, bgcolor=rvolHigh ? cGreen : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 8, "CVD", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(cvd, "#") + (cvd > cvdEma ? " >EMA" : " <EMA"), text_color=cText, bgcolor=cvd > cvdEma ? cGreen : cRed, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Range/ADR", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 9, na(rangeRatio) ? "n/a" : str.tostring(rangeRatio * 100, "#") + "%", text_color=cText, bgcolor=isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 10, "Day type", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 10, londonStarted ? dayType : dayType + " (info)", text_color=cText, bgcolor=not londonStarted ? cGray : isExpansion ? cGreen : isRotation ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 11, "ATR stop (ticks)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 11, na(stopTicks) ? "n/a" : str.tostring(stopTicks, "#.#"), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 12, "Position size (calc)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 12, str.tostring(contracts) + " contr", text_color=cText, bgcolor=contracts > 0 ? cGreen : cRed, text_size=size.small)
+
+    table.cell(dash, 0, 13, "$ risk if filled", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 13, "$" + str.tostring(actualRisk, "#.##"), text_color=cText, bgcolor=actualRisk <= riskUSD ? cGreen : cRed, text_size=size.small)
+
+    table.cell(dash, 0, 14, "Delta veto", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 14, longVeto ? "LONG vetoed" : shortVeto ? "SHORT vetoed" : "none", text_color=cText, bgcolor=(longVeto or shortVeto) ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 15, "Exhaust block", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 15, longExhaustBlock and shortExhaustBlock ? "BOTH" : longExhaustBlock ? "LONGS" : shortExhaustBlock ? "SHORTS" : "none", text_color=cText, bgcolor=(longExhaustBlock or shortExhaustBlock) ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 16, "Fired (session)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 16, not oneSignalPerSession ? "limit off" : (longFiredSession ? "L" : "-") + " / " + (shortFiredSession ? "S" : "-"), text_color=cText, bgcolor=(oneSignalPerSession and (longFiredSession or shortFiredSession)) ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 17, "Windows", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 17, (enableAsia ? "A" : "-") + " / " + (enableLondon ? "L" : "-"), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 18, "Risk vs limits", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 18, (trailingDD > 0 ? str.tostring(actualRisk / trailingDD * 100, "#.#") + "% of DD" : "n/a") + " | lim $" + str.tostring(dailyLossLimit, "#"), text_color=cText, bgcolor=actualRisk <= dailyLossLimit ? cGray : cRed, text_size=size.small)
+
+    // ---- STRATEGY-ADDED ROWS -------------------------------------------------
+    table.cell(dash, 0, 19, "Data ready", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 19, dataReady ? "YES (valid)" : (not deltaReady ? "no CVD" : "no RVOL"), text_color=cText, bgcolor=dataReady ? cGreen : cRed, text_size=size.small)
+
+    table.cell(dash, 0, 20, "Session mode", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 20, sessionMode, text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dash, 0, 21, "Trades today", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 21, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), text_color=cText, bgcolor=tradesToday >= maxTradesPerDay ? cRed : cGray, text_size=size.small)
+
+    table.cell(dash, 0, 22, "Daily P&L vs limit", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 22, "$" + str.tostring(dayPnL, "#") + " / -$" + str.tostring(dailyLossLimit, "#") + (dllLatched ? " HALT" : ""), text_color=cText, bgcolor=dllLatched ? cRed : (dayPnL < 0 ? cGray : cGreen), text_size=size.small)
+
+    table.cell(dash, 0, 23, "Dist to trail DD", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 23, "$" + str.tostring(distToTrail, "#") + " (thr $" + str.tostring(trailThreshold, "#") + ")", text_color=cText, bgcolor=distToTrail <= 0 ? cRed : distToTrail < trailingDD * 0.25 ? color.new(color.orange, 20) : cGreen, text_size=size.small)
+
+    table.cell(dash, 0, 24, "Open position", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dash, 1, 24, strategy.position_size == 0 ? "flat" : (strategy.position_size > 0 ? "LONG " : "SHORT ") + str.tostring(math.abs(strategy.position_size)) + (tT1done ? " (BE)" : ""), text_color=cText, bgcolor=strategy.position_size == 0 ? cGray : strategy.position_size > 0 ? cGreen : cRed, text_size=size.small)
+
+// =============================================================================
+// PER-SESSION A/B TABLE (bottom-right, bonus). Entry-session attribution.
+// =============================================================================
+var table sessTbl = table.new(position.bottom_right, 4, 4, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if barstate.islast and showSessionTable
+    table.cell(sessTbl, 0, 0, "Session", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 1, 0, "Trades",  text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 2, 0, "Wins",    text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 3, 0, "Gross $", text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(sessTbl, 0, 1, "Asia",   text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 1, 1, str.tostring(asiaTrades), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 2, 1, str.tostring(asiaWins) + (asiaTrades > 0 ? " (" + str.tostring(asiaWins / asiaTrades * 100, "#") + "%)" : ""), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 3, 1, "$" + str.tostring(asiaGross, "#"), text_color=cText, bgcolor=asiaGross >= 0 ? cGreen : cRed, text_size=size.small)
+
+    table.cell(sessTbl, 0, 2, "London", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 1, 2, str.tostring(londonTrades), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 2, 2, str.tostring(londonWins) + (londonTrades > 0 ? " (" + str.tostring(londonWins / londonTrades * 100, "#") + "%)" : ""), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 3, 2, "$" + str.tostring(londonGross, "#"), text_color=cText, bgcolor=londonGross >= 0 ? cGreen : cRed, text_size=size.small)
+
+    table.cell(sessTbl, 0, 3, "TOTAL", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 1, 3, str.tostring(asiaTrades + londonTrades), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 2, 3, str.tostring(asiaWins + londonWins), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(sessTbl, 3, 3, "$" + str.tostring(asiaGross + londonGross, "#"), text_color=cText, bgcolor=(asiaGross + londonGross) >= 0 ? cGreen : cRed, text_size=size.small)
+
+// =============================================================================
+// ALERTS  (retained from the indicator; harmless in a strategy)
+// =============================================================================
+if longSignal
+    string msg = str.format("MGC LONG | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bullScore, str.tostring(entryPrice, format.mintick), str.tostring(longStop, format.mintick), str.tostring(longT1, format.mintick), str.tostring(longT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
+    alert(msg, alert.freq_once_per_bar_close)
+if shortSignal
+    string msg = str.format("MGC SHORT | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bearScore, str.tostring(entryPrice, format.mintick), str.tostring(shortStop, format.mintick), str.tostring(shortT1, format.mintick), str.tostring(shortT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
+    alert(msg, alert.freq_once_per_bar_close)
+
+alertcondition(longSignal,  title="MGC Long signal",             message="MGC LONG confluence signal")
+alertcondition(shortSignal, title="MGC Short signal",            message="MGC SHORT confluence signal")
+alertcondition(regBear,     title="MGC Bearish exhaustion",      message="MGC bearish exhaustion (regular divergence) - exit/trail warning")
+alertcondition(regBull,     title="MGC Bullish exhaustion",      message="MGC bullish exhaustion (regular divergence) - exit/trail warning")
