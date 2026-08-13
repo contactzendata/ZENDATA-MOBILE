@@ -595,6 +595,70 @@ bool longStrong  = longSignal  and bullScore >= strongThreshold
 bool shortStrong = shortSignal and bearScore >= strongThreshold
 
 // =============================================================================
+// !!! TEMPORARY LONDON DIAGNOSTICS -- REMOVE AFTER TUNING !!!
+// -----------------------------------------------------------------------------
+// Read-only counters to see which side/component is starving the London window,
+// and whether raw signals are generated then suppressed vs never generated at
+// all. Counts accumulate over EVERY confirmed London-window bar in the loaded
+// range (no reset). NOTHING here feeds signals, entries, or exits -- pure
+// observation. The `>=7 (raw)` rows count the SCORE reaching the threshold with
+// NO suppression applied; the `raw signal` rows count longRaw/shortRaw (fully
+// gated but BEFORE debounce, session-cap and exhaustion). Compare those to the
+// per-session trade table (bottom-right) to locate the loss:
+//   raw signal count >> trades  => generated then SUPPRESSED (debounce/cap/exh)
+//   raw signal count ~ trades   => never generated; read the component rows
+// =============================================================================
+var int dbgLonBars    = 0
+var int dbgVwapBull   = 0
+var int dbgRegimeBull = 0
+var int dbgStructBull = 0
+var int dbgRvolHigh   = 0
+var int dbgCvdBull    = 0
+var int dbgRsiBull    = 0
+var int dbgVwapBear   = 0
+var int dbgRegimeBear = 0
+var int dbgStructBear = 0
+var int dbgCvdBear    = 0
+var int dbgRsiBear    = 0
+var int dbgBullGE7    = 0
+var int dbgBearGE7    = 0
+var int dbgLongRaw    = 0
+var int dbgShortRaw   = 0
+
+if inLondonTrade and barstate.isconfirmed
+    dbgLonBars := dbgLonBars + 1
+    if vwapBull
+        dbgVwapBull := dbgVwapBull + 1
+    if regimeBull
+        dbgRegimeBull := dbgRegimeBull + 1
+    if structBull
+        dbgStructBull := dbgStructBull + 1
+    if rvolHigh
+        dbgRvolHigh := dbgRvolHigh + 1
+    if cvdBull
+        dbgCvdBull := dbgCvdBull + 1
+    if rsiBull
+        dbgRsiBull := dbgRsiBull + 1
+    if vwapBear
+        dbgVwapBear := dbgVwapBear + 1
+    if regimeBear
+        dbgRegimeBear := dbgRegimeBear + 1
+    if structBear
+        dbgStructBear := dbgStructBear + 1
+    if cvdBear
+        dbgCvdBear := dbgCvdBear + 1
+    if rsiBear
+        dbgRsiBear := dbgRsiBear + 1
+    if bullScore >= signalThreshold
+        dbgBullGE7 := dbgBullGE7 + 1
+    if bearScore >= signalThreshold
+        dbgBearGE7 := dbgBearGE7 + 1
+    if longRaw
+        dbgLongRaw := dbgLongRaw + 1
+    if shortRaw
+        dbgShortRaw := dbgShortRaw + 1
+
+// =============================================================================
 // DATA-READINESS GATE  (STRATEGY-ONLY -- gates entries, never signals)
 // -----------------------------------------------------------------------------
 // request.security_lower_tf() has limited historical depth, so on older bars the
@@ -926,6 +990,56 @@ if barstate.islast and showSessionTable
     table.cell(sessTbl, 1, 3, str.tostring(asiaTrades + londonTrades), text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(sessTbl, 2, 3, str.tostring(asiaWins + londonWins), text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(sessTbl, 3, 3, "$" + str.tostring(asiaGross + londonGross, "#"), text_color=cText, bgcolor=(asiaGross + londonGross) >= 0 ? cGreen : cRed, text_size=size.small)
+
+// =============================================================================
+// !!! TEMPORARY LONDON DIAGNOSTIC TABLE (top-left) -- REMOVE AFTER TUNING !!!
+// Columns: component | BULL count | BEAR count, over all confirmed London bars.
+// =============================================================================
+var table dbgTbl = table.new(position.top_left, 3, 11, bgcolor=color.new(color.black, 10), border_width=1, frame_color=color.new(color.orange, 40), frame_width=1)
+if barstate.islast
+    table.cell(dbgTbl, 0, 0, "LONDON DIAG (TEMP)", text_color=color.orange, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 0, "BULL", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 0, "BEAR", text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 1, "VWAP (2)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 1, str.tostring(dbgVwapBull), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 1, str.tostring(dbgVwapBear), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 2, "HTF regime (2)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 2, str.tostring(dbgRegimeBull), text_color=cText, bgcolor=dbgRegimeBull == 0 ? cRed : cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 2, str.tostring(dbgRegimeBear), text_color=cText, bgcolor=dbgRegimeBear == 0 ? cRed : cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 3, "Struct (2)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 3, str.tostring(dbgStructBull), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 3, str.tostring(dbgStructBear), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 4, "RVOL (1, shared)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 4, str.tostring(dbgRvolHigh), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 4, str.tostring(dbgRvolHigh), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 5, "CVD (2)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 5, str.tostring(dbgCvdBull), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 5, str.tostring(dbgCvdBear), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 6, "RSI (1)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 6, str.tostring(dbgRsiBull), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 6, str.tostring(dbgRsiBear), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 7, "score>=7 (raw)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 7, str.tostring(dbgBullGE7), text_color=cText, bgcolor=dbgBullGE7 > 0 ? cGreen : cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 7, str.tostring(dbgBearGE7), text_color=cText, bgcolor=dbgBearGE7 > 0 ? cGreen : cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 8, "raw signal (pre-supp)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 8, str.tostring(dbgLongRaw), text_color=cText, bgcolor=dbgLongRaw > 0 ? cGreen : cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 8, str.tostring(dbgShortRaw), text_color=cText, bgcolor=dbgShortRaw > 0 ? cGreen : cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 9, "London bars (confirmed)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 9, str.tostring(dbgLonBars), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 9, "", text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(dbgTbl, 0, 10, "-> vs London trades", text_color=color.orange, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 1, 10, str.tostring(londonTrades) + " trd", text_color=color.orange, bgcolor=cGray, text_size=size.small)
+    table.cell(dbgTbl, 2, 10, "", text_color=cText, bgcolor=cGray, text_size=size.small)
 
 // =============================================================================
 // ALERTS  (retained from the indicator; harmless in a strategy)
