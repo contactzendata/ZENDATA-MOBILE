@@ -758,6 +758,16 @@ if shortSignal
     string msg = str.format("MGC SHORT | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bearScore, str.tostring(entryPrice, format.mintick), str.tostring(shortStop, format.mintick), str.tostring(shortT1, format.mintick), str.tostring(shortT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
     alert(msg, alert.freq_once_per_bar_close)
 
+// Dynamic exhaustion alerts -- these DO fire through "Any alert() function call".
+// regBear = bearish exhaustion at a high (price higher high + RSI lower high) => trail/exit LONGS.
+// regBull = bullish exhaustion at a low  (price lower low  + RSI higher low)  => trail/exit SHORTS.
+if regBear
+    string msg = str.format("MGC EXHAUSTION | BEARISH (price higher high + RSI lower high) | price {0} | RSI {1} | EXIT/TRAIL LONGS", str.tostring(close, format.mintick), str.tostring(rsiVal, "#.#"))
+    alert(msg, alert.freq_once_per_bar_close)
+if regBull
+    string msg = str.format("MGC EXHAUSTION | BULLISH (price lower low + RSI higher low) | price {0} | RSI {1} | EXIT/TRAIL SHORTS", str.tostring(close, format.mintick), str.tostring(rsiVal, "#.#"))
+    alert(msg, alert.freq_once_per_bar_close)
+
 // Static alertcondition() declarations.
 alertcondition(longSignal,  title="MGC Long signal",             message="MGC LONG confluence signal")
 alertcondition(shortSignal, title="MGC Short signal",            message="MGC SHORT confluence signal")
