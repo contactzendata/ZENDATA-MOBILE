@@ -253,3 +253,14 @@ Cells are color-coded green / red / gray by state.
 - Every `request.security()` / `request.security_lower_tf()` uses
   `lookahead = barmerge.lookahead_off` — **no repainting by design.**
 - No `request.footprint()` (Plus-plan safe).
+
+---
+
+## Companion tooling
+
+- **`propsim/`** — a Monte Carlo simulator for prop-firm evaluations
+  (`python -m propsim trades.csv`). Point it at a CSV of real fills to estimate
+  how often that trade distribution clears an evaluation, and how the answer
+  moves with position size. Its default ruleset is **unverified** and its day-
+  resampling model cannot reproduce multi-day losing streaks — see
+  [`propsim/README.md`](propsim/README.md) before trusting a number.
