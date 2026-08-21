@@ -753,6 +753,24 @@ var float trailExtreme = na   // highest high (long) / lowest low (short) since 
 var float trailStop    = na   // ratcheted chandelier stop for the active trade
 var float trailMult    = na   // active multiplier (mode C may tighten it mid-trade)
 
+// ---- ENTRY ATTRIBUTION SNAPSHOT (MEASUREMENT ONLY) --------------------------
+// Captured at each entry from the SAME entry-bar values used to size/place the
+// order, then paired with realized P&L when the position closes. These feed
+// NOTHING in the order path (no entry, exit, score or gate reads them) -- they
+// exist purely so the closed-position log and component win-rate tables below
+// can attribute each trade. VHSRCI is the traded side's six-component string,
+// built from the already-computed component booleans (vwapBull/regimeBull/...),
+// so it changes no logic. eScore is the traded side's score.
+var int    eBarTime   = na
+var int    eDir       = 0
+var string eSess      = na
+var int    eScore     = 0
+var string eVHSRCI    = na
+var float  eRvol      = na
+var string eDayType   = na
+var float  eStopTicks = na
+var int    eContracts = 0
+
 if canEnterLong
     tEntry    := close
     tStop     := longStop
@@ -765,6 +783,16 @@ if canEnterLong
     trailExtreme := high
     trailMult    := chandelierMult
     trailStop    := na
+    // Entry attribution snapshot (measurement only -- see declarations above).
+    eBarTime   := time
+    eDir       := 1
+    eSess      := tSessTag
+    eScore     := bullScore
+    eVHSRCI    := (vwapBull ? "V" : "-") + (regimeBull ? "H" : "-") + (structBull ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBull ? "C" : "-") + (rsiBull ? "I" : "-")
+    eRvol      := rvol
+    eDayType   := dayType
+    eStopTicks := stopTicks
+    eContracts := contracts
     tradesToday := tradesToday + 1
     strategy.entry("L", strategy.long, qty=contracts)
 else if canEnterShort
@@ -779,6 +807,16 @@ else if canEnterShort
     trailExtreme := low
     trailMult    := chandelierMult
     trailStop    := na
+    // Entry attribution snapshot (measurement only -- see declarations above).
+    eBarTime   := time
+    eDir       := -1
+    eSess      := tSessTag
+    eScore     := bearScore
+    eVHSRCI    := (vwapBear ? "V" : "-") + (regimeBear ? "H" : "-") + (structBear ? "S" : "-") + (rvolHigh ? "R" : "-") + (cvdBear ? "C" : "-") + (rsiBear ? "I" : "-")
+    eRvol      := rvol
+    eDayType   := dayType
+    eStopTicks := stopTicks
+    eContracts := contracts
     tradesToday := tradesToday + 1
     strategy.entry("R", strategy.short, qty=contracts)
 
@@ -899,6 +937,22 @@ var int   londonWins   = 0
 var float londonGross  = 0.0
 var float tradeStartEq = na
 
+// CLOSED-POSITION ATTRIBUTION LOG (measurement only). One element appended per
+// CLOSED POSITION (not per exit leg) when the position goes flat, pairing the
+// entry snapshot captured above with the realized per-position P&L bracketed
+// here. Parallel arrays, index-aligned; consumed by the recent-trades and
+// component win-rate tables on the last bar. Touches no signal/order logic.
+var array<int>    logTime    = array.new<int>()
+var array<int>    logDir     = array.new<int>()
+var array<string> logSess    = array.new<string>()
+var array<int>    logScore   = array.new<int>()
+var array<string> logVHSRCI  = array.new<string>()
+var array<float>  logRvol    = array.new<float>()
+var array<string> logDayType = array.new<string>()
+var array<float>  logStopTk  = array.new<float>()
+var array<int>    logContr   = array.new<int>()
+var array<float>  logPnL     = array.new<float>()
+
 bool justOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
 bool justClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
 
@@ -916,11 +970,33 @@ if justClosed and not na(tradeStartEq)
         asiaGross  := asiaGross + tradePnL
         if tradePnL > 0
             asiaWins := asiaWins + 1
+    // Append this closed position's entry attribution + realized P&L.
+    array.push(logTime,    eBarTime)
+    array.push(logDir,     eDir)
+    array.push(logSess,    eSess)
+    array.push(logScore,   eScore)
+    array.push(logVHSRCI,  eVHSRCI)
+    array.push(logRvol,    eRvol)
+    array.push(logDayType, eDayType)
+    array.push(logStopTk,  eStopTicks)
+    array.push(logContr,   eContracts)
+    array.push(logPnL,     tradePnL)
 
 // =============================================================================
-// EXIT-REASON INSTRUMENTATION (STRATEGY-ONLY). One terminal reason is recorded
-// as each position goes flat; the terminal counters + the partials row sum to
-// strategy.closedtrades. Attribution of the just-closed trade:
+// EXIT-REASON INSTRUMENTATION (STRATEGY-ONLY).
+// -----------------------------------------------------------------------------
+// UNIT: this table reports PER CLOSED POSITION, not per exit leg. A scaled
+// position closes via two legs (-scale and -run), so strategy.closedtrades
+// counts LEGS (~2x positions) and can never equal a per-position terminal
+// tally -- that was the old MISMATCH. Here exactly ONE terminal reason is
+// recorded per position on the bar it goes flat (justClosed), a position
+// counter (cPosClosed) is bumped on the same bar, and the reconciliation is
+// terminalTotal == cPosClosed -- an identity by construction, which is exactly
+// what makes it a real check: any code path that ever failed to classify a
+// close, or double-counted one, would break it. The leg count
+// (strategy.closedtrades) and the partial-reduction count are shown as separate
+// INFORMATIONAL rows, excluded from the reconcile.
+// Attribution of the just-closed position (the last leg carries its reason):
 //   exit_comment "exhaust"                          -> exhaustion close
 //   exit_comment "EOD flatten"/"window-end flatten" -> window/EOD flatten
 //   exit on the TARGET side of entry (limit)        -> target limit (T2 or T1@100%)
@@ -929,25 +1005,22 @@ if justClosed and not na(tradeStartEq)
 //   stop side otherwise (incl. any PRE-T1 stop)     -> initial stop
 // tT1done is guarded by position!=0, so it is NEVER set on the flat bar -- at
 // justClosed it still tells us truthfully whether a T1 partial actually filled.
-// Partials (any non-flattening size reduction) are counted on their own row and
-// EXCLUDED from the terminal reconciliation. In Mode A the only reduction is the
-// T1 scale-out; in B/C the runner (-run) can also trail-stop out before the
-// -scale half, which is a partial too -- counting reductions generally keeps the
-// reconciliation exact across all three modes.
 // =============================================================================
-var int cInitStop = 0
-var int cBEstop   = 0
-var int cTarget   = 0
-var int cTrail    = 0
-var int cExhaust  = 0
-var int cFlatten  = 0
-var int cPartial  = 0
+var int cInitStop  = 0
+var int cBEstop    = 0
+var int cTarget    = 0
+var int cTrail     = 0
+var int cExhaust   = 0
+var int cFlatten   = 0
+var int cPartial   = 0   // informational: intra-position size reductions (T1 scale, early runner trail)
+var int cPosClosed = 0   // positions gone flat -- the reconciliation denominator
 
 // Any bar where the still-open position shrank vs the prior bar = a partial fill.
 if strategy.position_size != 0 and math.abs(strategy.position_size) < math.abs(strategy.position_size[1])
     cPartial := cPartial + 1
 
 if justClosed
+    cPosClosed := cPosClosed + 1
     int    xi         = strategy.closedtrades - 1
     string xcmt       = strategy.closedtrades.exit_comment(xi)
     string xid        = strategy.closedtrades.exit_id(xi)
@@ -1179,16 +1252,17 @@ if barstate.islast
     table.cell(dbgTbl, 2, 10, "", text_color=cText, bgcolor=cGray, text_size=size.small)
 
 // =============================================================================
-// EXIT-REASON TABLE (bottom-left). Terminal reasons + partials reconcile to
-// strategy.closedtrades.
+// EXIT-REASON TABLE (bottom-left). Reports PER CLOSED POSITION: the six terminal
+// reasons sum to the number of positions closed (cPosClosed). Legs
+// (strategy.closedtrades) and partial reductions are informational only.
 // =============================================================================
 int terminalTotal = cInitStop + cBEstop + cTarget + cTrail + cExhaust + cFlatten
-bool reconOK = terminalTotal + cPartial == strategy.closedtrades
+bool reconOK = terminalTotal == cPosClosed
 
-var table exitTbl = table.new(position.bottom_left, 2, 11, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+var table exitTbl = table.new(position.bottom_left, 2, 12, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
 if barstate.islast
     string modeTag = exitMode == "A - divergence" ? "A" : exitMode == "B - chandelier" ? "B" : "C"
-    table.cell(exitTbl, 0, 0, "EXIT REASONS", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 0, 0, "EXIT REASONS /pos", text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(exitTbl, 1, 0, "mode " + modeTag, text_color=cText, bgcolor=cGray, text_size=size.small)
 
     table.cell(exitTbl, 0, 1, "Initial stop", text_color=cText, bgcolor=cGray, text_size=size.small)
@@ -1212,14 +1286,96 @@ if barstate.islast
     table.cell(exitTbl, 0, 7, "= Terminals", text_color=cText, bgcolor=cGray, text_size=size.small)
     table.cell(exitTbl, 1, 7, str.tostring(terminalTotal), text_color=cText, bgcolor=cGray, text_size=size.small)
 
-    table.cell(exitTbl, 0, 8, "Partials (T1/reductions, excl.)", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(exitTbl, 1, 8, str.tostring(cPartial), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 0, 8, "Positions closed", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 8, str.tostring(cPosClosed), text_color=cText, bgcolor=cGray, text_size=size.small)
 
-    table.cell(exitTbl, 0, 9, "closedtrades", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(exitTbl, 1, 9, str.tostring(strategy.closedtrades), text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 0, 9, "Reconcile (term=pos)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 9, reconOK ? "OK" : "MISMATCH " + str.tostring(terminalTotal) + "/" + str.tostring(cPosClosed), text_color=cText, bgcolor=reconOK ? cGreen : cRed, text_size=size.small)
 
-    table.cell(exitTbl, 0, 10, "Reconcile", text_color=cText, bgcolor=cGray, text_size=size.small)
-    table.cell(exitTbl, 1, 10, reconOK ? "OK" : "MISMATCH " + str.tostring(terminalTotal + cPartial) + "/" + str.tostring(strategy.closedtrades), text_color=cText, bgcolor=reconOK ? cGreen : cRed, text_size=size.small)
+    table.cell(exitTbl, 0, 10, "Legs (closedtrades, info)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 10, str.tostring(strategy.closedtrades), text_color=cText, bgcolor=color.new(color.gray, 45), text_size=size.small)
+
+    table.cell(exitTbl, 0, 11, "Partial reductions (info)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 11, str.tostring(cPartial), text_color=cText, bgcolor=color.new(color.gray, 45), text_size=size.small)
+
+// =============================================================================
+// RECENT CLOSED-POSITION LOG (middle-left, tiny). MEASUREMENT ONLY. One row per
+// CLOSED POSITION, most recent 30, newest at top. Entry attribution captured at
+// the entry bar (see the snapshot block) paired with realized per-position P&L.
+// Placed far-left / middle so it does not collide with dash (top-right),
+// sessTbl (bottom-right), dbgTbl (top-left) or exitTbl (bottom-left).
+// Columns: Date (entry) | Dir | Sess | Score | VHSRCI | RVOL | P&L.
+// =============================================================================
+var table logTbl = table.new(position.middle_left, 7, 31, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if barstate.islast
+    table.cell(logTbl, 0, 0, "Date",   text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 1, 0, "Dir",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 2, 0, "Ses",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 3, 0, "Sc",     text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 4, 0, "VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 5, 0, "RVOL",   text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 6, 0, "P&L",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    int nLog  = array.size(logPnL)
+    int showN = math.min(30, nLog)
+    if showN > 0
+        for r = 0 to showN - 1
+            int    idx    = nLog - 1 - r        // newest first
+            int    rowY   = r + 1
+            int    dTime  = array.get(logTime,   idx)
+            int    dDir   = array.get(logDir,    idx)
+            string dSess  = array.get(logSess,   idx)
+            int    dScore = array.get(logScore,  idx)
+            string dVH    = array.get(logVHSRCI, idx)
+            float  dRvol  = array.get(logRvol,   idx)
+            float  dPnL   = array.get(logPnL,    idx)
+            color  pnlCol = dPnL >= 0 ? cGreen : cRed
+            table.cell(logTbl, 0, rowY, str.format_time(dTime, "MM-dd HH:mm", tz), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 1, rowY, dDir == 1 ? "L" : "S", text_color=cText, bgcolor=dDir == 1 ? cGreen : cRed, text_size=size.tiny)
+            table.cell(logTbl, 2, rowY, na(dSess) ? "?" : dSess, text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 3, rowY, str.tostring(dScore), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 4, rowY, na(dVH) ? "-" : dVH, text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 5, rowY, na(dRvol) ? "n/a" : str.tostring(dRvol, "#.##"), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 6, rowY, "$" + str.tostring(dPnL, "#"), text_color=cText, bgcolor=pnlCol, text_size=size.tiny)
+
+// =============================================================================
+// COMPONENT WIN-RATE SUMMARY (bottom-center, tiny). MEASUREMENT ONLY. For each
+// of the six scoring components, over ALL closed positions: how many trades had
+// that component SCORING at entry (its letter present in the entry VHSRCI
+// string), how many of those were profitable, and their total P&L. Reveals
+// whether any component is dead weight before touching the scoring.
+// =============================================================================
+var table compTbl = table.new(position.bottom_center, 4, 8, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if barstate.islast
+    array<string> compLtr = array.from("V", "H", "S", "R", "C", "I")
+    array<string> compLbl = array.from("VWAP", "HTF", "Struct", "RVOL", "CVD", "RSI")
+    table.cell(compTbl, 0, 0, "COMPONENT WIN-RATE", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 1, 0, "", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 2, 0, "", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 3, 0, "", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 0, 1, "Comp (scored)", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 1, 1, "N",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 2, 1, "Wins", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(compTbl, 3, 1, "P&L",  text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    int nAll = array.size(logPnL)
+    for c = 0 to 5
+        string ltr = array.get(compLtr, c)
+        int    cN  = 0
+        int    cW  = 0
+        float  cP  = 0.0
+        if nAll > 0
+            for j = 0 to nAll - 1
+                string vh = array.get(logVHSRCI, j)
+                if not na(vh) and str.contains(vh, ltr)
+                    cN := cN + 1
+                    float p = array.get(logPnL, j)
+                    cP := cP + p
+                    if p > 0
+                        cW := cW + 1
+        int rowY = c + 2
+        table.cell(compTbl, 0, rowY, array.get(compLbl, c) + " (" + ltr + ")", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+        table.cell(compTbl, 1, rowY, str.tostring(cN), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+        table.cell(compTbl, 2, rowY, str.tostring(cW) + (cN > 0 ? " (" + str.tostring(cW / cN * 100, "#") + "%)" : ""), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+        table.cell(compTbl, 3, rowY, "$" + str.tostring(cP, "#"), text_color=cText, bgcolor=cP >= 0 ? cGreen : cRed, text_size=size.tiny)
 
 // =============================================================================
 // ALERTS  (retained from the indicator; harmless in a strategy)
