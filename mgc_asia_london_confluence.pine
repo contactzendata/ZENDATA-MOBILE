@@ -39,7 +39,7 @@ asiaTradeSess   = input.session("2000-0200", "Asia TRADE window (after Shanghai 
 londonTradeSess = input.session("0300-0700", "London TRADE window (London open onward)", group=grpSess)
 noNewAfterSess  = input.session("0700-0715", "No-new-entries cutoff window", group=grpSess, tooltip="Hard cutoff: no new entries once this window begins.")
 enableAsia   = input.bool(true,  "Enable Asia trade window",   group=grpSess)
-enableLondon = input.bool(false, "Enable London trade window", group=grpSess, tooltip="Default OFF: London was tested at ~$10 average trade over 11 trades and did not clear the cost hurdle. Retained for future re-testing rather than removed.")
+enableLondon = input.bool(true,  "Enable London trade window", group=grpSess, tooltip="Default ON: the final tested config traded BOTH sessions (sessionMode = Both, minSepATR 2.0, exhaustExit off) and produced +$1,530 over 20 positions, of which London contributed +$666 across 4 trades. (An earlier ~$10-average result came from the OLD config -- exhaustExit on, minSepATR 0.15, divergence exits -- which no longer exists, so that conclusion is not carried forward.)")
 
 // ---- Scoring thresholds ------------------------------------------------------
 grpScore = "Scoring"
