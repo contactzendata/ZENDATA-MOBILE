@@ -56,7 +56,7 @@ londonVwapWarmup = input.int(6, "London VWAP warm-up (confirmed bars)", minval=2
 grpEma = "EMAs / HTF regime"
 emaFastLen   = input.int(21, "Fast EMA length", minval=1, group=grpEma)
 emaSlowLen   = input.int(50, "Slow EMA length", minval=1, group=grpEma)
-minSepATR    = input.float(0.15, "Min EMA separation (x ATR)", minval=0.0, step=0.01, group=grpEma, tooltip="Fast/slow EMAs must be separated by more than this * ATR. Avoids crossover whipsaw.")
+minSepATR    = input.float(2.0, "Min EMA separation (x ATR)", minval=0.0, step=0.01, group=grpEma, tooltip="Fast/slow EMAs must be separated by more than this * 1H ATR before the HTF component can score. Default 2.0 matches the tested config. At 2.0 the HTF (H) component rarely fires BY DESIGN: component analysis on the tested window showed HTF at -$324 over 15 trades while Structure was +$1,280 over 18, so the 1H-stack gate is deliberately set high enough that it almost never contributes -- entries lean on VWAP/Structure/CVD instead. Lower it (e.g. 0.15) only to re-test whether HTF adds value. The strategy file keeps its 0.15 default and was set to 2.0 manually at test time.")
 slopeLookback = input.int(5, "EMA slope lookback (bars)", minval=1, group=grpEma)
 htfRegimeTF  = input.timeframe("60", "HTF regime timeframe", group=grpEma)
 htfConfirmTF = input.timeframe("15", "HTF confirm timeframe", group=grpEma)
@@ -103,6 +103,16 @@ maxSignalsPerSession = input.int(2, "Max signals per direction per session", min
 // ---- Display -----------------------------------------------------------------
 grpDisp = "Display"
 dashMode = input.string("Compact", "Dashboard display", options=["Full", "Compact", "Off"], group=grpDisp, tooltip="Compact (mobile-friendly) shows only session, bull/bear scores, the VHSRCI component masks, position size and $ risk. Full shows every row. Off hides the table entirely. The table sits bottom-right to clear TradingView's mobile legend and price scale.")
+
+// ---- Forward-test (virtual position) ----------------------------------------
+// The indicator has no orders, so it can't tell you how to MANAGE a trade once
+// you're in it -- only when to enter. This block simulates ONE position through
+// its whole lifecycle so the alerts/plot below can walk you through each stage,
+// mirroring the tested strategy config (exitMode B: chandelier trail, no
+// divergence exit). It touches NO scoring, threshold or entry-gating logic.
+grpVP = "Forward-test (virtual position)"
+vpTrailMult  = input.float(2.5, "Virtual chandelier ATR mult", minval=0.1, step=0.1, group=grpVP, tooltip="Chandelier trail = extreme-since-entry -/+ this * 5m ATR (atrVal). 2.5 matches the tested exitMode B. The trail ratchets favorably only, updates on bar close, and governs the stop only AFTER T1 is reached; it is clamped so it can never sit looser than the breakeven/fixed stop.")
+showTradeLog = input.bool(true, "Show forward-test trade log", group=grpVP, tooltip="Last 20 virtual trades (date, dir, session, score, VHSRCI, RVOL, outcome), top-left, so you can compare live signals against the backtest distribution.")
 
 // =============================================================================
 // SESSION STATE
@@ -748,28 +758,200 @@ if barstate.islast and showFull
     table.cell(dash, 1, 18, (trailingDD > 0 ? str.tostring(actualRisk / trailingDD * 100, "#.#") + "% of DD" : "n/a") + " | lim $" + str.tostring(dailyLossLimit, "#"), text_color=cText, bgcolor=actualRisk <= dailyLossLimit ? cGray : cRed, text_size=size.tiny)
 
 // =============================================================================
+// VIRTUAL POSITION TRACKING  (forward-test manual-management aid)
+// -----------------------------------------------------------------------------
+// The indicator holds no orders, so on its own it can only tell you WHEN to
+// enter. This block simulates ONE position through its whole lifecycle so the
+// alerts and the stepped stop-line below can walk you through each stage, exactly
+// mirroring the tested strategy config (exitMode B: chandelier trail, exhaustExit
+// OFF). It reads only already-computed signal values and NEVER feeds back into
+// scoring, thresholds, or entry gating.
+//
+// Lifecycle (mirrors mgc_asia_london_strategy.pine):
+//   OPEN  -- on longSignal/shortSignal while FLAT (one position at a time; a
+//            signal that fires while a virtual position is open is ignored, as
+//            pyramiding=0 would ignore it in the strategy).
+//   STOP  -- fixed ATR stop before T1; after T1 the stop is max(breakeven, trail)
+//            for longs / min(...) for shorts (BE-after-T1 is ON in the tested
+//            config). Trail = extreme-since-entry -/+ vpTrailMult*ATR, ratcheting
+//            favorably only, bar close only, governing only AFTER T1 is reached,
+//            clamped so it is never looser than the BE/fixed stop.
+//   T1    -- reached when price trades to the 1R target: scale 50%, move stop to BE.
+//   T2    -- runner target at 2R.
+//   FLAT  -- session flatten at the 07:00 cutoff window (inCutoff), same as the
+//            strategy's default EOD flatten.
+// Closes on the FIRST of: stop, T2, or session flatten. Bar-close only -- no
+// intrabar logic; level "hits" are tested against the confirmed bar's high/low.
+// =============================================================================
+var bool   vpActive       = false
+var int    vpDir          = 0
+var float  vpEntry        = na
+var float  vpStop0        = na     // fixed initial stop (pre-T1)
+var float  vpT1           = na
+var float  vpT2           = na
+var bool   vpT1done       = false
+var float  vpExtreme      = na     // extreme-since-entry (inclusive)
+var float  vpTrail        = na     // ratcheted chandelier level
+var float  vpActiveStop   = na     // the stop the user should be working right now
+var float  vpLastAlertStop = na    // last stop level announced via alert (anti-spam)
+var string vpSess         = na
+var int    vpTime         = na
+var int    vpScore        = 0
+var string vpVH           = na
+var float  vpRvol         = na
+
+// Forward-test trade log (parallel arrays, appended on each virtual close).
+var array<int>    lgTime = array.new<int>()
+var array<int>    lgDir  = array.new<int>()
+var array<string> lgSess = array.new<string>()
+var array<int>    lgScore= array.new<int>()
+var array<string> lgVH   = array.new<string>()
+var array<float>  lgRvol = array.new<float>()
+var array<string> lgOut  = array.new<string>()
+
+// ---- OPEN (on a signal while flat) ------------------------------------------
+bool vpOpenLong  = longSignal  and not vpActive
+bool vpOpenShort = shortSignal and not vpActive
+bool vpJustOpened = vpOpenLong or vpOpenShort
+if vpJustOpened
+    vpActive        := true
+    vpDir           := vpOpenLong ? 1 : -1
+    vpEntry         := close
+    vpStop0         := vpOpenLong ? longStop : shortStop
+    vpT1            := vpOpenLong ? longT1 : shortT1
+    vpT2            := vpOpenLong ? longT2 : shortT2
+    vpT1done        := false
+    vpExtreme       := vpOpenLong ? high : low
+    vpTrail         := na
+    vpActiveStop    := vpStop0
+    vpLastAlertStop := vpStop0
+    vpSess          := inLondonTrade ? "L" : "A"
+    vpTime          := time
+    vpScore         := vpOpenLong ? bullScore : bearScore
+    vpVH            := vpOpenLong ? bullParts : bearParts
+    vpRvol          := rvol
+    string enMsg = str.format("MGC ENTRY | {0} | {1} | score {2}/10 | VHSRCI {3} | entry {4} | stop {5} | T1 {6} | T2 {7} | {8} contr | RVOL {9}", vpDir == 1 ? "LONG" : "SHORT", vpSess == "L" ? "LONDON" : "ASIA", vpScore, vpVH, str.tostring(vpEntry, format.mintick), str.tostring(vpStop0, format.mintick), str.tostring(vpT1, format.mintick), str.tostring(vpT2, format.mintick), contracts, na(vpRvol) ? "n/a" : str.tostring(vpRvol, "#.##"))
+    alert(enMsg, alert.freq_once_per_bar_close)
+
+// ---- MANAGE (every confirmed bar the position is open, except its open bar) --
+if vpActive and barstate.isconfirmed and not vpJustOpened
+    // 1. Extreme-since-entry + ratcheted chandelier level (bar close only).
+    if vpDir == 1
+        vpExtreme := math.max(vpExtreme, high)
+        float rawCh = vpExtreme - vpTrailMult * atrVal
+        vpTrail := na(vpTrail) ? rawCh : math.max(vpTrail, rawCh)
+    else
+        vpExtreme := math.min(vpExtreme, low)
+        float rawCh = vpExtreme + vpTrailMult * atrVal
+        vpTrail := na(vpTrail) ? rawCh : math.min(vpTrail, rawCh)
+
+    // 2. Effective stop coming INTO this bar (BE + trail apply only post-T1).
+    float beStop = vpEntry
+    float curStop = vpT1done ? (na(vpTrail) ? beStop : (vpDir == 1 ? math.max(beStop, vpTrail) : math.min(beStop, vpTrail))) : vpStop0
+
+    // 3. Exit test, in priority order. Stop is checked before T2 (pessimistic,
+    //    matching the bar-granular backtest's worse-case fill assumption).
+    string exitReason = na
+    float  exitPx     = na
+    if inCutoff
+        exitReason := "flat"
+        exitPx     := close
+    else if vpDir == 1 and low <= curStop
+        exitReason := vpT1done ? "trail" : "stop"
+        exitPx     := curStop
+    else if vpDir == -1 and high >= curStop
+        exitReason := vpT1done ? "trail" : "stop"
+        exitPx     := curStop
+    else if vpDir == 1 and high >= vpT2
+        exitReason := "T2"
+        exitPx     := vpT2
+    else if vpDir == -1 and low <= vpT2
+        exitReason := "T2"
+        exitPx     := vpT2
+
+    if not na(exitReason)
+        // Close the virtual position: alert, log, go flat.
+        string outLabel = exitReason == "flat" ? "session flatten" : exitReason == "T2" ? "T2 hit" : exitReason == "trail" ? "trail/BE stop hit" : "stop hit"
+        string exMsg = str.format("MGC EXIT | {0} | {1} at {2} | entry {3}", vpDir == 1 ? "LONG" : "SHORT", outLabel, str.tostring(exitPx, format.mintick), str.tostring(vpEntry, format.mintick))
+        alert(exMsg, alert.freq_once_per_bar_close)
+        array.push(lgTime,  vpTime)
+        array.push(lgDir,   vpDir)
+        array.push(lgSess,  vpSess)
+        array.push(lgScore, vpScore)
+        array.push(lgVH,    vpVH)
+        array.push(lgRvol,  vpRvol)
+        array.push(lgOut,   exitReason)
+        vpActiveStop := na
+        vpActive     := false
+    else
+        // 4. Still open: detect T1 reached (scale + BE), then trail-move alert.
+        if not vpT1done and ((vpDir == 1 and high >= vpT1) or (vpDir == -1 and low <= vpT1))
+            vpT1done        := true
+            vpLastAlertStop := vpEntry
+            string t1Msg = str.format("MGC T1 REACHED | {0} | scale 50%, move stop to breakeven at {1}", vpDir == 1 ? "LONG" : "SHORT", str.tostring(vpEntry, format.mintick))
+            alert(t1Msg, alert.freq_once_per_bar_close)
+        // Recompute the effective stop after any T1/BE change for plotting + alert.
+        float effStop = vpT1done ? (na(vpTrail) ? vpEntry : (vpDir == 1 ? math.max(vpEntry, vpTrail) : math.min(vpEntry, vpTrail))) : vpStop0
+        vpActiveStop := effStop
+        // Trail-update alert ONLY when the stop actually moves (post-T1), not every bar.
+        if vpT1done
+            bool moved = vpDir == 1 ? (effStop > vpLastAlertStop + syminfo.mintick * 0.5) : (effStop < vpLastAlertStop - syminfo.mintick * 0.5)
+            if moved
+                vpLastAlertStop := effStop
+                string trMsg = str.format("MGC TRAIL | {0} | move stop to {1}", vpDir == 1 ? "LONG" : "SHORT", str.tostring(effStop, format.mintick))
+                alert(trMsg, alert.freq_once_per_bar_close)
+
+// Stepped stop line while a virtual position is open -- shows where your working
+// stop should sit at each stage (fixed pre-T1, then BE, then ratcheting trail).
+plot(vpActive ? vpActiveStop : na, "Virtual stop", color=color.new(color.fuchsia, 0), linewidth=2, style=plot.style_stepline)
+
+// =============================================================================
+// FORWARD-TEST TRADE LOG (top-left, tiny). Last 20 virtual trades, newest first.
+// Columns: Date (entry) | Dir | Ses | Score | VHSRCI | RVOL | Outcome.
+// Compare live signals against the backtest distribution.
+// =============================================================================
+var table logTbl = table.new(position.top_left, 7, 21, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if barstate.islast and showTradeLog
+    table.cell(logTbl, 0, 0, "Date",   text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 1, 0, "Dir",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 2, 0, "Ses",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 3, 0, "Sc",     text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 4, 0, "VHSRCI", text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 5, 0, "RVOL",   text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    table.cell(logTbl, 6, 0, "Out",    text_color=cText, bgcolor=cGray, text_size=size.tiny)
+    int nLog  = array.size(lgOut)
+    int showN = math.min(20, nLog)
+    if showN > 0
+        for r = 0 to showN - 1
+            int    idx   = nLog - 1 - r        // newest first
+            int    rowY  = r + 1
+            int    dTime = array.get(lgTime,  idx)
+            int    dDir  = array.get(lgDir,   idx)
+            string dSess = array.get(lgSess,  idx)
+            int    dSc   = array.get(lgScore, idx)
+            string dVH   = array.get(lgVH,    idx)
+            float  dRv   = array.get(lgRvol,  idx)
+            string dOut  = array.get(lgOut,   idx)
+            color  outCol = dOut == "T2" ? cGreen : dOut == "trail" ? color.new(color.green, 55) : dOut == "flat" ? cGray : cRed
+            table.cell(logTbl, 0, rowY, str.format_time(dTime, "MM-dd HH:mm", tz), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 1, rowY, dDir == 1 ? "L" : "S", text_color=cText, bgcolor=dDir == 1 ? cGreen : cRed, text_size=size.tiny)
+            table.cell(logTbl, 2, rowY, na(dSess) ? "?" : dSess, text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 3, rowY, str.tostring(dSc), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 4, rowY, na(dVH) ? "-" : dVH, text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 5, rowY, na(dRv) ? "n/a" : str.tostring(dRv, "#.##"), text_color=cText, bgcolor=cGray, text_size=size.tiny)
+            table.cell(logTbl, 6, rowY, dOut, text_color=cText, bgcolor=outCol, text_size=size.tiny)
+
+// =============================================================================
 // ALERTS
 // =============================================================================
-// Dynamic alert() message on fired signals, once per bar close.
-if longSignal
-    string msg = str.format("MGC LONG | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bullScore, str.tostring(entryPrice, format.mintick), str.tostring(longStop, format.mintick), str.tostring(longT1, format.mintick), str.tostring(longT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
-    alert(msg, alert.freq_once_per_bar_close)
-if shortSignal
-    string msg = str.format("MGC SHORT | {0} | score {1}/10 | entry {2} | stop {3} | T1 {4} | T2 {5} | size {6} | RVOL {7}", curSession, bearScore, str.tostring(entryPrice, format.mintick), str.tostring(shortStop, format.mintick), str.tostring(shortT1, format.mintick), str.tostring(shortT2, format.mintick), contracts, na(rvol) ? "n/a" : str.tostring(rvol, "#.##"))
-    alert(msg, alert.freq_once_per_bar_close)
-
-// Dynamic exhaustion alerts -- these DO fire through "Any alert() function call".
-// regBear = bearish exhaustion at a high (price higher high + RSI lower high) => trail/exit LONGS.
-// regBull = bullish exhaustion at a low  (price lower low  + RSI higher low)  => trail/exit SHORTS.
-if regBear
-    string msg = str.format("MGC EXHAUSTION | BEARISH (price higher high + RSI lower high) | price {0} | RSI {1} | EXIT/TRAIL LONGS", str.tostring(close, format.mintick), str.tostring(rsiVal, "#.#"))
-    alert(msg, alert.freq_once_per_bar_close)
-if regBull
-    string msg = str.format("MGC EXHAUSTION | BULLISH (price lower low + RSI higher low) | price {0} | RSI {1} | EXIT/TRAIL SHORTS", str.tostring(close, format.mintick), str.tostring(rsiVal, "#.#"))
-    alert(msg, alert.freq_once_per_bar_close)
-
-// Static alertcondition() declarations.
-alertcondition(longSignal,  title="MGC Long signal",             message="MGC LONG confluence signal")
-alertcondition(shortSignal, title="MGC Short signal",            message="MGC SHORT confluence signal")
-alertcondition(regBear,     title="MGC Bearish exhaustion",      message="MGC bearish exhaustion (regular divergence) - exit/trail warning")
-alertcondition(regBull,     title="MGC Bullish exhaustion",      message="MGC bullish exhaustion (regular divergence) - exit/trail warning")
+// All entry + trade-management alerts are emitted by the VIRTUAL POSITION
+// TRACKING section above, every one via alert(), so a single "Any alert()
+// function call" alert covers ENTRY, T1 REACHED, TRAIL, and EXIT. Regular-
+// divergence exhaustion NO LONGER emits an exit alert -- it was removed from the
+// tested config (it cost -$980 as an exit). The X markers still plot and still
+// gate entries via exhaustBars; they simply do not alert.
+//
+// Static alertcondition() declarations for the raw entry signals, kept for users
+// who prefer wiring one alert per condition instead of the "Any alert()" route.
+alertcondition(longSignal,  title="MGC Long signal",  message="MGC LONG confluence signal")
+alertcondition(shortSignal, title="MGC Short signal", message="MGC SHORT confluence signal")
