@@ -149,6 +149,7 @@ scaleT1Pct    = input.float(50.0, "Scale-out % at T1 (1R)", minval=0.0, maxval=1
 moveBEafterT1 = input.bool(true, "Move stop to breakeven after T1", group=grpExit)
 runnerExit    = input.bool(true, "Runner exits at T2 (2R)", group=grpExit, tooltip="If off, the remainder rides on the stop / exhaustion / session-flatten only.")
 exhaustExit   = input.bool(true, "Exhaustion exit (close longs on regBear, shorts on regBull)", group=grpExit, tooltip="This is what the indicator's exhaustion X-cross markers were always for.")
+flattenAtWindowEnd = input.bool(false, "Flatten at trade-window end", group=grpExit, tooltip="FALSE (default, Mode A baseline -- byte-identical to the backtested run): every open position is flattened at the 07:00 cutoff window regardless of which session it opened in. TRUE: flatten at the end of the window the trade was ENTERED in -- Asia entries (2000-0200) close at 02:00, London entries (0300-0700) at 07:00 -- so an Asia trade is not carried ~5h through London. Uses the entry-captured session tag (tSessTag).")
 
 // ---- Topstep realism model ---------------------------------------------------
 // Reuses the existing `dailyLossLimit` and `trailingDD` inputs (Risk group,
@@ -811,12 +812,25 @@ if exhaustExit and strategy.position_size > 0 and regBear
 if exhaustExit and strategy.position_size < 0 and regBull
     strategy.close("R", comment="exhaust")
 
-// Session flatten -- NON-OPTIONAL. Fires on the first cutoff bar (07:00), whose
-// close is well before the window ends (07:15), so nothing is carried past the
-// session. Topstep's trailing drawdown trails on EOD balance; carrying a
-// position past the session is not the strategy being tested.
-if inCutoff and strategy.position_size != 0
+// Session flatten. Two modes, selected by flattenAtWindowEnd, kept as its OWN
+// variable rather than folded into the exit orders/test above.
+//   FALSE (default, Mode A -- byte-identical to the backtested run): flatten
+//     everything at the 07:00 cutoff window. Fires on the first cutoff bar,
+//     whose close is well before the window ends (07:15).
+//   TRUE: flatten at the end of the window the trade was ENTERED in, via the
+//     entry-captured tSessTag -- Asia entry ("A") at the 02:00 Asia window-end,
+//     London entry ("L") at the 07:00 London window-end. Prevents an Asia trade
+//     from being carried ~5h through London to the 07:00 cutoff.
+// Topstep's trailing drawdown trails on EOD balance; nothing is carried past the
+// session in either mode.
+bool asiaWindowEnd    = not inAsiaTrade   and inAsiaTrade[1]    // first bar after 02:00
+bool londonWindowEnd  = not inLondonTrade and inLondonTrade[1]  // first bar after 07:00
+bool windowEndFlatten = flattenAtWindowEnd and ((tSessTag == "A" and asiaWindowEnd) or (tSessTag == "L" and londonWindowEnd))
+
+if not flattenAtWindowEnd and inCutoff and strategy.position_size != 0
     strategy.close_all(comment="EOD flatten")
+if windowEndFlatten and strategy.position_size != 0
+    strategy.close_all(comment="window-end flatten")
 
 // =============================================================================
 // PER-SESSION P&L (bonus). Attributed by ENTRY session. One position at a time
