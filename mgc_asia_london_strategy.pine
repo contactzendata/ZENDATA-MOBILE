@@ -151,6 +151,11 @@ runnerExit    = input.bool(true, "Runner exits at T2 (2R)", group=grpExit, toolt
 exhaustExit   = input.bool(true, "Exhaustion exit (close longs on regBear, shorts on regBull)", group=grpExit, tooltip="This is what the indicator's exhaustion X-cross markers were always for.")
 flattenAtWindowEnd = input.bool(false, "Flatten at trade-window end", group=grpExit, tooltip="FALSE (default, Mode A baseline -- byte-identical to the backtested run): every open position is flattened at the 07:00 cutoff window regardless of which session it opened in. TRUE: flatten at the end of the window the trade was ENTERED in -- Asia entries (2000-0200) close at 02:00, London entries (0300-0700) at 07:00 -- so an Asia trade is not carried ~5h through London. Uses the entry-captured session tag (tSessTag).")
 
+// Exit MODE. A is the control and MUST stay byte-identical to the backtested run.
+exitMode = input.string("A - divergence", "Exit mode", options=["A - divergence", "B - chandelier", "C - divergence tightens"], group=grpExit, tooltip="A - divergence (control, unchanged): fixed stop, BE after T1, and exhaustExit closes on regBear/regBull. B - chandelier: the -run leg's stop becomes a chandelier trail; regBear/regBull no longer EXIT (they still plot and still gate entries via exhaustBars). C - divergence tightens: same chandelier as B, but a divergence AGAINST the open trade drops the multiplier to the tight value for the rest of that trade (tightens, never exits).")
+chandelierMult      = input.float(2.5, "Chandelier ATR mult (B/C)", minval=0.1, step=0.1, group=grpExit, tooltip="Trail = extreme-since-entry -/+ this * 5m ATR (atrVal). Extreme tracked from the entry bar inclusive; engages immediately; ratchets favorably only.")
+chandelierTightMult = input.float(1.5, "Chandelier tight mult (C only)", minval=0.1, step=0.1, group=grpExit, tooltip="Mode C: once a divergence prints against the open trade (regBear while long / regBull while short), the multiplier drops to this and STAYS tightened for the remainder of the trade.")
+
 // ---- Topstep realism model ---------------------------------------------------
 // Reuses the existing `dailyLossLimit` and `trailingDD` inputs (Risk group,
 // verbatim from the indicator) and adds only the max-trades-per-day cap, so
@@ -743,6 +748,10 @@ var int   tDir      = 0
 var int   tInitSize = 0
 var bool  tT1done   = false
 var string tSessTag = na
+// Chandelier trail state (modes B/C), reset at each entry.
+var float trailExtreme = na   // highest high (long) / lowest low (short) since entry, inclusive
+var float trailStop    = na   // ratcheted chandelier stop for the active trade
+var float trailMult    = na   // active multiplier (mode C may tighten it mid-trade)
 
 if canEnterLong
     tEntry    := close
@@ -753,6 +762,9 @@ if canEnterLong
     tInitSize := contracts
     tT1done   := false
     tSessTag  := inLondonTrade ? "L" : "A"
+    trailExtreme := high
+    trailMult    := chandelierMult
+    trailStop    := na
     tradesToday := tradesToday + 1
     strategy.entry("L", strategy.long, qty=contracts)
 else if canEnterShort
@@ -764,6 +776,9 @@ else if canEnterShort
     tInitSize := contracts
     tT1done   := false
     tSessTag  := inLondonTrade ? "L" : "A"
+    trailExtreme := low
+    trailMult    := chandelierMult
+    trailStop    := na
     tradesToday := tradesToday + 1
     strategy.entry("R", strategy.short, qty=contracts)
 
@@ -786,30 +801,63 @@ float remStopS = (tT1done and moveBEafterT1) ? tEntry : tStop
 float runLimitL = runnerExit ? tT2 : na
 float runLimitS = runnerExit ? tT2 : na
 
+// -----------------------------------------------------------------------------
+// EXIT MODE (A/B/C). A is the control (byte-identical). B/C replace the -run
+// leg's stop with a chandelier trail; the -scale leg is ALWAYS left untouched.
+// -----------------------------------------------------------------------------
+bool useTrail = exitMode != "A - divergence"
+
+// Mode C: a divergence AGAINST the open trade tightens the chandelier multiplier
+// for the REMAINDER of the trade (ratchets tighter, never loosens, never exits).
+if exitMode == "C - divergence tightens"
+    if strategy.position_size > 0 and tDir == 1 and regBear
+        trailMult := chandelierTightMult
+    if strategy.position_size < 0 and tDir == -1 and regBull
+        trailMult := chandelierTightMult
+
+// Chandelier trail (B/C): extreme tracked from ENTRY inclusive, bar-close only,
+// ratcheted so it can only move favorably even if ATR expands. Uses the existing
+// 5m atrVal. trailExtreme / trailMult / trailStop were seeded at entry.
+if strategy.position_size > 0 and tDir == 1
+    trailExtreme := na(trailExtreme) ? high : math.max(trailExtreme, high)
+    float rawChandL = trailExtreme - trailMult * atrVal
+    trailStop := na(trailStop) ? rawChandL : math.max(trailStop, rawChandL)
+else if strategy.position_size < 0 and tDir == -1
+    trailExtreme := na(trailExtreme) ? low : math.min(trailExtreme, low)
+    float rawChandS = trailExtreme + trailMult * atrVal
+    trailStop := na(trailStop) ? rawChandS : math.min(trailStop, rawChandS)
+
+// Effective -run stop. In A it is exactly remStopL/S (byte-identical). In B/C the
+// trail competes with the fixed/BE stop and can only ever be TIGHTER, never
+// looser: max(fixed, trail) for longs, min(fixed, trail) for shorts.
+float runStopL = (useTrail and not na(trailStop)) ? math.max(remStopL, trailStop) : remStopL
+float runStopS = (useTrail and not na(trailStop)) ? math.min(remStopS, trailStop) : remStopS
+
 // LONG exits
 if strategy.position_size > 0 and tDir == 1
     if scaleT1Pct > 0 and scaleT1Pct < 100
         strategy.exit("L-scale", from_entry="L", qty_percent=scaleT1Pct, limit=tT1, stop=tStop)
-        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=remStopL)
+        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=runStopL)
     else if scaleT1Pct >= 100
         strategy.exit("L-scale", from_entry="L", limit=tT1, stop=tStop)
     else
-        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=remStopL)
+        strategy.exit("L-run",   from_entry="L", limit=runLimitL, stop=runStopL)
 
 // SHORT exits
 if strategy.position_size < 0 and tDir == -1
     if scaleT1Pct > 0 and scaleT1Pct < 100
         strategy.exit("R-scale", from_entry="R", qty_percent=scaleT1Pct, limit=tT1, stop=tStop)
-        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=remStopS)
+        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=runStopS)
     else if scaleT1Pct >= 100
         strategy.exit("R-scale", from_entry="R", limit=tT1, stop=tStop)
     else
-        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=remStopS)
+        strategy.exit("R-run",   from_entry="R", limit=runLimitS, stop=runStopS)
 
-// Exhaustion exit (market close on the exhausting divergence).
-if exhaustExit and strategy.position_size > 0 and regBear
+// Exhaustion exit (market close) -- MODE A ONLY. In B/C, regBear/regBull still
+// plot and still gate entries via exhaustBars, but never close a position.
+if exitMode == "A - divergence" and exhaustExit and strategy.position_size > 0 and regBear
     strategy.close("L", comment="exhaust")
-if exhaustExit and strategy.position_size < 0 and regBull
+if exitMode == "A - divergence" and exhaustExit and strategy.position_size < 0 and regBull
     strategy.close("R", comment="exhaust")
 
 // Session flatten. Two modes, selected by flattenAtWindowEnd, kept as its OWN
@@ -862,6 +910,62 @@ if justClosed and not na(tradeStartEq)
         asiaGross  := asiaGross + tradePnL
         if tradePnL > 0
             asiaWins := asiaWins + 1
+
+// =============================================================================
+// EXIT-REASON INSTRUMENTATION (STRATEGY-ONLY). One terminal reason is recorded
+// as each position goes flat; the terminal counters + the partials row sum to
+// strategy.closedtrades. Attribution of the just-closed trade:
+//   exit_comment "exhaust"                          -> exhaustion close
+//   exit_comment "EOD flatten"/"window-end flatten" -> window/EOD flatten
+//   exit on the TARGET side of entry (limit)        -> target limit (T2 or T1@100%)
+//   stop side, trail strictly tighter than fixed    -> trail   (B/C only)
+//   stop side, T1 partial filled + BE armed         -> BE stop
+//   stop side otherwise                             -> initial stop
+// tT1done is guarded by position!=0, so it is NEVER set on the flat bar -- at
+// justClosed it still tells us truthfully whether a T1 partial actually filled.
+// Partials (any non-flattening size reduction) are counted on their own row and
+// EXCLUDED from the terminal reconciliation. In Mode A the only reduction is the
+// T1 scale-out; in B/C the runner (-run) can also trail-stop out before the
+// -scale half, which is a partial too -- counting reductions generally keeps the
+// reconciliation exact across all three modes.
+// =============================================================================
+var int cInitStop = 0
+var int cBEstop   = 0
+var int cTarget   = 0
+var int cTrail    = 0
+var int cExhaust  = 0
+var int cFlatten  = 0
+var int cPartial  = 0
+
+// Any bar where the still-open position shrank vs the prior bar = a partial fill.
+if strategy.position_size != 0 and math.abs(strategy.position_size) < math.abs(strategy.position_size[1])
+    cPartial := cPartial + 1
+
+if justClosed
+    int    xi         = strategy.closedtrades - 1
+    string xcmt       = strategy.closedtrades.exit_comment(xi)
+    string xid        = strategy.closedtrades.exit_id(xi)
+    float  xpx        = strategy.closedtrades.exit_price(xi)
+    float  epx        = strategy.closedtrades.entry_price(xi)
+    bool   wasLong    = tDir == 1
+    bool   targetSide = wasLong ? xpx > epx : xpx < epx
+    // Only the -run leg carries the trail / BE stop; the -scale leg always used
+    // the fixed initial stop (tStop). Route by exit id so a scale-leg stop-out in
+    // B/C is never mislabelled as a trail exit.
+    bool   isRunLeg   = str.contains(xid, "run")
+    bool   trailBound = useTrail and isRunLeg and not na(trailStop) and (wasLong ? trailStop > remStopL : trailStop < remStopS)
+    if xcmt == "exhaust"
+        cExhaust := cExhaust + 1
+    else if xcmt == "EOD flatten" or xcmt == "window-end flatten"
+        cFlatten := cFlatten + 1
+    else if targetSide
+        cTarget := cTarget + 1
+    else if trailBound
+        cTrail := cTrail + 1
+    else if isRunLeg and tT1done and moveBEafterT1
+        cBEstop := cBEstop + 1
+    else
+        cInitStop := cInitStop + 1
 
 // =============================================================================
 // PLOTS (global scope only)   (retained from the indicator)
@@ -1065,6 +1169,49 @@ if barstate.islast
     table.cell(dbgTbl, 0, 10, "-> vs London trades", text_color=color.orange, bgcolor=cGray, text_size=size.small)
     table.cell(dbgTbl, 1, 10, str.tostring(londonTrades) + " trd", text_color=color.orange, bgcolor=cGray, text_size=size.small)
     table.cell(dbgTbl, 2, 10, "", text_color=cText, bgcolor=cGray, text_size=size.small)
+
+// =============================================================================
+// EXIT-REASON TABLE (bottom-left). Terminal reasons + partials reconcile to
+// strategy.closedtrades.
+// =============================================================================
+int terminalTotal = cInitStop + cBEstop + cTarget + cTrail + cExhaust + cFlatten
+bool reconOK = terminalTotal + cPartial == strategy.closedtrades
+
+var table exitTbl = table.new(position.bottom_left, 2, 11, bgcolor=color.new(color.black, 20), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+if barstate.islast
+    string modeTag = exitMode == "A - divergence" ? "A" : exitMode == "B - chandelier" ? "B" : "C"
+    table.cell(exitTbl, 0, 0, "EXIT REASONS", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 0, "mode " + modeTag, text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 1, "Initial stop", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 1, str.tostring(cInitStop), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 2, "BE stop", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 2, str.tostring(cBEstop), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 3, "Target limit (T2/T1@100)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 3, str.tostring(cTarget), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 4, "Trail (B/C)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 4, str.tostring(cTrail), text_color=cText, bgcolor=useTrail ? cGray : color.new(color.gray, 70), text_size=size.small)
+
+    table.cell(exitTbl, 0, 5, "Exhaustion close", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 5, str.tostring(cExhaust), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 6, "Window/EOD flatten", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 6, str.tostring(cFlatten), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 7, "= Terminals", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 7, str.tostring(terminalTotal), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 8, "Partials (T1/reductions, excl.)", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 8, str.tostring(cPartial), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 9, "closedtrades", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 9, str.tostring(strategy.closedtrades), text_color=cText, bgcolor=cGray, text_size=size.small)
+
+    table.cell(exitTbl, 0, 10, "Reconcile", text_color=cText, bgcolor=cGray, text_size=size.small)
+    table.cell(exitTbl, 1, 10, reconOK ? "OK" : "MISMATCH " + str.tostring(terminalTotal + cPartial) + "/" + str.tostring(strategy.closedtrades), text_color=cText, bgcolor=reconOK ? cGreen : cRed, text_size=size.small)
 
 // =============================================================================
 // ALERTS  (retained from the indicator; harmless in a strategy)
