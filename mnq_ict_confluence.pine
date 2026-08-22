@@ -333,6 +333,8 @@ fadeInvalidated = input.bool(true, "Fade invalidated zones instead of deleting",
      tooltip = "Same reasoning as retired liquidity pools: where a zone failed is information.")
 showSMT = input.bool(true, "Show SMT markers", group = grpDisp)
 showSignals = input.bool(true, "Show entry / stop / target lines", group = grpDisp)
+compactTable = input.bool(true, "Compact table (diagnostics only)", group = grpDisp,
+     tooltip = "The full table is 54 rows and runs off the bottom of most screens, which hides the score histogram -- the single most important diagnostic in the build. Compact mode shows only what you need to judge whether the model is discriminating.")
 showHistoricalOTE = input.bool(false, "Keep dead OTE bands (validation mode)", group = grpDisp,
      tooltip = "Off is correct for live trading: a dealing range is a claim about right now. On is for scrolling back to audit whether the dealing-range logic was right on past setups.")
 
@@ -1639,6 +1641,16 @@ var array<POI>  poiBook = array.new<POI>()
 // kind. Surfaced in the debug table -- see the notes on collinearity above.
 var int fvgObCoincidenceCount = 0
 
+// CUMULATIVE creation counters. The table shows these beside the ACTIVE counts,
+// because "0 active FVGs" is ambiguous on its own: it could mean a quiet moment
+// or it could mean FVGs essentially never form. Only the pair distinguishes
+// those two, and they demand completely different responses.
+var int cumFvgBull  = 0
+var int cumFvgBear  = 0
+var int cumIfvg     = 0
+var int cumOb       = 0
+var int cumBreaker  = 0
+
 // --- shared: retire a zone's drawings ---------------------------------------
 // Fade rather than delete, for the same reason retired liquidity pools stay on
 // the chart: where a zone failed is information.
@@ -1803,6 +1815,7 @@ if barstate.isconfirmed
                                  border_color = color.new(ic, 40),
                                  border_width = 1, border_style = line.style_solid)
                     array.push(ifvgs, iv)
+                    cumIfvg += 1
                     f_capIfvgs()
 
     // ---- 3. CREATION --------------------------------------------------------
@@ -1821,6 +1834,7 @@ if barstate.isconfirmed
             if szOk and dispOk
                 float gCe = (gTop + gBot) / 2
                 bool coi = f_fvgCoincidesWithOb(gTop, gBot, true)
+                cumFvgBull += 1
                 if coi
                     fvgObCoincidenceCount += 1
                 FVG g = FVG.new(top = gTop, bottom = gBot, ce = gCe, bullish = true,
@@ -1849,6 +1863,7 @@ if barstate.isconfirmed
             if szOkB and dispOkB
                 float gCeB = (gTopB + gBotB) / 2
                 bool coiB = f_fvgCoincidesWithOb(gTopB, gBotB, false)
+                cumFvgBear += 1
                 if coiB
                     fvgObCoincidenceCount += 1
                 FVG gb = FVG.new(top = gTopB, bottom = gBotB, ce = gCeB, bullish = false,
@@ -1925,6 +1940,7 @@ if barstate.isconfirmed
                 bool flips   = obInvalidateOnCloseThrough and through
                 if flips
                     o.state := ST_BREAKER
+                    cumBreaker += 1
                     if not na(o.bx)
                         box.set_bgcolor(o.bx, color.new(colBreaker, 88))
                         box.set_border_color(o.bx, color.new(colBreaker, 35))
@@ -1986,6 +2002,7 @@ if barstate.isconfirmed
                              border_color = color.new(oc, 30),
                              border_width = 2, border_style = line.style_solid)
                 array.push(obs, o)
+                cumOb += 1
                 f_capObs()
 
 // =============================================================================
@@ -2396,6 +2413,14 @@ var float smtLastPx       = na
 var float smtLastStrength = 0.0
 var int   smtCount        = 0
 
+// ---- TEMPORARY DIAGNOSTICS for the pool-gate investigation ------------------
+// smtCandidates counts structural divergences found BEFORE the pool gate is
+// applied; smtCount counts those that survived it. If the two are equal the
+// gate is not filtering anything.
+var int   smtCandidates       = 0
+var float smtLastDistAny      = na   // ticks to nearest pool of ANY tier
+var float smtLastDistSig      = na   // ticks to nearest pool of tier <= 1
+
 // Per-bar marker price, reset every bar.
 float smtMarkPx = na
 
@@ -2442,6 +2467,23 @@ f_refRange(int lb) =>
 // Deliberately does NOT require pool.active. The highest-value SMT is the one
 // that prints exactly as a level is swept, and by that bar stage 2 has already
 // marked the pool consumed. Requiring active would filter out the best cases.
+// Distance in TICKS from `price` to the nearest same-side pool at or below
+// `maxTier`. Diagnostic only. Reading this at two tier bands is what exposes
+// whether the gate is matching a meaningful level or something trivial.
+f_nearestPoolDistTicks(float price, bool buySide, int maxTier) =>
+    float best = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.buySide == buySide and p.tier <= maxTier
+                float d = math.abs(p.price - price)
+                if na(best) or d < best
+                    best := d
+    float t = na
+    if not na(best)
+        t := best / syminfo.mintick
+    t
+
 f_anyPoolNear(float price, float tol, bool buySide) =>
     bool r = false
     if array.size(pools) > 0
@@ -2472,6 +2514,9 @@ if barstate.isconfirmed and smtEnabled
             float refPrev = f_refHighAround(bar_index - prevBar, pivotLen)
             // Both must be real numbers. A missing reference is "no opinion".
             if not na(refCur) and not na(refPrev) and refCur <= refPrev
+                smtCandidates += 1
+                smtLastDistAny := f_nearestPoolDistTicks(mnqCur, true, TIER_TRANSIENT)
+                smtLastDistSig := f_nearestPoolDistTicks(mnqCur, true, TIER_SIGNIFICANT)
                 bool atPool = f_anyPoolNear(mnqCur, poolTol, true)
                 if atPool or not smtRequireAtPool
                     float rr   = f_refRange(smtLookbackBars)
@@ -2502,6 +2547,9 @@ if barstate.isconfirmed and smtEnabled
             float refCurL  = f_refLowAround(bar_index - curBarL,  pivotLen)
             float refPrevL = f_refLowAround(bar_index - prevBarL, pivotLen)
             if not na(refCurL) and not na(refPrevL) and refCurL >= refPrevL
+                smtCandidates += 1
+                smtLastDistAny := f_nearestPoolDistTicks(mnqCurL, false, TIER_TRANSIENT)
+                smtLastDistSig := f_nearestPoolDistTicks(mnqCurL, false, TIER_SIGNIFICANT)
                 bool atPoolL = f_anyPoolNear(mnqCurL, poolTol, false)
                 if atPoolL or not smtRequireAtPool
                     float rrL   = f_refRange(smtLookbackBars)
@@ -2735,6 +2783,14 @@ var int   peakSwLong  = na
 var float peakShort   = na
 var int   peakSwShort = na
 
+// How many armed setups EVER had a live dealing range while armed. If this
+// fraction is low, both location components are structurally dead and the max
+// achievable score drops by 3.0 points.
+var int  armedSetups   = 0
+var int  armedWithDR   = 0
+var bool curHadDrLong  = false
+var bool curHadDrShort = false
+
 if barstate.isconfirmed
     scLong  := f_computeScore(true)
     scShort := f_computeScore(false)
@@ -2746,14 +2802,24 @@ if barstate.isconfirmed
         // A different setup than the one being tracked: bank the old peak.
         if not na(peakLong)
             f_bucketScore(peakLong)
-        peakSwLong := swL.confirmBarIdx
-        peakLong   := scLong.total
+            armedSetups += 1
+            if curHadDrLong
+                armedWithDR += 1
+        peakSwLong    := swL.confirmBarIdx
+        peakLong      := scLong.total
+        curHadDrLong  := false
     if gateL and not na(peakSwLong) and peakSwLong == swL.confirmBarIdx
         peakLong := math.max(nz(peakLong, 0.0), scLong.total)
+        if hasDealingRange()
+            curHadDrLong := true
     if not gateL and not na(peakLong)
         f_bucketScore(peakLong)
-        peakLong   := na
-        peakSwLong := na
+        armedSetups += 1
+        if curHadDrLong
+            armedWithDR += 1
+        peakLong     := na
+        peakSwLong   := na
+        curHadDrLong := false
 
     // --- SHORT side peak tracking ---
     Sweep swS = getLiveSweep(true)
@@ -2761,14 +2827,24 @@ if barstate.isconfirmed
     if gateS and (na(peakSwShort) or peakSwShort != swS.confirmBarIdx)
         if not na(peakShort)
             f_bucketScore(peakShort)
-        peakSwShort := swS.confirmBarIdx
-        peakShort   := scShort.total
+            armedSetups += 1
+            if curHadDrShort
+                armedWithDR += 1
+        peakSwShort   := swS.confirmBarIdx
+        peakShort     := scShort.total
+        curHadDrShort := false
     if gateS and not na(peakSwShort) and peakSwShort == swS.confirmBarIdx
         peakShort := math.max(nz(peakShort, 0.0), scShort.total)
+        if hasDealingRange()
+            curHadDrShort := true
     if not gateS and not na(peakShort)
         f_bucketScore(peakShort)
-        peakShort   := na
-        peakSwShort := na
+        armedSetups += 1
+        if curHadDrShort
+            armedWithDR += 1
+        peakShort     := na
+        peakSwShort   := na
+        curHadDrShort := false
 
 // ---- C. PUBLIC OUTPUT --------------------------------------------------------
 // scoreFor() is the real interface: stage 6 and validation both need to know
@@ -3347,6 +3423,20 @@ f_cmp(float earned, float maxv) =>
     string s = str.tostring(earned, "#.00") + " / " + str.tostring(maxv, "#.00")
     s
 
+f_bucketTotal() =>
+    int n = 0
+    if array.size(scoreBuckets) == 5
+        for i = 0 to 4
+            n += array.get(scoreBuckets, i)
+    n
+
+// "  (93%)" or "" when the denominator is zero.
+f_pctStr(int num, int den) =>
+    string r = ""
+    if den > 0
+        r := "  (" + str.tostring(num * 100.0 / den, "#") + "%)"
+    r
+
 f_bucketStr() =>
     string s = ""
     if array.size(scoreBuckets) == 5
@@ -3380,297 +3470,379 @@ var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 54,
+        // Sized for the full table; compact mode simply leaves the rest empty.
+        dbg := table.new(position.top_right, 2, 58,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
-    color hdrBg  = color.new(color.blue, 80)
-    color cellBg = color.new(color.black, 80)
-    color txt    = color.new(color.white, 0)
+    // Cells persist until overwritten, so clear before filling. That is what
+    // lets the two modes share one table object without stale rows from the
+    // other mode bleeding through.
+    table.clear(dbg, 0, 0, 1, 57)
+
+    // =========================================================================
+    // COMPACT MODE. Only what is needed to judge whether the model is
+    // discriminating. The histogram is at ROW 3 so it can never be the row that
+    // scrolls off the bottom.
+    // =========================================================================
+    if compactTable
+        color kHdr = color.new(color.blue, 80)
+        color kBg  = color.new(color.black, 80)
+        color kTx  = color.new(color.white, 0)
+
+        string kSess = not inAnySession ? "NONE" : inAsia ? "ASIA" : "LONDON"
+        string kArmL = "-"
+        string kArmS = "-"
+        if not na(scLong) and scLong.gateOk
+            kArmL := str.tostring(scLong.total, "#.00") + (scLong.pass ? " PASS" : "")
+        if not na(scShort) and scShort.gateOk
+            kArmS := str.tostring(scShort.total, "#.00") + (scShort.pass ? " PASS" : "")
+        string kSig = "none"
+        if lastSigDir != 0
+            kSig := (lastSigDir > 0 ? "LONG " : "SHORT ") + str.tostring(lastSigScore, "#.00") +
+                     "  e " + str.tostring(lastSigEntry, format.mintick) +
+                     "  x" + str.tostring(lastSigQty)
+
+        table.cell(dbg, 0, 0, "MNQ ICT  DIAG", bgcolor = kHdr, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 0, "counts are act | cum", bgcolor = kHdr, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 1, "Day / session", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 1, str.tostring(tradingDay) + "  " + tradingDateStr + "  " + kSess, bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 2, "Sweep : breakout", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 2, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount, sweepUpgradeCount), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // THE diagnostic. Clustering in one bucket means the model is not
+        // discriminating, whatever the other rows say.
+        table.cell(dbg, 0, 3, "SCORE <5/5-6/6-7/7-8/8+", bgcolor = kHdr, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 3, f_bucketStr() + "   n=" + str.tostring(f_bucketTotal()), bgcolor = kHdr, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 4, "Sup: debounce", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 4, "spent " + str.tostring(supSpent) +
+                 " | inpos " + str.tostring(supInPos) +
+                 " | bars " + str.tostring(supMinBars) +
+                 " | max " + str.tostring(supMaxSess) +
+                 " | ambig " + str.tostring(supAmbig), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 5, "Sup: context", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 5, "sess " + str.tostring(supOutSess) +
+                 " | cut " + str.tostring(supCutoff) +
+                 " | exh " + str.tostring(supExhaust) +
+                 " | stop " + str.tostring(supStopBand) +
+                 " | decay " + str.tostring(supDecay) +
+                 " | runFB " + str.tostring(runnerFallbk), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 6, "Last signal", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 6, kSig, bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 7, "Armed L | S", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 7, kArmL + "   |   " + kArmS, bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // Temporary, for the SMT pool-gate investigation.
+        table.cell(dbg, 0, 8, "SMT cand|pass, dist", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 8, str.tostring(smtCandidates) + " | " + str.tostring(smtCount) +
+                 "   any " + f_num(smtLastDistAny) + "t / T0-1 " + f_num(smtLastDistSig) + "t", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+    if not compactTable
+        color hdrBg  = color.new(color.blue, 80)
+        color cellBg = color.new(color.black, 80)
+        color txt    = color.new(color.white, 0)
+
+        string sessName = not inAnySession ? "NONE" :
+                          inAsia ? (inAsiaSignal ? "ASIA" : "ASIA (late, muted)") : "LONDON"
+        int    sessBars = inAsiaRaw ? asiaBars : inLondonRaw ? londonBars : 0
+        string closedStr = asiaJustClosed ? "ASIA closed" : londonJustClosed ? "LONDON closed" : "-"
+
+        Pool nBuy  = nearestBuySideAbove(close)
+        Pool nSell = nearestSellSideBelow(close)
+
+        // Tier breakdown + saturation. If T2 is pinned and the total sits at the
+        // cap, the book is under eviction pressure.
+        // Tier breakdown, saturation, and how many are still ACTIVE. Stage 2
+        // consumes pools on sweeps and breakouts, so act < total is now normal and
+        // a large gap means most of the book has already been taken out.
+        string tierStr = "T0 " + str.tostring(f_tierCount(TIER_PROTECTED)) +
+                         " | T1 " + str.tostring(f_tierCount(TIER_SIGNIFICANT)) +
+                         " | T2 " + str.tostring(f_tierCount(TIER_TRANSIENT)) +
+                         "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
+                         "  act " + str.tostring(activePoolCount())
+
+        table.cell(dbg, 0, 0, "MNQ ICT  COMPLETE", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 1, str.tostring(tradingDay) + "  " + tradingDateStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 2, "Session", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 2, sessName, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 3, "Bars into", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 3, str.tostring(sessBars), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    string sessName = not inAnySession ? "NONE" :
-                      inAsia ? (inAsiaSignal ? "ASIA" : "ASIA (late, muted)") : "LONDON"
-    int    sessBars = inAsiaRaw ? asiaBars : inLondonRaw ? londonBars : 0
-    string closedStr = asiaJustClosed ? "ASIA closed" : londonJustClosed ? "LONDON closed" : "-"
+        table.cell(dbg, 0, 4, "Just closed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 4, closedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    Pool nBuy  = nearestBuySideAbove(close)
-    Pool nSell = nearestSellSideBelow(close)
+        table.cell(dbg, 0, 5, "Sess range", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 5, f_num(curSessRange), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    // Tier breakdown + saturation. If T2 is pinned and the total sits at the
-    // cap, the book is under eviction pressure.
-    // Tier breakdown, saturation, and how many are still ACTIVE. Stage 2
-    // consumes pools on sweeps and breakouts, so act < total is now normal and
-    // a large gap means most of the book has already been taken out.
-    string tierStr = "T0 " + str.tostring(f_tierCount(TIER_PROTECTED)) +
-                     " | T1 " + str.tostring(f_tierCount(TIER_SIGNIFICANT)) +
-                     " | T2 " + str.tostring(f_tierCount(TIER_TRANSIENT)) +
-                     "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
-                     "  act " + str.tostring(activePoolCount())
+        table.cell(dbg, 0, 6, "Median 20", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 6, f_num(curSessMed) + "  (A " + f_num(asiaMedRange) + " / L " + f_num(londonMedRange) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 0, "MNQ ICT  COMPLETE", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 7, "ATR " + str.tostring(atrLen), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 7, f_num(atr), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 1, str.tostring(tradingDay) + "  " + tradingDateStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 8, "Asia High", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 8, f_px(asiaRangeHigh), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 2, "Session", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 2, sessName, bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 9, "Asia Low", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 9, f_px(asiaRangeLow), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 3, "Bars into", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 3, str.tostring(sessBars), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 10, "PDH", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 10, f_px(pdh), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 4, "Just closed", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 4, closedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 11, "PDL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 11, f_px(pdl), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 5, "Sess range", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 5, f_num(curSessRange), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 12, "PWH", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 12, f_px(pwh), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 6, "Median 20", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 6, f_num(curSessMed) + "  (A " + f_num(asiaMedRange) + " / L " + f_num(londonMedRange) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 13, "PWL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 13, f_px(pwl), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 7, "ATR " + str.tostring(atrLen), bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 7, f_num(atr), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 14, "Pools by tier", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 14, tierStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 8, "Asia High", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 8, f_px(asiaRangeHigh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 15, "Last swing H", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 15, f_swingStr(lastConfirmedSwingHigh, lastSwingHighBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 9, "Asia Low", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 9, f_px(asiaRangeLow), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 16, "Last swing L", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 16, f_swingStr(lastConfirmedSwingLow, lastSwingLowBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 10, "PDH", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 10, f_px(pdh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 17, "Nearest pool", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 17, "up " + f_poolStr(nBuy) + " | dn " + f_poolStr(nSell), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 11, "PDL", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 11, f_px(pdl), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        // ---- STAGE 2 ROWS --------------------------------------------------------
+        string biasStr = structBias > 0 ? "BULL" : structBias < 0 ? "BEAR" : "NEUTRAL"
+        string dispStr = isDisplacementUp ? "UP" : isDisplacementDown ? "DOWN" : "none"
+        bool   longArmed  = isSweepMssPair(false)   // sell-side swept, bullish MSS
+        bool   shortArmed = isSweepMssPair(true)    // buy-side swept, bearish MSS
+        string armedStr = longArmed and shortArmed ? "BOTH (?)" :
+                          longArmed ? "LONG" : shortArmed ? "SHORT" : "none"
 
-    table.cell(dbg, 0, 12, "PWH", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 12, f_px(pwh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 18, "S2 bias", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 18, biasStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 13, "PWL", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 13, f_px(pwl), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 14, "Pools by tier", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 14, tierStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 15, "Last swing H", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 15, f_swingStr(lastConfirmedSwingHigh, lastSwingHighBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 16, "Last swing L", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 16, f_swingStr(lastConfirmedSwingLow, lastSwingLowBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 17, "Nearest pool", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 17, "up " + f_poolStr(nBuy) + " | dn " + f_poolStr(nSell), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // ---- STAGE 2 ROWS --------------------------------------------------------
-    string biasStr = structBias > 0 ? "BULL" : structBias < 0 ? "BEAR" : "NEUTRAL"
-    string dispStr = isDisplacementUp ? "UP" : isDisplacementDown ? "DOWN" : "none"
-    bool   longArmed  = isSweepMssPair(false)   // sell-side swept, bullish MSS
-    bool   shortArmed = isSweepMssPair(true)    // buy-side swept, bearish MSS
-    string armedStr = longArmed and shortArmed ? "BOTH (?)" :
-                      longArmed ? "LONG" : shortArmed ? "SHORT" : "none"
-
-    table.cell(dbg, 0, 18, "S2 bias", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 18, biasStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 19, "Displacement", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 19, dispStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 20, "Live sweep BUY", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 20, f_liveSweepStr(getLiveSweep(true)), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 21, "Live sweep SELL", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 21, f_liveSweepStr(getLiveSweep(false)), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 22, "Last structure", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 22, f_structEvtStr(lastStructType, lastStructDir, lastStructBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 23, "Sweep+MSS armed", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 23, armedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 24, "Sweep : breakout", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount, sweepUpgradeCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // ---- STAGE 3 ROWS --------------------------------------------------------
-    POI poiLong  = bestPOI(true,  close)
-    POI poiShort = bestPOI(false, close)
-    string oteNowStr = inOTE(true) ? "LONG" : inOTE(false) ? "SHORT" : "no"
-    if not hasDealingRange()
-        oteNowStr := "no range"
-
-    table.cell(dbg, 0, 25, "S3 FVG b/s", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 25, str.tostring(f_countFvgActive(true)) + " bull / " + str.tostring(f_countFvgActive(false)) + " bear", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 26, "IFVG active", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 26, str.tostring(f_countIfvgActive()), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 27, "OB / breaker", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 27, str.tostring(f_countObState(false)) + " / " + str.tostring(f_countObState(true)), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 28, "Dealing range", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 28, f_drStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 29, "In OTE now", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 29, oteNowStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 30, "bestPOI long", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 30, f_bestPoiStr(poiLong), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 31, "bestPOI short", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 31, f_bestPoiStr(poiShort), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 32, "FVG+OB overlap", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 32, str.tostring(fvgObCoincidenceCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // ---- STAGE 4 ROWS --------------------------------------------------------
-    string smtStateStr = "none"
-    if smtDivergence(true)
-        smtStateStr := "BULLISH  " + str.tostring(smtStrengthNow(), "#.00")
-    if smtDivergence(false)
-        smtStateStr := "BEARISH  " + str.tostring(smtStrengthNow(), "#.00")
-    if not smtEnabled
-        smtStateStr := "disabled"
-
-    // If this reads "no feed" the reference is not delivering and every SMT
-    // result below is silently absent rather than wrong.
-    string refFeedStr = na(refClose) ? "no feed" : str.tostring(refClose, format.mintick)
-
-    table.cell(dbg, 0, 33, "S4 SMT", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 33, smtStateStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 34, "Ref feed", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 34, smtSymbol + "  " + refFeedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 35, "SMT count", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 35, str.tostring(smtCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // ---- STAGE 5 ROWS --------------------------------------------------------
-    // Show whichever side is armed. If both are, show the higher-scoring one.
-    Score shown = na
-    bool  gL = not na(scLong)  and scLong.gateOk
-    bool  gS = not na(scShort) and scShort.gateOk
-    if gL and not gS
-        shown := scLong
-    if gS and not gL
-        shown := scShort
-    if gL and gS and scLong.total >= scShort.total
-        shown := scLong
-    if gL and gS and scShort.total > scLong.total
-        shown := scShort
-
-    string armedStr2 = "none"
-    string sweepStr  = "-"
-    string mssStr    = "-"
-    string poiStr2   = "-"
-    string locStr    = "-"
-    string smtPtsStr = "-"
-    string sessStr   = "-"
-    string totalStr  = "-"
-    string verdict   = "-"
-    if not na(shown)
-        armedStr2 := shown.isLong ? "LONG" : "SHORT"
-        sweepStr  := f_cmp(shown.sweepPts, wSweep) + "  (" + shown.poolTag + " T" + str.tostring(shown.poolTier) + ")"
-        mssStr    := f_cmp(shown.mssPts, wMss)
-        poiStr2   := f_cmp(shown.poiPts, wPoi) + "  (" + shown.poiKind + ")"
-        locStr    := f_cmp(shown.locPts, wLocation)
-        smtPtsStr := f_cmp(shown.smtPts, wSmt) + (inAsia ? "  asia x0.5" : "")
-        sessStr   := f_cmp(shown.sessPts, wSessionPd)
-        totalStr  := str.tostring(shown.total, "#.00") + "  vs " + str.tostring(scoreThreshold, "#.0")
-        verdict   := shown.strong ? "PASS - STRONG" : shown.pass ? "PASS - signal" : "FAIL"
-
-    // Built with explicit ifs, not a ternary chain: Pine evaluates both arms of
-    // a ternary, and shown.strong on an na object is a runtime error.
-    color vBg = cellBg
-    if not na(shown) and shown.strong
-        vBg := color.new(color.green, 55)
-    if not na(shown) and shown.pass and not shown.strong
-        vBg := color.new(color.green, 75)
-    if not na(shown) and not shown.pass
-        vBg := color.new(color.red, 78)
-
-    table.cell(dbg, 0, 36, "S5 armed", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 36, armedStr2, bgcolor = hdrBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 37, "Sweep", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 37, sweepStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 38, "MSS", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 38, mssStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 39, "POI", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 39, poiStr2, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 40, "DR location", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 40, locStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 41, "SMT", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 41, smtPtsStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 42, "Session P/D", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 42, sessStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 43, "TOTAL", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 43, totalStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 44, "Verdict", bgcolor = vBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 44, verdict, bgcolor = vBg, text_color = txt, text_size = size.small)
-
-    // THE diagnostic. One sample per armed setup, at its peak score. Clustering
-    // in a single bucket means the model is not discriminating.
-    table.cell(dbg, 0, 45, "Dist <5/5-6/6-7/7-8/8+", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 45, f_bucketStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // ---- STAGE 6 ROWS --------------------------------------------------------
-    string sigHdr = "none"
-    string sigLv1 = "-"
-    string sigLv2 = "-"
-    string sigLv3 = "-"
-    if lastSigDir != 0
-        sigHdr := f_sigSideStr() + "  " + str.tostring(lastSigScore, "#.00") +
-                  "  (peak " + str.tostring(lastSigPeak, "#.00") + ")"
-        sigLv1 := "e " + str.tostring(lastSigEntry, format.mintick) +
-                  "  s " + str.tostring(lastSigStop, format.mintick) +
-                  "  (" + str.tostring(lastSigStopPts, "#.0") + "pt)"
-        sigLv2 := "t1 " + str.tostring(lastSigTp1, format.mintick) +
-                  "  run " + str.tostring(lastSigRunner, format.mintick)
-        sigLv3 := "x" + str.tostring(lastSigQty) + "  $" + str.tostring(lastSigRisk, "#.00") +
-                  "  " + lastSigSess + "  " + lastSigTrig
-
-    table.cell(dbg, 0, 46, "S6 last signal", bgcolor = hdrBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 46, sigHdr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 47, "Entry / stop", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 47, sigLv1, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 48, "TP1 / runner", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 48, sigLv2, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 49, "Size / risk", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 49, sigLv3, bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 50, "Swept / position", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 50, lastSigSwept + "  |  " + f_posStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 51, "Session signals", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 51, "Asia L" + str.tostring(sigAsiaLong) + " S" + str.tostring(sigAsiaShort) +
-             "  |  Ldn L" + str.tostring(sigLdnLong) + " S" + str.tostring(sigLdnShort) +
-             "  (max " + str.tostring(maxSignalsPerSession) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    // Which guard rail is actually doing the work. Each counts blocked
-    // TRIGGERS, not bars, so these are comparable to each other.
-    table.cell(dbg, 0, 52, "Sup: debounce", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 52, "spent " + str.tostring(supSpent) +
-             " | inpos " + str.tostring(supInPos) +
-             " | bars " + str.tostring(supMinBars) +
-             " | max " + str.tostring(supMaxSess) +
-             " | ambig " + str.tostring(supAmbig), bgcolor = cellBg, text_color = txt, text_size = size.small)
-
-    table.cell(dbg, 0, 53, "Sup: context", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 53, "sess " + str.tostring(supOutSess) +
-             " | cut " + str.tostring(supCutoff) +
-             " | exh " + str.tostring(supExhaust) +
-             " | stop " + str.tostring(supStopBand) +
-             " | decay " + str.tostring(supDecay) +
-             " | runFB " + str.tostring(runnerFallbk), bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 19, "Displacement", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 19, dispStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 20, "Live sweep BUY", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 20, f_liveSweepStr(getLiveSweep(true)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 21, "Live sweep SELL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 21, f_liveSweepStr(getLiveSweep(false)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 22, "Last structure", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 22, f_structEvtStr(lastStructType, lastStructDir, lastStructBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 23, "Sweep+MSS armed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 23, armedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 24, "Sweep : breakout", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount, sweepUpgradeCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // ---- STAGE 3 ROWS --------------------------------------------------------
+        POI poiLong  = bestPOI(true,  close)
+        POI poiShort = bestPOI(false, close)
+        string oteNowStr = inOTE(true) ? "LONG" : inOTE(false) ? "SHORT" : "no"
+        if not hasDealingRange()
+            oteNowStr := "no range"
+
+        // ZONE COUNTS: "active | cum". Active alone is ambiguous -- 0 could be a
+        // quiet moment or could mean the zone type essentially never forms, and
+        // those demand opposite responses.
+        table.cell(dbg, 0, 25, "S3 zones  act | cum", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 25, "FVG b/s  " + str.tostring(f_countFvgActive(true)) + " / " + str.tostring(f_countFvgActive(false)) +
+                 "  |  cum " + str.tostring(cumFvgBull) + " / " + str.tostring(cumFvgBear), bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 26, "IFVG", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 26, str.tostring(f_countIfvgActive()) + "  |  cum " + str.tostring(cumIfvg), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 27, "OB / breaker", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 27, str.tostring(f_countObState(false)) + " / " + str.tostring(f_countObState(true)) +
+                 "  |  cum " + str.tostring(cumOb) + " / " + str.tostring(cumBreaker), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 28, "Dealing range", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 28, f_drStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 29, "In OTE now", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 29, oteNowStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 30, "bestPOI long", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 30, f_bestPoiStr(poiLong), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 31, "bestPOI short", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 31, f_bestPoiStr(poiShort), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 32, "FVG+OB overlap", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 32, str.tostring(fvgObCoincidenceCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // ---- STAGE 4 ROWS --------------------------------------------------------
+        string smtStateStr = "none"
+        if smtDivergence(true)
+            smtStateStr := "BULLISH  " + str.tostring(smtStrengthNow(), "#.00")
+        if smtDivergence(false)
+            smtStateStr := "BEARISH  " + str.tostring(smtStrengthNow(), "#.00")
+        if not smtEnabled
+            smtStateStr := "disabled"
+
+        // If this reads "no feed" the reference is not delivering and every SMT
+        // result below is silently absent rather than wrong.
+        string refFeedStr = na(refClose) ? "no feed" : str.tostring(refClose, format.mintick)
+
+        table.cell(dbg, 0, 33, "S4 SMT", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 33, smtStateStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 34, "Ref feed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 34, smtSymbol + "  " + refFeedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 35, "SMT cand | passed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 35, str.tostring(smtCandidates) + "  |  " + str.tostring(smtCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // ---- STAGE 5 ROWS --------------------------------------------------------
+        // Show whichever side is armed. If both are, show the higher-scoring one.
+        Score shown = na
+        bool  gL = not na(scLong)  and scLong.gateOk
+        bool  gS = not na(scShort) and scShort.gateOk
+        if gL and not gS
+            shown := scLong
+        if gS and not gL
+            shown := scShort
+        if gL and gS and scLong.total >= scShort.total
+            shown := scLong
+        if gL and gS and scShort.total > scLong.total
+            shown := scShort
+
+        string armedStr2 = "none"
+        string sweepStr  = "-"
+        string mssStr    = "-"
+        string poiStr2   = "-"
+        string locStr    = "-"
+        string smtPtsStr = "-"
+        string sessStr   = "-"
+        string totalStr  = "-"
+        string verdict   = "-"
+        if not na(shown)
+            armedStr2 := shown.isLong ? "LONG" : "SHORT"
+            sweepStr  := f_cmp(shown.sweepPts, wSweep) + "  (" + shown.poolTag + " T" + str.tostring(shown.poolTier) + ")"
+            mssStr    := f_cmp(shown.mssPts, wMss)
+            poiStr2   := f_cmp(shown.poiPts, wPoi) + "  (" + shown.poiKind + ")"
+            locStr    := f_cmp(shown.locPts, wLocation)
+            smtPtsStr := f_cmp(shown.smtPts, wSmt) + (inAsia ? "  asia x0.5" : "")
+            sessStr   := f_cmp(shown.sessPts, wSessionPd)
+            totalStr  := str.tostring(shown.total, "#.00") + "  vs " + str.tostring(scoreThreshold, "#.0")
+            verdict   := shown.strong ? "PASS - STRONG" : shown.pass ? "PASS - signal" : "FAIL"
+
+        // Built with explicit ifs, not a ternary chain: Pine evaluates both arms of
+        // a ternary, and shown.strong on an na object is a runtime error.
+        color vBg = cellBg
+        if not na(shown) and shown.strong
+            vBg := color.new(color.green, 55)
+        if not na(shown) and shown.pass and not shown.strong
+            vBg := color.new(color.green, 75)
+        if not na(shown) and not shown.pass
+            vBg := color.new(color.red, 78)
+
+        table.cell(dbg, 0, 36, "S5 armed", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 36, armedStr2, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 37, "Sweep", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 37, sweepStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 38, "MSS", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 38, mssStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 39, "POI", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 39, poiStr2, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 40, "DR location", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 40, locStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 41, "SMT", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 41, smtPtsStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 42, "Session P/D", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 42, sessStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 43, "TOTAL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 43, totalStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 44, "Verdict", bgcolor = vBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 44, verdict, bgcolor = vBg, text_color = txt, text_size = size.small)
+
+        // THE diagnostic. One sample per armed setup, at its peak score. Clustering
+        // in a single bucket means the model is not discriminating.
+        table.cell(dbg, 0, 45, "Dist <5/5-6/6-7/7-8/8+", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 45, f_bucketStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // ---- STAGE 6 ROWS --------------------------------------------------------
+        string sigHdr = "none"
+        string sigLv1 = "-"
+        string sigLv2 = "-"
+        string sigLv3 = "-"
+        if lastSigDir != 0
+            sigHdr := f_sigSideStr() + "  " + str.tostring(lastSigScore, "#.00") +
+                      "  (peak " + str.tostring(lastSigPeak, "#.00") + ")"
+            sigLv1 := "e " + str.tostring(lastSigEntry, format.mintick) +
+                      "  s " + str.tostring(lastSigStop, format.mintick) +
+                      "  (" + str.tostring(lastSigStopPts, "#.0") + "pt)"
+            sigLv2 := "t1 " + str.tostring(lastSigTp1, format.mintick) +
+                      "  run " + str.tostring(lastSigRunner, format.mintick)
+            sigLv3 := "x" + str.tostring(lastSigQty) + "  $" + str.tostring(lastSigRisk, "#.00") +
+                      "  " + lastSigSess + "  " + lastSigTrig
+
+        table.cell(dbg, 0, 46, "S6 last signal", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 46, sigHdr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 47, "Entry / stop", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 47, sigLv1, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 48, "TP1 / runner", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 48, sigLv2, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 49, "Size / risk", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 49, sigLv3, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 50, "Swept / position", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 50, lastSigSwept + "  |  " + f_posStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 51, "Session signals", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 51, "Asia L" + str.tostring(sigAsiaLong) + " S" + str.tostring(sigAsiaShort) +
+                 "  |  Ldn L" + str.tostring(sigLdnLong) + " S" + str.tostring(sigLdnShort) +
+                 "  (max " + str.tostring(maxSignalsPerSession) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // Which guard rail is actually doing the work. Each counts blocked
+        // TRIGGERS, not bars, so these are comparable to each other.
+        table.cell(dbg, 0, 52, "Sup: debounce", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 52, "spent " + str.tostring(supSpent) +
+                 " | inpos " + str.tostring(supInPos) +
+                 " | bars " + str.tostring(supMinBars) +
+                 " | max " + str.tostring(supMaxSess) +
+                 " | ambig " + str.tostring(supAmbig), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 53, "Sup: context", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 53, "sess " + str.tostring(supOutSess) +
+                 " | cut " + str.tostring(supCutoff) +
+                 " | exh " + str.tostring(supExhaust) +
+                 " | stop " + str.tostring(supStopBand) +
+                 " | decay " + str.tostring(supDecay) +
+                 " | runFB " + str.tostring(runnerFallbk), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        // ---- TEMPORARY INVESTIGATION ROWS ----------------------------------------
+        table.cell(dbg, 0, 54, "SMT pool dist", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 54, "any " + f_num(smtLastDistAny) + "t  |  T0/1 " + f_num(smtLastDistSig) + "t", bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+        table.cell(dbg, 0, 55, "Armed w/ DR", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 55, str.tostring(armedWithDR) + " / " + str.tostring(armedSetups) + f_pctStr(armedWithDR, armedSetups), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
