@@ -3468,14 +3468,18 @@ f_pctStr(int num, int den) =>
         r := "  (" + str.tostring(num * 100.0 / den, "#") + "%)"
     r
 
+// Every bucket carries its own edge, so the row reads as a histogram even when
+// it is all zeros. The previous bare "0 / 0 / 0 / 0 / 0" was indistinguishable
+// from an empty row, which is how it got missed.
 f_bucketStr() =>
     string s = ""
     if array.size(scoreBuckets) == 5
-        s := str.tostring(array.get(scoreBuckets, 0)) + " / " +
-             str.tostring(array.get(scoreBuckets, 1)) + " / " +
-             str.tostring(array.get(scoreBuckets, 2)) + " / " +
-             str.tostring(array.get(scoreBuckets, 3)) + " / " +
-             str.tostring(array.get(scoreBuckets, 4))
+        s := "<5 "    + str.tostring(array.get(scoreBuckets, 0)) +
+             " | 5-6 " + str.tostring(array.get(scoreBuckets, 1)) +
+             " | 6-7 " + str.tostring(array.get(scoreBuckets, 2)) +
+             " | 7-8 " + str.tostring(array.get(scoreBuckets, 3)) +
+             " | 8+ "  + str.tostring(array.get(scoreBuckets, 4)) +
+             "   (total " + str.tostring(f_bucketTotal()) + ")"
     s
 
 // ---- stage-6 table helpers --------------------------------------------------
@@ -3545,8 +3549,11 @@ if barstate.islast and showDebugTable
 
         // THE diagnostic. Clustering in one bucket means the model is not
         // discriminating, whatever the other rows say.
-        table.cell(dbg, 0, 3, "SCORE <5/5-6/6-7/7-8/8+", bgcolor = kHdr, text_color = kTx, text_size = size.small)
-        table.cell(dbg, 1, 3, f_bucketStr() + "   n=" + str.tostring(f_bucketTotal()), bgcolor = kHdr, text_color = kTx, text_size = size.small)
+        // THE diagnostic, directly under Sweep:breakout so it is never the row
+        // that scrolls off. Clustering in one bucket means the model is not
+        // discriminating, whatever every other row says.
+        table.cell(dbg, 0, 3, "Scores", bgcolor = kHdr, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 3, f_bucketStr(), bgcolor = kHdr, text_color = kTx, text_size = size.small)
 
         table.cell(dbg, 0, 4, "Sup: debounce", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 4, "spent " + str.tostring(supSpent) +
@@ -3812,7 +3819,7 @@ if barstate.islast and showDebugTable
 
         // THE diagnostic. One sample per armed setup, at its peak score. Clustering
         // in a single bucket means the model is not discriminating.
-        table.cell(dbg, 0, 45, "Dist <5/5-6/6-7/7-8/8+", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 0, 45, "Score distribution", bgcolor = cellBg, text_color = txt, text_size = size.small)
         table.cell(dbg, 1, 45, f_bucketStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
         // ---- STAGE 6 ROWS --------------------------------------------------------
