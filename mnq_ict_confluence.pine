@@ -1,0 +1,724 @@
+//@version=6
+// =============================================================================
+// MNQ ICT CONFLUENCE  --  STAGE 1 of 6: FOUNDATION
+// -----------------------------------------------------------------------------
+// DISCLAIMER: research/education tool. NOT financial advice. Every level and
+// threshold in here is an untested hypothesis about how MNQ behaves. Trade your
+// own money at your own risk.
+//
+// Instrument : MNQ (Micro E-mini Nasdaq-100, CME)
+//              tick 0.25 pts | tick value $0.50 | point value $2.00
+// Chart      : 5-minute
+// Plan       : TradingView PLUS. This script deliberately uses NONE of:
+//              request.footprint(), seconds-based intervals, Bar Magnifier,
+//              Deep Backtesting. It is an indicator, not a strategy.
+//
+// WHAT STAGE 1 CONTAINS
+//   A. Session engine (Asia / London, trading-day attribution, shading)
+//   B. ATR + rolling median of completed session ranges
+//   C. Liquidity pool map (Asia range, PDH/PDL, PWH/PWL, swings, EQH/EQL)
+//   D. Anti-repaint fractal swing pivots
+//   E. Debug verification table
+//   F. Empty, clearly-marked stubs for stages 2-6
+//
+// ANTI-REPAINT CONTRACT (holds for every stage of this project)
+//   1. Session membership comes from the bar's OPEN time, which is fixed the
+//      moment the bar prints, so session flags can never repaint.
+//   2. Every state mutation a future signal could depend on lives inside an
+//      `if barstate.isconfirmed` block. Nothing is written from a forming bar.
+//   3. Every request.security() uses lookahead = barmerge.lookahead_off AND a
+//      [1] offset on the requested expression, so we only ever read a period
+//      that has already CLOSED.
+//   4. Swing pivots are registered pivotLen bars late, by construction. The lag
+//      is real and is never papered over.
+//   5. All clock logic uses the "America/New_York" string, so US DST shifts are
+//      handled by TradingView. No hardcoded UTC offsets anywhere.
+// =============================================================================
+
+indicator("MNQ ICT Confluence [S1]", shorttitle = "MNQ ICT S1", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// ---- Group: Sessions ---------------------------------------------------------
+grpSess = "Sessions"
+
+asiaEnabled = input.bool(true, "Asia enabled", group = grpSess,
+     tooltip = "Turns Asia session flags and shading on/off. The Asia RANGE is tracked either way so pools stay correct.")
+asiaSession = input.session("2000-0200", "Asia session (ET)", group = grpSess,
+     tooltip = "Spans midnight. This full window always builds the Asia range high/low.")
+asiaExcludeLate = input.bool(true, "Exclude late Asia 00:00-02:00 from signals", group = grpSess,
+     tooltip = "When on, the 00:00-02:00 ET tail is suppressed for SIGNAL purposes only. It is STILL used to build the Asia range high/low.")
+
+londonEnabled = input.bool(true, "London enabled", group = grpSess)
+londonPreset  = input.string("Killzone 02:00-05:00", "London preset", group = grpSess,
+     options = ["Killzone 02:00-05:00", "Extended 02:00-06:00", "Legacy 03:00-07:00"])
+londonUseCustom = input.bool(false, "Override preset with custom London window", group = grpSess,
+     tooltip = "Switch on to ignore the preset and use the custom session string below.")
+londonSessionCustom = input.session("0200-0500", "London session custom (ET)", group = grpSess,
+     tooltip = "Only used when the override above is on.")
+
+// ---- Group: Structure --------------------------------------------------------
+grpStruct = "Structure"
+
+pivotLen = input.int(2, "Pivot length (bars each side)", minval = 1, maxval = 20, group = grpStruct,
+     tooltip = "Fractal confirmation. A pivot is only KNOWN pivotLen bars after it prints.")
+atrLen = input.int(14, "ATR length", minval = 1, group = grpStruct)
+
+// ---- Group: Liquidity Pools --------------------------------------------------
+grpPools = "Liquidity Pools"
+
+showAsiaRange   = input.bool(true, "Draw Asia range high/low", group = grpPools)
+showPDHL        = input.bool(true, "Draw prior day high/low",  group = grpPools)
+showPWHL        = input.bool(true, "Draw prior week high/low", group = grpPools)
+showEqualLevels = input.bool(true, "Draw equal highs/lows",    group = grpPools)
+
+equalTolTicks = input.float(3.0, "Equal-level tolerance (ticks)", minval = 0.0, step = 0.25, group = grpPools,
+     tooltip = "MNQ tick = 0.25 pts, so 3 ticks = 0.75 pts.")
+equalTolAtrMult = input.float(0.10, "Equal-level tolerance (x ATR)", minval = 0.0, step = 0.01, group = grpPools)
+equalTolMode = input.string("Max of both", "Equal-level tolerance mode", group = grpPools,
+     options = ["Ticks", "ATR", "Max of both"])
+
+pdhlSource = input.string("RTH 09:30-16:00", "Prior day high/low source", group = grpPools,
+     options = ["RTH 09:30-16:00", "Full session"],
+     tooltip = "RTH builds the level natively from intraday bars. Full session reads the prior CLOSED daily bar.")
+
+maxPools = input.int(40, "Max pools kept (drawings capped)", minval = 5, maxval = 200, group = grpPools,
+     tooltip = "Hard cap on stored pools and their line/label objects. Oldest is dropped first.")
+
+// ---- Group: Display ----------------------------------------------------------
+grpDisp = "Display"
+
+showDebugTable     = input.bool(true, "Show debug table",      group = grpDisp)
+showSessionShading = input.bool(true, "Show session shading",  group = grpDisp)
+showSwingMarkers   = input.bool(true, "Show confirmed swing markers", group = grpDisp,
+     tooltip = "Triangles are drawn back at the TRUE pivot bar, but only appear pivotLen bars later. That visible lag IS the anti-repaint guarantee.")
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// One timezone string for the whole script. DST handled by TradingView.
+string TZ = "America/New_York"
+
+// Fixed helper windows (deliberately not user-tunable).
+string SESS_ASIA_LATE = "0000-0200"   // the Asia tail we can mute for signals
+string SESS_RTH       = "0930-1600"   // US cash session, for RTH PDH/PDL
+
+// How many completed session ranges feed the rolling median.
+int MEDIAN_LOOKBACK = 20
+
+// How many recent confirmed swings we keep in memory (and as pools).
+int SWING_KEEP = 10
+
+// CME futures roll the trading day at 18:00 ET. Any bar at or after this hour
+// belongs to the NEXT calendar trading day. This is what makes a Sunday 20:00
+// ET Asia open belong to Monday.
+int TRADING_DAY_ROLL_HOUR = 18
+
+// Pool colours: buy-side liquidity sits ABOVE price (red), sell-side BELOW (teal).
+color colBuySide  = #ef5350
+color colSellSide = #26a69a
+
+// =============================================================================
+// SECTION B (part 1): ATR + TOLERANCE
+// Chart-timeframe ATR. It is only READ inside confirmed-bar blocks, where its
+// value for the bar is already final.
+// =============================================================================
+
+float atr = ta.atr(atrLen)
+
+// Resolve the equal-highs/lows tolerance into PRICE units from the chosen mode.
+f_equalTol() =>
+    float tTicks = equalTolTicks * syminfo.mintick
+    float tAtr   = equalTolAtrMult * nz(atr)
+    float res    = switch equalTolMode
+        "Ticks" => tTicks
+        "ATR"   => tAtr
+        => math.max(tTicks, tAtr)
+    res
+
+// =============================================================================
+// SECTION C (part 1): LIQUIDITY POOL TYPE + API
+// A "pool" is a resting-liquidity price level. Stages 2-6 will sweep, score and
+// target these, so the API is defined now and kept deliberately small.
+// =============================================================================
+
+// price   : the level itself
+// tag     : the pool's label, e.g. "Asia High", "PDH", "EQH"
+// buySide : true  = buy-side liquidity  (above price: stops of shorts)
+//           false = sell-side liquidity (below price: stops of longs)
+// barIdx  : bar_index at which the pool was CONFIRMED. For swings this is
+//           pivotLen bars AFTER the pivot itself -- that is intentional.
+// active  : true until a later stage marks it consumed/swept
+// ln / lb : its drawing objects, carried on the object so cleanup is trivial
+type Pool
+    float  price
+    string tag
+    bool   buySide
+    int    barIdx
+    bool   active
+    line   ln = na
+    label  lb = na
+
+// The single global pool book. Stages 2-6 read from this array.
+var array<Pool> pools = array.new<Pool>()
+
+// --- internal: destroy a pool's drawings and drop it from the book -----------
+f_deletePoolAt(int idx) =>
+    Pool p = array.get(pools, idx)
+    if not na(p.ln)
+        line.delete(p.ln)
+    if not na(p.lb)
+        label.delete(p.lb)
+    array.remove(pools, idx)
+
+// --- internal: enforce the global object cap, oldest first ------------------
+f_enforcePoolCap() =>
+    while array.size(pools) > maxPools
+        f_deletePoolAt(0)
+
+// --- internal: keep at most keepN pools carrying `tag`, dropping oldest -----
+// Stops a stream of fresh swing pools from evicting the day/week levels.
+f_trimTag(string tag, int keepN) =>
+    int cnt = 0
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            if array.get(pools, i).tag == tag
+                cnt += 1
+    int toDrop = cnt - keepN
+    int cur = 0
+    while toDrop > 0 and cur < array.size(pools)
+        if array.get(pools, cur).tag == tag
+            f_deletePoolAt(cur)
+            toDrop -= 1
+        else
+            cur += 1
+
+// --- PUBLIC: remove every pool carrying `tag` -------------------------------
+// Used for singleton levels that get RE-STATED each day/week/session.
+removePoolsByTag(string tag) =>
+    if array.size(pools) > 0
+        for i = array.size(pools) - 1 to 0
+            if array.get(pools, i).tag == tag
+                f_deletePoolAt(i)
+
+// --- internal: the full add, with an explicit "should this be drawn" flag ---
+f_addPool(float price, string tag, bool buySide, bool draw) =>
+    Pool p = Pool.new(price = price, tag = tag, buySide = buySide,
+                     barIdx = bar_index, active = true)
+    if draw
+        color c = buySide ? colBuySide : colSellSide
+        p.ln := line.new(bar_index, price, bar_index + 1, price,
+                 xloc = xloc.bar_index, extend = extend.right,
+                 color = color.new(c, 35), style = line.style_dotted, width = 1)
+        p.lb := label.new(bar_index + 3, price, tag,
+                 xloc = xloc.bar_index, style = label.style_label_left,
+                 color = color.new(color.black, 100), textcolor = color.new(c, 10),
+                 size = size.small)
+    array.push(pools, p)
+    f_enforcePoolCap()
+    p
+
+// --- PUBLIC: addPool(price, label, side) ------------------------------------
+// The stage-2+ entry point. Adds a drawn pool and returns it.
+addPool(float price, string tag, bool buySide) =>
+    f_addPool(price, tag, buySide, true)
+
+// --- PUBLIC: move an existing pool's price (and its drawings) ---------------
+setPoolPrice(Pool p, float price) =>
+    p.price := price
+    if not na(p.ln)
+        line.set_y1(p.ln, price)
+        line.set_y2(p.ln, price)
+    if not na(p.lb)
+        label.set_y(p.lb, price)
+
+// --- PUBLIC: nearest ACTIVE buy-side pool strictly ABOVE px -----------------
+// Returns na when nothing qualifies. Stage 2 uses this to pick sweep targets.
+nearestBuySideAbove(float px) =>
+    Pool best = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.active and p.buySide and p.price > px
+                if na(best)
+                    best := p
+                else if p.price < best.price
+                    best := p
+    best
+
+// --- PUBLIC: nearest ACTIVE sell-side pool strictly BELOW px ----------------
+nearestSellSideBelow(float px) =>
+    Pool best = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.active and not p.buySide and p.price < px
+                if na(best)
+                    best := p
+                else if p.price > best.price
+                    best := p
+    best
+
+// --- PUBLIC: first ACTIVE pool with `tag` within `tol` of price, else na ----
+findActivePoolNear(string tag, float price, float tol) =>
+    Pool hit = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.active and p.tag == tag and math.abs(p.price - price) <= tol
+                if na(hit)
+                    hit := p
+    hit
+
+// --- PUBLIC: how many pools are still active --------------------------------
+activePoolCount() =>
+    int n = 0
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            if array.get(pools, i).active
+                n += 1
+    n
+
+// =============================================================================
+// SECTION A: SESSION ENGINE
+// =============================================================================
+
+// Resolve the London window from the preset, unless the user overrides it.
+string londonPresetSess = switch londonPreset
+    "Killzone 02:00-05:00" => "0200-0500"
+    "Extended 02:00-06:00" => "0200-0600"
+    "Legacy 03:00-07:00"   => "0300-0700"
+    => "0200-0500"
+
+string londonSession = londonUseCustom ? londonSessionCustom : londonPresetSess
+
+// Raw membership. time() is evaluated against the bar's OPEN timestamp, which
+// is fixed when the bar prints, so these flags cannot repaint intrabar.
+// The RAW flags ignore the enable toggles, so range building and trading-day
+// attribution stay correct even when a session is hidden.
+bool inAsiaRaw   = not na(time(timeframe.period, asiaSession,    TZ))
+bool inLondonRaw = not na(time(timeframe.period, londonSession,  TZ))
+bool inAsiaLate  = not na(time(timeframe.period, SESS_ASIA_LATE, TZ))
+bool inRthRaw    = not na(time(timeframe.period, SESS_RTH,       TZ))
+
+// Previous-bar membership. The bar_index guard keeps bar 0 clean.
+bool prevAsiaRaw   = bar_index > 0 and inAsiaRaw[1]
+bool prevLondonRaw = bar_index > 0 and inLondonRaw[1]
+bool prevRthRaw    = bar_index > 0 and inRthRaw[1]
+
+// Edge transitions (raw, i.e. independent of the enable toggles).
+bool asiaOpenRaw    = inAsiaRaw       and not prevAsiaRaw
+bool asiaCloseRaw   = not inAsiaRaw   and prevAsiaRaw
+bool londonOpenRaw  = inLondonRaw     and not prevLondonRaw
+bool londonCloseRaw = not inLondonRaw and prevLondonRaw
+bool rthOpenRaw     = inRthRaw        and not prevRthRaw
+bool rthCloseRaw    = not inRthRaw    and prevRthRaw
+
+// ---- PUBLIC session booleans ------------------------------------------------
+bool inAsia       = asiaEnabled   and inAsiaRaw
+bool inLondon     = londonEnabled and inLondonRaw
+bool inAnySession = inAsia or inLondon
+
+// Signal-eligible Asia: optionally drops the 00:00-02:00 ET tail. The RANGE is
+// unaffected -- it is always built from the full asiaSession window.
+bool inAsiaSignal = inAsia and not (asiaExcludeLate and inAsiaLate)
+
+// "Just closed" fires on the FIRST CONFIRMED bar after the session ends. The
+// barstate.isconfirmed gate is what stops a live bar from finalising a range.
+bool asiaJustClosed   = barstate.isconfirmed and asiaCloseRaw   and asiaEnabled
+bool londonJustClosed = barstate.isconfirmed and londonCloseRaw and londonEnabled
+
+// Raw variants, so range finalisation still happens when a session is hidden.
+bool asiaJustClosedRaw   = barstate.isconfirmed and asiaCloseRaw
+bool londonJustClosedRaw = barstate.isconfirmed and londonCloseRaw
+bool rthJustClosedRaw    = barstate.isconfirmed and rthCloseRaw
+
+// ---- Trading-day attribution ------------------------------------------------
+// Increments at the ASIA SESSION ANCHOR, never at calendar midnight. So the
+// Asia session that opens Sunday 20:00 ET carries Monday's trading day.
+var int tradingDay = 0
+if barstate.isconfirmed and asiaOpenRaw
+    tradingDay += 1
+
+// Human-readable trading date: shift evening bars forward one calendar day so
+// the label matches the CME 18:00 ET reset.
+int    etHour        = hour(time, TZ)
+int    tdStamp       = etHour >= TRADING_DAY_ROLL_HOUR ? time + 86400000 : time
+string tradingDateStr = str.format_time(tdStamp, "yyyy-MM-dd", TZ)
+
+// ---- Bars into each session --------------------------------------------------
+// Reset to 1 on the session's opening bar, counted on confirmed bars only.
+var int asiaBars   = 0
+var int londonBars = 0
+if barstate.isconfirmed
+    asiaBars   := inAsiaRaw   ? (asiaOpenRaw   ? 1 : asiaBars   + 1) : 0
+    londonBars := inLondonRaw ? (londonOpenRaw ? 1 : londonBars + 1) : 0
+
+// ---- Optional background shading ---------------------------------------------
+// Distinct and deliberately faint: Asia = indigo, London = amber.
+bgcolor(showSessionShading and inAsia   ? color.new(color.blue,   93) : na, title = "Asia shading")
+bgcolor(showSessionShading and inLondon ? color.new(color.orange, 93) : na, title = "London shading")
+
+// =============================================================================
+// SECTION B (part 2): SESSION RANGE CONTEXT
+// Live range per session, completed ranges pushed into a 20-slot ring buffer,
+// median read back from the buffer. Stage 5/6 use the median for exhaustion
+// suppression ("this session has already travelled more than it usually does").
+// =============================================================================
+
+// Live Asia range -- ALWAYS the full asiaSession window, even when the late
+// tail is muted for signals.
+var float asiaCurHigh = na
+var float asiaCurLow  = na
+// Live London range.
+var float lonCurHigh = na
+var float lonCurLow  = na
+
+if barstate.isconfirmed
+    if inAsiaRaw
+        asiaCurHigh := asiaOpenRaw ? high : math.max(nz(asiaCurHigh, high), high)
+        asiaCurLow  := asiaOpenRaw ? low  : math.min(nz(asiaCurLow,  low),  low)
+    if inLondonRaw
+        lonCurHigh := londonOpenRaw ? high : math.max(nz(lonCurHigh, high), high)
+        lonCurLow  := londonOpenRaw ? low  : math.min(nz(lonCurLow,  low),  low)
+
+// Finalised Asia range, carried forward. Set when Asia closes, then held
+// through London and beyond until the NEXT Asia session closes over it.
+var float asiaRangeHigh = na
+var float asiaRangeLow  = na
+
+// Ring buffers of completed session ranges (max MEDIAN_LOOKBACK entries).
+var array<float> asiaRangeHist   = array.new<float>()
+var array<float> londonRangeHist = array.new<float>()
+
+// Push a value, evicting the oldest once the buffer is full.
+f_pushRing(array<float> a, float v) =>
+    array.push(a, v)
+    while array.size(a) > MEDIAN_LOOKBACK
+        array.shift(a)
+
+if asiaJustClosedRaw and not na(asiaCurHigh) and not na(asiaCurLow)
+    asiaRangeHigh := asiaCurHigh
+    asiaRangeLow  := asiaCurLow
+    f_pushRing(asiaRangeHist, asiaCurHigh - asiaCurLow)
+
+if londonJustClosedRaw and not na(lonCurHigh) and not na(lonCurLow)
+    f_pushRing(londonRangeHist, lonCurHigh - lonCurLow)
+
+// Medians over the last <=20 COMPLETED ranges. na until one has completed.
+float asiaMedRange   = array.size(asiaRangeHist)   > 0 ? array.median(asiaRangeHist)   : na
+float londonMedRange = array.size(londonRangeHist) > 0 ? array.median(londonRangeHist) : na
+
+// Range of whichever session is live right now (na when flat).
+float curSessRange = inAsiaRaw and not na(asiaCurHigh) ? asiaCurHigh - asiaCurLow :
+                     inLondonRaw and not na(lonCurHigh) ? lonCurHigh - lonCurLow : na
+float curSessMed = inAsiaRaw ? asiaMedRange : inLondonRaw ? londonMedRange : na
+
+// =============================================================================
+// SECTION C (part 2): HIGHER-TIMEFRAME LEVELS (PDH/PDL, PWH/PWL)
+// =============================================================================
+
+// PRIOR DAY, full session.
+// WHY THE [1]: high[1]/low[1] inside the request is the daily bar that has
+// ALREADY CLOSED, so the value can never change under us mid-day.
+// WHY lookahead_off: without it TradingView would hand historical bars the
+// completed daily value early, which is the classic backtest-flattering
+// repaint. Both together are what make this safe.
+[pdhFull, pdlFull] = request.security(syminfo.tickerid, "D", [high[1], low[1]],
+     lookahead = barmerge.lookahead_off) // [1] -> last CLOSED daily bar; lookahead_off -> no future leak
+
+// PRIOR WEEK. Same contract: [1] = last CLOSED weekly bar, lookahead_off = no
+// future leakage. Without the [1] this would return the still-forming week.
+[pwhRaw, pwlRaw] = request.security(syminfo.tickerid, "W", [high[1], low[1]],
+     lookahead = barmerge.lookahead_off) // [1] -> last CLOSED weekly bar; lookahead_off -> no future leak
+
+// PRIOR DAY, RTH only. Built natively from intraday bars -- no security call at
+// all -- because a daily futures bar cannot express 09:30-16:00.
+var float rthCurHigh = na
+var float rthCurLow  = na
+var float pdhRth     = na
+var float pdlRth     = na
+
+if barstate.isconfirmed
+    if inRthRaw
+        rthCurHigh := rthOpenRaw ? high : math.max(nz(rthCurHigh, high), high)
+        rthCurLow  := rthOpenRaw ? low  : math.min(nz(rthCurLow,  low),  low)
+    if rthJustClosedRaw and not na(rthCurHigh) and not na(rthCurLow)
+        pdhRth := rthCurHigh
+        pdlRth := rthCurLow
+
+// Resolve which pair the rest of the script (and stages 2-6) treat as PDH/PDL.
+float pdh = pdhlSource == "Full session" ? pdhFull : pdhRth
+float pdl = pdhlSource == "Full session" ? pdlFull : pdlRth
+float pwh = pwhRaw
+float pwl = pwlRaw
+
+// =============================================================================
+// SECTION D: SWING PIVOTS (ANTI-REPAINT)
+// =============================================================================
+
+// ta.pivothigh/low return a value only once pivotLen bars have printed to the
+// RIGHT of the candidate.
+// CONFIRMATION LAG IS EXACTLY pivotLen BARS: on the bar where `ph` is non-na,
+// the pivot itself lives at bar_index - pivotLen. Nothing downstream is ever
+// allowed to see a pivot before that bar. This lag is not a defect to be
+// offset away -- it is the guarantee that the level was real.
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low,  pivotLen, pivotLen)
+
+// Most recent CONFIRMED swings (price + TRUE bar index of the pivot).
+var float lastConfirmedSwingHigh = na
+var float lastConfirmedSwingLow  = na
+var int   lastSwingHighBar       = na
+var int   lastSwingLowBar        = na
+
+// Short history of the last SWING_KEEP confirmed swings on each side.
+var array<float> swingHighPrices = array.new<float>()
+var array<int>   swingHighBars   = array.new<int>()
+var array<float> swingLowPrices  = array.new<float>()
+var array<int>   swingLowBars    = array.new<int>()
+
+f_pushSwing(array<float> pxArr, array<int> ixArr, float px, int ix) =>
+    array.push(pxArr, px)
+    array.push(ixArr, ix)
+    while array.size(pxArr) > SWING_KEEP
+        array.shift(pxArr)
+        array.shift(ixArr)
+
+// =============================================================================
+// SECTION C (part 3): POOL POPULATION
+// Every write below sits inside the confirmed-bar gate.
+// =============================================================================
+
+if barstate.isconfirmed
+    // ---- 1. ASIA RANGE HIGH / LOW -------------------------------------------
+    // Finalised on Asia close, then carried forward through London and beyond.
+    // Replaced only when the NEXT Asia session closes.
+    if asiaJustClosedRaw and not na(asiaRangeHigh) and not na(asiaRangeLow)
+        removePoolsByTag("Asia High")
+        removePoolsByTag("Asia Low")
+        f_addPool(asiaRangeHigh, "Asia High", true,  showAsiaRange)
+        f_addPool(asiaRangeLow,  "Asia Low",  false, showAsiaRange)
+
+    // ---- 2. PRIOR DAY HIGH / LOW --------------------------------------------
+    // Re-stated only when the value actually changes, i.e. a new day completed.
+    if not na(pdh) and (na(pdh[1]) or pdh != pdh[1])
+        removePoolsByTag("PDH")
+        f_addPool(pdh, "PDH", true, showPDHL)
+    if not na(pdl) and (na(pdl[1]) or pdl != pdl[1])
+        removePoolsByTag("PDL")
+        f_addPool(pdl, "PDL", false, showPDHL)
+
+    // ---- 3. PRIOR WEEK HIGH / LOW -------------------------------------------
+    if not na(pwh) and (na(pwh[1]) or pwh != pwh[1])
+        removePoolsByTag("PWH")
+        f_addPool(pwh, "PWH", true, showPWHL)
+    if not na(pwl) and (na(pwl[1]) or pwl != pwl[1])
+        removePoolsByTag("PWL")
+        f_addPool(pwl, "PWL", false, showPWHL)
+
+    // ---- 4 + 5. CONFIRMED SWINGS, THEN EQUAL HIGHS / LOWS --------------------
+    float tol = f_equalTol()
+
+    if not na(ph)
+        int   pbar = bar_index - pivotLen    // TRUE bar of the pivot
+        float ppx  = ph
+
+        // Cluster test runs BEFORE this pivot joins the history: how many
+        // earlier confirmed swing highs sit within tolerance of it?
+        int   eqCount   = 0
+        float eqExtreme = ppx
+        if array.size(swingHighPrices) > 0
+            for i = 0 to array.size(swingHighPrices) - 1
+                float q = array.get(swingHighPrices, i)
+                if math.abs(q - ppx) <= tol
+                    eqCount   += 1
+                    eqExtreme := math.max(eqExtreme, q)   // extreme of the cluster
+
+        // Register the swing itself. Stored as a pool but NOT drawn, so later
+        // stages can query it without the chart turning into spaghetti.
+        lastConfirmedSwingHigh := ppx
+        lastSwingHighBar       := pbar
+        f_pushSwing(swingHighPrices, swingHighBars, ppx, pbar)
+        f_addPool(ppx, "Swing High", true, false)
+        f_trimTag("Swing High", SWING_KEEP)
+
+        // Two or more pivots inside tolerance => ONE EQH pool at the extreme.
+        // If an EQH pool already covers this cluster, move it rather than add.
+        Pool eqhHit = findActivePoolNear("EQH", eqExtreme, tol)
+        if eqCount >= 1 and na(eqhHit)
+            f_addPool(eqExtreme, "EQH", true, showEqualLevels)
+        if eqCount >= 1 and not na(eqhHit)
+            setPoolPrice(eqhHit, math.max(eqhHit.price, eqExtreme))
+
+    if not na(pl)
+        int   pbarL = bar_index - pivotLen   // TRUE bar of the pivot
+        float ppxL  = pl
+
+        int   eqCountL   = 0
+        float eqExtremeL = ppxL
+        if array.size(swingLowPrices) > 0
+            for j = 0 to array.size(swingLowPrices) - 1
+                float qL = array.get(swingLowPrices, j)
+                if math.abs(qL - ppxL) <= tol
+                    eqCountL   += 1
+                    eqExtremeL := math.min(eqExtremeL, qL)   // extreme of the cluster
+
+        lastConfirmedSwingLow := ppxL
+        lastSwingLowBar       := pbarL
+        f_pushSwing(swingLowPrices, swingLowBars, ppxL, pbarL)
+        f_addPool(ppxL, "Swing Low", false, false)
+        f_trimTag("Swing Low", SWING_KEEP)
+
+        Pool eqlHit = findActivePoolNear("EQL", eqExtremeL, tol)
+        if eqCountL >= 1 and na(eqlHit)
+            f_addPool(eqExtremeL, "EQL", false, showEqualLevels)
+        if eqCountL >= 1 and not na(eqlHit)
+            setPoolPrice(eqlHit, math.min(eqlHit.price, eqExtremeL))
+
+// ---- Keep pool labels pinned near the right edge ----------------------------
+// Only on the last bar, so historical bars do no drawing work at all.
+if barstate.islast and array.size(pools) > 0
+    for i = 0 to array.size(pools) - 1
+        Pool p = array.get(pools, i)
+        if p.active and not na(p.lb)
+            label.set_x(p.lb, bar_index + 3)
+
+// ---- Confirmed swing markers -------------------------------------------------
+// Drawn back at the TRUE pivot bar via offset, but they only APPEAR pivotLen
+// bars later. That visible delay is the anti-repaint behaviour, on purpose.
+plotshape(showSwingMarkers and not na(ph), title = "Confirmed swing high",
+     style = shape.triangledown, location = location.abovebar, offset = -pivotLen,
+     color = color.new(colBuySide, 20), size = size.tiny)
+plotshape(showSwingMarkers and not na(pl), title = "Confirmed swing low",
+     style = shape.triangleup, location = location.belowbar, offset = -pivotLen,
+     color = color.new(colSellSide, 20), size = size.tiny)
+
+// =============================================================================
+// SECTION E: DEBUG TABLE
+// The stage-1 verification surface. Everything here is read from confirmed
+// state, so if a number looks wrong the state is wrong, not the display.
+// =============================================================================
+
+f_px(float v) =>
+    string s = na(v) ? "pending" : str.tostring(v, format.mintick)
+    s
+
+f_num(float v) =>
+    string s = na(v) ? "n/a" : str.tostring(v, "#.##")
+    s
+
+// "price @ bar N" for a confirmed swing, or "pending".
+f_swingStr(float px, int bidx) =>
+    string s = "pending"
+    if not na(px)
+        s := str.tostring(px, format.mintick) + " @ " + str.tostring(bidx)
+    s
+
+// "price (tag)" for a pool, or "none".
+f_poolStr(Pool p) =>
+    string s = "none"
+    if not na(p)
+        s := str.tostring(p.price, format.mintick) + " (" + p.tag + ")"
+    s
+
+var table dbg = na
+
+if barstate.islast and showDebugTable
+    if na(dbg)
+        dbg := table.new(position.top_right, 2, 18,
+             border_width = 1, border_color = color.new(color.gray, 60),
+             frame_width  = 1, frame_color  = color.new(color.gray, 40))
+
+    color hdrBg  = color.new(color.blue, 80)
+    color cellBg = color.new(color.black, 80)
+    color txt    = color.new(color.white, 0)
+
+    string sessName = not inAnySession ? "NONE" :
+                      inAsia ? (inAsiaSignal ? "ASIA" : "ASIA (late, muted)") : "LONDON"
+    int    sessBars = inAsiaRaw ? asiaBars : inLondonRaw ? londonBars : 0
+    string closedStr = asiaJustClosed ? "ASIA closed" : londonJustClosed ? "LONDON closed" : "-"
+
+    Pool nBuy  = nearestBuySideAbove(close)
+    Pool nSell = nearestSellSideBelow(close)
+
+    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 1", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 1, str.tostring(tradingDay) + "  " + tradingDateStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 2, "Session", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 2, sessName, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 3, "Bars into", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 3, str.tostring(sessBars), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 4, "Just closed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 4, closedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 5, "Sess range", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 5, f_num(curSessRange), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 6, "Median 20", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 6, f_num(curSessMed) + "  (A " + f_num(asiaMedRange) + " / L " + f_num(londonMedRange) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 7, "ATR " + str.tostring(atrLen), bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 7, f_num(atr), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 8, "Asia High", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 8, f_px(asiaRangeHigh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 9, "Asia Low", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 9, f_px(asiaRangeLow), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 10, "PDH", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 10, f_px(pdh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 11, "PDL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 11, f_px(pdl), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 12, "PWH", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 12, f_px(pwh), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 13, "PWL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 13, f_px(pwl), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 14, "Pools act/all", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 14, str.tostring(activePoolCount()) + " / " + str.tostring(array.size(pools)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 15, "Last swing H", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 15, f_swingStr(lastConfirmedSwingHigh, lastSwingHighBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 16, "Last swing L", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 16, f_swingStr(lastConfirmedSwingLow, lastSwingLowBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 17, "Nearest pool", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 17, "up " + f_poolStr(nBuy) + " | dn " + f_poolStr(nSell), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+// Remove the table if the user switches it off mid-session.
+if barstate.islast and not showDebugTable and not na(dbg)
+    table.delete(dbg)
+    dbg := na
+
+// =============================================================================
+// SECTION F: STAGE STUBS
+// Nothing below this line is implemented yet. The order is fixed; each stage
+// fills in its own block and touches nothing else.
+// =============================================================================
+
+// ===== STAGE 2: DISPLACEMENT / SWEEP DETECTION =====
+// Will consume: nearestBuySideAbove() / nearestSellSideBelow(), the Pool.active
+// flag, atr, asiaMedRange / londonMedRange, and the confirmed swing arrays.
+
+// ===== STAGE 3: FVG / IFVG / ORDER BLOCKS / OTE =====
+
+// ===== STAGE 4: SMT DIVERGENCE (MNQ vs ES) =====
+
+// ===== STAGE 5: CONFLUENCE SCORING =====
+
+// ===== STAGE 6: ENTRY TRIGGER, GUARD RAILS, ALERTS =====
