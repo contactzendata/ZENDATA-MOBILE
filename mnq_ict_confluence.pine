@@ -225,6 +225,9 @@ smtRequireAtPool = input.bool(true, "Only count divergence at a liquidity pool",
      tooltip = "Divergence in open space is noise. At a mapped pool it is a statement about who is defending that level.")
 smtPoolProxTicks = input.float(12.0, "Pool proximity (ticks)", minval = 0.0, step = 0.25, group = grpSmt,
      tooltip = "MNQ tick = 0.25 pts, so 12 ticks = 3.0 pts.")
+smtMinTier = input.string("Protected + Equal", "Pool significance for the SMT gate", group = grpSmt,
+     options = ["Protected only", "Protected + Equal", "All including swings"],
+     tooltip = "MUST NOT be set to 'All including swings'. Stage 1 registers every confirmed pivot as a TIER_TRANSIENT pool at exactly that pivot's price, on the same confirmed bar the SMT test then runs. Including tier 2 therefore matches the pivot against a pool derived from itself at a distance of exactly zero, and the gate can never fail. Kept as a SEPARATE input from sweepMinTier so opening sweeps to swings cannot silently re-break this.")
 
 // ---- Group: Scoring ----------------------------------------------------------
 grpScore = "Scoring"
@@ -2420,6 +2423,7 @@ var int   smtCount        = 0
 var int   smtCandidates       = 0
 var float smtLastDistAny      = na   // ticks to nearest pool of ANY tier
 var float smtLastDistSig      = na   // ticks to nearest pool of tier <= 1
+var float smtLastDistProt     = na   // ticks to nearest PROTECTED pool (tier 0)
 
 // Per-bar marker price, reset every bar.
 float smtMarkPx = na
@@ -2467,9 +2471,18 @@ f_refRange(int lb) =>
 // Deliberately does NOT require pool.active. The highest-value SMT is the one
 // that prints exactly as a level is swept, and by that bar stage 2 has already
 // marked the pool consumed. Requiring active would filter out the best cases.
+// Resolve the SMT significance filter. Deliberately its own input rather than a
+// reuse of sweepMaxTier: the two answer different questions and one must not
+// move when the other does.
+int smtMaxTier = switch smtMinTier
+    "Protected only"    => TIER_PROTECTED
+    "Protected + Equal" => TIER_SIGNIFICANT
+    => TIER_TRANSIENT
+
 // Distance in TICKS from `price` to the nearest same-side pool at or below
-// `maxTier`. Diagnostic only. Reading this at two tier bands is what exposes
-// whether the gate is matching a meaningful level or something trivial.
+// `maxTier`. Diagnostic only. Read at THREE tier bands side by side, this is
+// what distinguishes a gate matching a meaningful level from one matching
+// something trivially co-located with the pivot being tested.
 f_nearestPoolDistTicks(float price, bool buySide, int maxTier) =>
     float best = na
     if array.size(pools) > 0
@@ -2484,12 +2497,28 @@ f_nearestPoolDistTicks(float price, bool buySide, int maxTier) =>
         t := best / syminfo.mintick
     t
 
-f_anyPoolNear(float price, float tol, bool buySide) =>
+// --- is this extreme sitting on a SIGNIFICANT mapped pool? -------------------
+// The maxTier argument is not decoration, it IS the gate.
+// WHY: stage 1's pool population runs earlier in the same confirmed bar and
+// registers every newly confirmed pivot as a TIER_TRANSIENT pool at exactly
+// that pivot's price. Without a tier filter this function was handed the pivot
+// and found the pool made from that same pivot, distance 0.0, so `atPool` was
+// structurally always true and smtRequireAtPool gated nothing at all. Excluding
+// tier 2 removes the self-reference by construction, with no bar-index
+// bookkeeping to rot. It is also the right rule on its own terms: "divergence
+// at a liquidity pool" has to mean a level that matters, and "this pivot high
+// is near a swing high" is true of every pivot by definition.
+//
+// Still deliberately does NOT require pool.active. The highest-value SMT is the
+// one that prints exactly as a level is swept, and by that bar stage 2 has
+// already marked the pool consumed. Requiring active would filter out the best
+// cases, and it was never the source of the fault.
+f_anyPoolNear(float price, float tol, bool buySide, int maxTier) =>
     bool r = false
     if array.size(pools) > 0
         for i = 0 to array.size(pools) - 1
             Pool p = array.get(pools, i)
-            if not r and p.buySide == buySide and math.abs(p.price - price) <= tol
+            if not r and p.buySide == buySide and p.tier <= maxTier and math.abs(p.price - price) <= tol
                 r := true
     r
 
@@ -2515,9 +2544,10 @@ if barstate.isconfirmed and smtEnabled
             // Both must be real numbers. A missing reference is "no opinion".
             if not na(refCur) and not na(refPrev) and refCur <= refPrev
                 smtCandidates += 1
-                smtLastDistAny := f_nearestPoolDistTicks(mnqCur, true, TIER_TRANSIENT)
-                smtLastDistSig := f_nearestPoolDistTicks(mnqCur, true, TIER_SIGNIFICANT)
-                bool atPool = f_anyPoolNear(mnqCur, poolTol, true)
+                smtLastDistAny  := f_nearestPoolDistTicks(mnqCur, true, TIER_TRANSIENT)
+                smtLastDistSig  := f_nearestPoolDistTicks(mnqCur, true, TIER_SIGNIFICANT)
+                smtLastDistProt := f_nearestPoolDistTicks(mnqCur, true, TIER_PROTECTED)
+                bool atPool = f_anyPoolNear(mnqCur, poolTol, true, smtMaxTier)
                 if atPool or not smtRequireAtPool
                     float rr   = f_refRange(smtLookbackBars)
                     float frac = na(rr) or rr <= 0 ? 0.0 : math.min((refPrev - refCur) / rr, 1.0)
@@ -2548,9 +2578,10 @@ if barstate.isconfirmed and smtEnabled
             float refPrevL = f_refLowAround(bar_index - prevBarL, pivotLen)
             if not na(refCurL) and not na(refPrevL) and refCurL >= refPrevL
                 smtCandidates += 1
-                smtLastDistAny := f_nearestPoolDistTicks(mnqCurL, false, TIER_TRANSIENT)
-                smtLastDistSig := f_nearestPoolDistTicks(mnqCurL, false, TIER_SIGNIFICANT)
-                bool atPoolL = f_anyPoolNear(mnqCurL, poolTol, false)
+                smtLastDistAny  := f_nearestPoolDistTicks(mnqCurL, false, TIER_TRANSIENT)
+                smtLastDistSig  := f_nearestPoolDistTicks(mnqCurL, false, TIER_SIGNIFICANT)
+                smtLastDistProt := f_nearestPoolDistTicks(mnqCurL, false, TIER_PROTECTED)
+                bool atPoolL = f_anyPoolNear(mnqCurL, poolTol, false, smtMaxTier)
                 if atPoolL or not smtRequireAtPool
                     float rrL   = f_refRange(smtLookbackBars)
                     float fracL = na(rrL) or rrL <= 0 ? 0.0 : math.min((refCurL - refPrevL) / rrL, 1.0)
@@ -3541,7 +3572,7 @@ if barstate.islast and showDebugTable
         // Temporary, for the SMT pool-gate investigation.
         table.cell(dbg, 0, 8, "SMT cand|pass, dist", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 8, str.tostring(smtCandidates) + " | " + str.tostring(smtCount) +
-                 "   any " + f_num(smtLastDistAny) + "t / T0-1 " + f_num(smtLastDistSig) + "t", bgcolor = kBg, text_color = kTx, text_size = size.small)
+                 "   d " + f_num(smtLastDistAny) + " / " + f_num(smtLastDistSig) + " / " + f_num(smtLastDistProt) + "t", bgcolor = kBg, text_color = kTx, text_size = size.small)
 
     if not compactTable
         color hdrBg  = color.new(color.blue, 80)
@@ -3839,7 +3870,7 @@ if barstate.islast and showDebugTable
 
         // ---- TEMPORARY INVESTIGATION ROWS ----------------------------------------
         table.cell(dbg, 0, 54, "SMT pool dist", bgcolor = cellBg, text_color = txt, text_size = size.small)
-        table.cell(dbg, 1, 54, "any " + f_num(smtLastDistAny) + "t  |  T0/1 " + f_num(smtLastDistSig) + "t", bgcolor = cellBg, text_color = txt, text_size = size.small)
+        table.cell(dbg, 1, 54, "any " + f_num(smtLastDistAny) + "  |  T0-1 " + f_num(smtLastDistSig) + "  |  T0 " + f_num(smtLastDistProt) + "  ticks", bgcolor = cellBg, text_color = txt, text_size = size.small)
 
         table.cell(dbg, 0, 55, "Armed w/ DR", bgcolor = cellBg, text_color = txt, text_size = size.small)
         table.cell(dbg, 1, 55, str.tostring(armedWithDR) + " / " + str.tostring(armedSetups) + f_pctStr(armedWithDR, armedSetups), bgcolor = cellBg, text_color = txt, text_size = size.small)
