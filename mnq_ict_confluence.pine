@@ -31,6 +31,9 @@
 //      that has already CLOSED.
 //   4. Swing pivots are registered pivotLen bars late, by construction. The lag
 //      is real and is never papered over.
+//   6. Pools carry a TIER. The drawing-object cap evicts transient pools first
+//      and never evicts a protected one, so the day/week/session levels cannot
+//      be pushed out of the book by a burst of swings.
 //   5. All clock logic uses the "America/New_York" string, so US DST shifts are
 //      handled by TradingView. No hardcoded UTC offsets anywhere.
 // =============================================================================
@@ -86,7 +89,9 @@ pdhlSource = input.string("RTH 09:30-16:00", "Prior day high/low source", group 
      tooltip = "RTH builds the level natively from intraday bars. Full session reads the prior CLOSED daily bar.")
 
 maxPools = input.int(40, "Max pools kept (drawings capped)", minval = 5, maxval = 200, group = grpPools,
-     tooltip = "Hard cap on stored pools and their line/label objects. Oldest is dropped first.")
+     tooltip = "Hard cap on stored pools and their line/label objects. Transient (swing) pools are evicted first; protected levels never are.")
+maxEqualPools = input.int(8, "Max EQH / EQL pools (each side)", minval = 1, maxval = 50, group = grpPools,
+     tooltip = "Per-tag cap on equal-high and equal-low clusters. Without this the EQ pools grow without bound and saturate the book.")
 
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
@@ -117,6 +122,14 @@ int SWING_KEEP = 10
 // belongs to the NEXT calendar trading day. This is what makes a Sunday 20:00
 // ET Asia open belong to Monday.
 int TRADING_DAY_ROLL_HOUR = 18
+
+// Pool TIERS. Lower number = more significant = harder to evict.
+//   0 protected   : session / day / week levels. Never evicted by the cap.
+//   1 significant : equal highs and lows (clustered, so deliberate).
+//   2 transient   : individual swing pivots. First to go under pressure.
+int TIER_PROTECTED   = 0
+int TIER_SIGNIFICANT = 1
+int TIER_TRANSIENT   = 2
 
 // Pool colours: buy-side liquidity sits ABOVE price (red), sell-side BELOW (teal).
 color colBuySide  = #ef5350
@@ -152,6 +165,8 @@ f_equalTol() =>
 //           false = sell-side liquidity (below price: stops of longs)
 // barIdx  : bar_index at which the pool was CONFIRMED. For swings this is
 //           pivotLen bars AFTER the pivot itself -- that is intentional.
+// tier    : 0 protected / 1 significant / 2 transient. Drives eviction order
+//           under the global cap AND how stage 2 filters sweep targets.
 // active  : true until a later stage marks it consumed/swept
 // ln / lb : its drawing objects, carried on the object so cleanup is trivial
 type Pool
@@ -159,6 +174,7 @@ type Pool
     string tag
     bool   buySide
     int    barIdx
+    int    tier
     bool   active
     line   ln = na
     label  lb = na
@@ -175,10 +191,31 @@ f_deletePoolAt(int idx) =>
         label.delete(p.lb)
     array.remove(pools, idx)
 
-// --- internal: enforce the global object cap, oldest first ------------------
+// --- internal: index of the OLDEST pool in tier `t`, or -1 -------------------
+// Pools are appended in time order, so the first match found IS the oldest.
+f_findOldestOfTier(int t) =>
+    int idx = -1
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            if idx < 0 and array.get(pools, i).tier == t
+                idx := i
+    idx
+
+// --- internal: enforce the global object cap, LEAST significant first --------
+// Evicts the oldest transient pool; only if none remain, the oldest significant
+// one; and never a protected one. If the book is somehow all protected we stop
+// rather than evict -- protected pools are singletons and self-limiting, so the
+// book cannot actually run away on them.
 f_enforcePoolCap() =>
-    while array.size(pools) > maxPools
-        f_deletePoolAt(0)
+    bool stop = false
+    while array.size(pools) > maxPools and not stop
+        int victim = f_findOldestOfTier(TIER_TRANSIENT)
+        if victim < 0
+            victim := f_findOldestOfTier(TIER_SIGNIFICANT)
+        if victim < 0
+            stop := true
+        if victim >= 0
+            f_deletePoolAt(victim)
 
 // --- internal: keep at most keepN pools carrying `tag`, dropping oldest -----
 // Stops a stream of fresh swing pools from evicting the day/week levels.
@@ -205,10 +242,25 @@ removePoolsByTag(string tag) =>
             if array.get(pools, i).tag == tag
                 f_deletePoolAt(i)
 
-// --- internal: the full add, with an explicit "should this be drawn" flag ---
-f_addPool(float price, string tag, bool buySide, bool draw) =>
+// --- internal: map a known tag to its tier ----------------------------------
+// One source of truth, so the public addPool() cannot mis-tier a level.
+f_tierForTag(string tag) =>
+    int t = switch tag
+        "Asia High" => TIER_PROTECTED
+        "Asia Low"  => TIER_PROTECTED
+        "PDH"       => TIER_PROTECTED
+        "PDL"       => TIER_PROTECTED
+        "PWH"       => TIER_PROTECTED
+        "PWL"       => TIER_PROTECTED
+        "EQH"       => TIER_SIGNIFICANT
+        "EQL"       => TIER_SIGNIFICANT
+        => TIER_TRANSIENT
+    t
+
+// --- internal: the full add, with explicit tier and "should this be drawn" --
+f_addPool(float price, string tag, bool buySide, int tier, bool draw) =>
     Pool p = Pool.new(price = price, tag = tag, buySide = buySide,
-                     barIdx = bar_index, active = true)
+                     barIdx = bar_index, tier = tier, active = true)
     if draw
         color c = buySide ? colBuySide : colSellSide
         p.ln := line.new(bar_index, price, bar_index + 1, price,
@@ -223,9 +275,10 @@ f_addPool(float price, string tag, bool buySide, bool draw) =>
     p
 
 // --- PUBLIC: addPool(price, label, side) ------------------------------------
-// The stage-2+ entry point. Adds a drawn pool and returns it.
+// The stage-2+ entry point. Adds a drawn pool and returns it. The tier is
+// derived from the tag, so callers cannot forget to set it.
 addPool(float price, string tag, bool buySide) =>
-    f_addPool(price, tag, buySide, true)
+    f_addPool(price, tag, buySide, f_tierForTag(tag), true)
 
 // --- PUBLIC: move an existing pool's price (and its drawings) ---------------
 setPoolPrice(Pool p, float price) =>
@@ -236,32 +289,58 @@ setPoolPrice(Pool p, float price) =>
     if not na(p.lb)
         label.set_y(p.lb, price)
 
-// --- PUBLIC: nearest ACTIVE buy-side pool strictly ABOVE px -----------------
-// Returns na when nothing qualifies. Stage 2 uses this to pick sweep targets.
-nearestBuySideAbove(float px) =>
+// --- PUBLIC: nearest ACTIVE buy-side pool ABOVE px, tier-filtered -----------
+// maxTier = 0 -> protected levels only (Asia/PD/PW)
+// maxTier = 1 -> also equal highs
+// maxTier = 2 -> also individual swing highs
+// Stage 2 should sweep against a TIGHT tier, so a 20-minute-old swing high is
+// not treated as equal in weight to the Asia session high.
+nearestBuySideAboveTier(float px, int maxTier) =>
     Pool best = na
     if array.size(pools) > 0
         for i = 0 to array.size(pools) - 1
             Pool p = array.get(pools, i)
-            if p.active and p.buySide and p.price > px
+            if p.active and p.buySide and p.tier <= maxTier and p.price > px
                 if na(best)
                     best := p
                 else if p.price < best.price
                     best := p
     best
 
-// --- PUBLIC: nearest ACTIVE sell-side pool strictly BELOW px ----------------
-nearestSellSideBelow(float px) =>
+// --- PUBLIC: nearest ACTIVE sell-side pool BELOW px, tier-filtered ----------
+nearestSellSideBelowTier(float px, int maxTier) =>
     Pool best = na
     if array.size(pools) > 0
         for i = 0 to array.size(pools) - 1
             Pool p = array.get(pools, i)
-            if p.active and not p.buySide and p.price < px
+            if p.active and not p.buySide and p.tier <= maxTier and p.price < px
                 if na(best)
                     best := p
                 else if p.price > best.price
                     best := p
     best
+
+// --- PUBLIC: nearest ACTIVE buy-side pool strictly ABOVE px -----------------
+// Unfiltered form, kept so existing callers are unaffected. Pine forbids
+// default arguments on user functions, so this delegates instead.
+nearestBuySideAbove(float px) =>
+    nearestBuySideAboveTier(px, TIER_TRANSIENT)
+
+// --- PUBLIC: nearest ACTIVE sell-side pool strictly BELOW px ----------------
+nearestSellSideBelow(float px) =>
+    nearestSellSideBelowTier(px, TIER_TRANSIENT)
+
+// --- PUBLIC: significance weight for a tier ---------------------------------
+// STAGE 5 will multiply the sweep component's score contribution by this, so
+// taking out the Asia high counts fully while running a single swing pivot
+// contributes only a fraction. NOT USED YET -- declared here so the scale is
+// fixed in one place before scoring is written.
+poolWeight(int tier) =>
+    float w = switch tier
+        0 => 1.0
+        1 => 0.6
+        => 0.3
+    w
 
 // --- PUBLIC: first ACTIVE pool with `tag` within `tol` of price, else na ----
 findActivePoolNear(string tag, float price, float tol) =>
@@ -273,6 +352,16 @@ findActivePoolNear(string tag, float price, float tol) =>
                 if na(hit)
                     hit := p
     hit
+
+// --- PUBLIC: how many pools sit in tier `t` (active or not) -----------------
+// Used by the debug table so eviction pressure is visible before it bites.
+f_tierCount(int t) =>
+    int n = 0
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            if array.get(pools, i).tier == t
+                n += 1
+    n
 
 // --- PUBLIC: how many pools are still active --------------------------------
 activePoolCount() =>
@@ -344,10 +433,16 @@ var int tradingDay = 0
 if barstate.isconfirmed and asiaOpenRaw
     tradingDay += 1
 
-// Human-readable trading date: shift evening bars forward one calendar day so
-// the label matches the CME 18:00 ET reset.
-int    etHour        = hour(time, TZ)
-int    tdStamp       = etHour >= TRADING_DAY_ROLL_HOUR ? time + 86400000 : time
+// Human-readable trading date: evening bars are labelled with the NEXT calendar
+// day so the label matches the CME 18:00 ET reset.
+// DST-SAFE: we do NOT add 86400000ms to the bar time. On the two US DST
+// transition days the local day is 23 or 25 hours long, so a fixed 24h add
+// lands on the wrong calendar date. Instead we anchor to LOCAL NOON of the
+// bar's own ET date and step from there -- noon +/- 1h is still the same day,
+// so the +24h step always crosses exactly one date boundary.
+int etHour = hour(time, TZ)
+int etNoon = timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 12, 0, 0)
+int tdStamp = etHour >= TRADING_DAY_ROLL_HOUR ? etNoon + 86400000 : etNoon
 string tradingDateStr = str.format_time(tdStamp, "yyyy-MM-dd", TZ)
 
 // ---- Bars into each session --------------------------------------------------
@@ -457,6 +552,16 @@ float pdl = pdhlSource == "Full session" ? pdlFull : pdlRth
 float pwh = pwhRaw
 float pwl = pwlRaw
 
+// Period keys used to decide WHEN to restate these levels as pools.
+// A value-equality test ("has the number changed?") silently fails when two
+// consecutive periods share an identical high or low to the tick -- the pool
+// would then never be restated for the new period. Keying off the PERIOD
+// instead makes restatement unconditional and exact.
+// PDH/PDL flip at the trading-day anchor (Asia open), which is precisely when
+// yesterday's high stops being "today's prior day high".
+int dayKey  = tradingDay
+int weekKey = year(time, TZ) * 100 + weekofyear(time, TZ)
+
 // =============================================================================
 // SECTION D: SWING PIVOTS (ANTI-REPAINT)
 // =============================================================================
@@ -494,6 +599,12 @@ f_pushSwing(array<float> pxArr, array<int> ixArr, float px, int ix) =>
 // Every write below sits inside the confirmed-bar gate.
 // =============================================================================
 
+// Which period each singleton level was last stated for. na = never stated.
+var int pdhStatedDay  = na
+var int pdlStatedDay  = na
+var int pwhStatedWeek = na
+var int pwlStatedWeek = na
+
 if barstate.isconfirmed
     // ---- 1. ASIA RANGE HIGH / LOW -------------------------------------------
     // Finalised on Asia close, then carried forward through London and beyond.
@@ -501,25 +612,32 @@ if barstate.isconfirmed
     if asiaJustClosedRaw and not na(asiaRangeHigh) and not na(asiaRangeLow)
         removePoolsByTag("Asia High")
         removePoolsByTag("Asia Low")
-        f_addPool(asiaRangeHigh, "Asia High", true,  showAsiaRange)
-        f_addPool(asiaRangeLow,  "Asia Low",  false, showAsiaRange)
+        f_addPool(asiaRangeHigh, "Asia High", true,  TIER_PROTECTED, showAsiaRange)
+        f_addPool(asiaRangeLow,  "Asia Low",  false, TIER_PROTECTED, showAsiaRange)
 
     // ---- 2. PRIOR DAY HIGH / LOW --------------------------------------------
-    // Re-stated only when the value actually changes, i.e. a new day completed.
-    if not na(pdh) and (na(pdh[1]) or pdh != pdh[1])
+    // Restated on TRADING-DAY CHANGE, not on value change. Two consecutive days
+    // can share an identical RTH high to the tick, and a value test would then
+    // never restate the level.
+    if not na(pdh) and (na(pdhStatedDay) or dayKey != pdhStatedDay)
         removePoolsByTag("PDH")
-        f_addPool(pdh, "PDH", true, showPDHL)
-    if not na(pdl) and (na(pdl[1]) or pdl != pdl[1])
+        f_addPool(pdh, "PDH", true, TIER_PROTECTED, showPDHL)
+        pdhStatedDay := dayKey
+    if not na(pdl) and (na(pdlStatedDay) or dayKey != pdlStatedDay)
         removePoolsByTag("PDL")
-        f_addPool(pdl, "PDL", false, showPDHL)
+        f_addPool(pdl, "PDL", false, TIER_PROTECTED, showPDHL)
+        pdlStatedDay := dayKey
 
     // ---- 3. PRIOR WEEK HIGH / LOW -------------------------------------------
-    if not na(pwh) and (na(pwh[1]) or pwh != pwh[1])
+    // Same defect, same fix, keyed on the calendar week instead.
+    if not na(pwh) and (na(pwhStatedWeek) or weekKey != pwhStatedWeek)
         removePoolsByTag("PWH")
-        f_addPool(pwh, "PWH", true, showPWHL)
-    if not na(pwl) and (na(pwl[1]) or pwl != pwl[1])
+        f_addPool(pwh, "PWH", true, TIER_PROTECTED, showPWHL)
+        pwhStatedWeek := weekKey
+    if not na(pwl) and (na(pwlStatedWeek) or weekKey != pwlStatedWeek)
         removePoolsByTag("PWL")
-        f_addPool(pwl, "PWL", false, showPWHL)
+        f_addPool(pwl, "PWL", false, TIER_PROTECTED, showPWHL)
+        pwlStatedWeek := weekKey
 
     // ---- 4 + 5. CONFIRMED SWINGS, THEN EQUAL HIGHS / LOWS --------------------
     float tol = f_equalTol()
@@ -544,14 +662,15 @@ if barstate.isconfirmed
         lastConfirmedSwingHigh := ppx
         lastSwingHighBar       := pbar
         f_pushSwing(swingHighPrices, swingHighBars, ppx, pbar)
-        f_addPool(ppx, "Swing High", true, false)
+        f_addPool(ppx, "Swing High", true, TIER_TRANSIENT, false)
         f_trimTag("Swing High", SWING_KEEP)
 
         // Two or more pivots inside tolerance => ONE EQH pool at the extreme.
         // If an EQH pool already covers this cluster, move it rather than add.
         Pool eqhHit = findActivePoolNear("EQH", eqExtreme, tol)
         if eqCount >= 1 and na(eqhHit)
-            f_addPool(eqExtreme, "EQH", true, showEqualLevels)
+            f_addPool(eqExtreme, "EQH", true, TIER_SIGNIFICANT, showEqualLevels)
+            f_trimTag("EQH", maxEqualPools)   // per-tag cap, enforced on every add
         if eqCount >= 1 and not na(eqhHit)
             setPoolPrice(eqhHit, math.max(eqhHit.price, eqExtreme))
 
@@ -571,12 +690,13 @@ if barstate.isconfirmed
         lastConfirmedSwingLow := ppxL
         lastSwingLowBar       := pbarL
         f_pushSwing(swingLowPrices, swingLowBars, ppxL, pbarL)
-        f_addPool(ppxL, "Swing Low", false, false)
+        f_addPool(ppxL, "Swing Low", false, TIER_TRANSIENT, false)
         f_trimTag("Swing Low", SWING_KEEP)
 
         Pool eqlHit = findActivePoolNear("EQL", eqExtremeL, tol)
         if eqCountL >= 1 and na(eqlHit)
-            f_addPool(eqExtremeL, "EQL", false, showEqualLevels)
+            f_addPool(eqExtremeL, "EQL", false, TIER_SIGNIFICANT, showEqualLevels)
+            f_trimTag("EQL", maxEqualPools)   // per-tag cap, enforced on every add
         if eqCountL >= 1 and not na(eqlHit)
             setPoolPrice(eqlHit, math.min(eqlHit.price, eqExtremeL))
 
@@ -646,6 +766,13 @@ if barstate.islast and showDebugTable
     Pool nBuy  = nearestBuySideAbove(close)
     Pool nSell = nearestSellSideBelow(close)
 
+    // Tier breakdown + saturation. If T2 is pinned and the total sits at the
+    // cap, the book is under eviction pressure.
+    string tierStr = "T0 " + str.tostring(f_tierCount(TIER_PROTECTED)) +
+                     " | T1 " + str.tostring(f_tierCount(TIER_SIGNIFICANT)) +
+                     " | T2 " + str.tostring(f_tierCount(TIER_TRANSIENT)) +
+                     "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")"
+
     table.cell(dbg, 0, 0, "MNQ ICT  STAGE 1", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
@@ -688,8 +815,8 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 13, "PWL", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 13, f_px(pwl), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
-    table.cell(dbg, 0, 14, "Pools act/all", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 14, str.tostring(activePoolCount()) + " / " + str.tostring(array.size(pools)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 14, "Pools by tier", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 14, tierStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 15, "Last swing H", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 15, f_swingStr(lastConfirmedSwingHigh, lastSwingHighBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
