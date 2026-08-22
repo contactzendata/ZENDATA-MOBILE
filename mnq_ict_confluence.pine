@@ -3026,6 +3026,24 @@ var int runnerFallbk = 0   // opposing pool unusable, fell back to fixed R
 // reached it. Only the pair distinguishes those.
 var int triggersRaw = 0
 
+// ---- TEMPORARY: stop-construction forensics ---------------------------------
+// Whether the wide stops are real structure or an artefact of POI selection.
+// Recorded for every trigger that REACHES the stop calculation, which is the
+// same set as the stop-band suppressions whenever none survive.
+var int    supStopBelow   = 0     // suppressed for being under stopMinPts
+var int    supStopAbove   = 0     // suppressed for being over stopMaxPts
+var int    stopDiagN      = 0     // triggers that reached the stop calc
+var int    stopPoiNaN     = 0     // of those, how many had NO snapshot POI
+var float  stopSweptSum   = 0.0   // running sum of the swept-extreme distance
+var float  stopPoiSum     = 0.0   // running sum of the POI-far-edge distance
+var float  lastStopSwept  = na
+var float  lastStopPoi    = na
+var float  lastStopUsed   = na
+var string lastStopWhich  = "-"
+// Wall-clock of the last session-suppressed trigger, to show whether the longer
+// entry window is pushing triggers past a session boundary.
+var string lastSessSupEt  = "-"
+
 // Episode latches, so per-bar states are counted once rather than every bar.
 var int  lastSpentCounted = na
 var bool wasAmbiguous     = false
@@ -3257,6 +3275,7 @@ if barstate.isconfirmed
             // inAsiaSignal is stage 1's signal-eligible Asia: it drops the
             // 00:00-02:00 tail when asiaExcludeLate is on.
             supOutSess += 1
+            lastSessSupEt := str.format_time(time, "HH:mm", TZ)
             ok := false
         if ok and pastCutoff
             supCutoff += 1
@@ -3301,8 +3320,38 @@ if barstate.isconfirmed
             if stopMode == "Wider of the two"
                 stopPx := na(stopPoi) ? stopSwept : (isLong ? math.min(stopSwept, stopPoi) : math.max(stopSwept, stopPoi))
             stopPts := isLong ? entryPx - stopPx : stopPx - entryPx
+
+            // ---- TEMPORARY forensics, recorded before the band test ---------
+            // Both candidate distances in POINTS, so a systematically wider POI
+            // anchor is visible directly rather than inferred.
+            float dSwept = isLong ? entryPx - stopSwept : stopSwept - entryPx
+            float dPoi   = na
+            if not na(stopPoi)
+                dPoi := isLong ? entryPx - stopPoi : stopPoi - entryPx
+            stopDiagN    += 1
+            stopSweptSum += dSwept
+            if na(stopPoi)
+                stopPoiNaN += 1
+            if not na(dPoi)
+                stopPoiSum += dPoi
+            lastStopSwept := dSwept
+            lastStopPoi   := dPoi
+            lastStopUsed  := stopPts
+            // "Wider of the two" takes the LARGER distance, so comparing the
+            // two distances names the winner without float-equality games.
+            if na(dPoi)
+                lastStopWhich := "swept (no POI)"
+            if not na(dPoi) and dPoi > dSwept
+                lastStopWhich := "POI"
+            if not na(dPoi) and dPoi <= dSwept
+                lastStopWhich := "swept"
+
             // SUPPRESS, never clamp. A stop outside the band is the structure
             // saying it is not the structure we thought we had.
+            if not na(stopPts) and stopPts < stopMinPts
+                supStopBelow += 1
+            if not na(stopPts) and stopPts > stopMaxPts
+                supStopAbove += 1
             if na(stopPts) or stopPts < stopMinPts or stopPts > stopMaxPts
                 supStopBand += 1
                 ok := false
@@ -3532,6 +3581,13 @@ f_cmp(float earned, float maxv) =>
     string s = str.tostring(earned, "#.00") + " / " + str.tostring(maxv, "#.00")
     s
 
+// Running mean, or "n/a" when there is nothing to average.
+f_meanStr(float total, int n) =>
+    string r = "n/a"
+    if n > 0
+        r := str.tostring(total / n, "#.0")
+    r
+
 f_bucketTotal() =>
     int n = 0
     if array.size(scoreBuckets) == 5
@@ -3658,6 +3714,29 @@ if barstate.islast and showDebugTable
 
         table.cell(dbg, 0, 7, "Armed L | S", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 7, kArmL + "   |   " + kArmS, bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // ---- TEMPORARY: stop forensics --------------------------------------
+        table.cell(dbg, 0, 9, "Stop band", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 9, "below " + str.tostring(supStopBelow) +
+                 " | above " + str.tostring(supStopAbove) +
+                 "   (reached stop calc " + str.tostring(stopDiagN) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 10, "Stop anchors mean", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 10, "swept " + f_meanStr(stopSweptSum, stopDiagN) +
+                 "pt | poi " + f_meanStr(stopPoiSum, stopDiagN - stopPoiNaN) +
+                 "pt | poiNa " + str.tostring(stopPoiNaN), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 11, "Stop last", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 11, "swept " + f_num(lastStopSwept) +
+                 " | poi " + f_num(lastStopPoi) +
+                 " | used " + f_num(lastStopUsed) + " via " + lastStopWhich, bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 12, "Armed w/ DR", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 12, str.tostring(armedWithDR) + " / " + str.tostring(armedSetups) +
+                 f_pctStr(armedWithDR, armedSetups), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 13, "Last sess-sup at", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 13, lastSessSupEt + " ET", bgcolor = kBg, text_color = kTx, text_size = size.small)
 
         // Temporary, for the SMT pool-gate investigation.
         table.cell(dbg, 0, 8, "SMT cand|pass, dist", bgcolor = kBg, text_color = kTx, text_size = size.small)
