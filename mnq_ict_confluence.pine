@@ -830,13 +830,16 @@ f_pushS2Label(label lb) =>
 // machine per side rather than a bundle of ad hoc flags:
 //
 //   (idle) --penetration--> PENETRATED --close back inside--> SWEPT
-//                                |
-//                                +--N consecutive closes beyond--> BROKEN OUT
-//                                |
-//                                +--reclaim window elapsed------> EXPIRED
+//                              |  ^
+//                              |  +--UPGRADE (a more significant pool is
+//                              |     penetrated while this one is pending)
+//                              |
+//                              +--N consecutive closes beyond--> BROKEN OUT
+//                              |
+//                              +--reclaim window elapsed------> EXPIRED
 //
 // SWEPT and BROKEN OUT both consume the pool, so one level can never produce
-// two signals. EXPIRED leaves it active.
+// two signals. EXPIRED and UPGRADE both leave the abandoned pool active.
 // =============================================================================
 
 // side          : buySide = true means BUY-side liquidity (above highs) was
@@ -973,6 +976,7 @@ var int   pendDnCloses  = 0
 // Cumulative calibration counters for the debug table.
 var int sweepConfirmedCount   = 0
 var int breakoutRejectedCount = 0
+var int sweepUpgradeCount     = 0      // how often a pending record was upgraded
 var int lastBreakoutDir       = 0      // +1 up, -1 down. For later stages.
 
 // Per-bar marker prices. Not `var`, so they reset to na every bar.
@@ -1004,14 +1008,43 @@ if barstate.isconfirmed
     float pen = f_sweepPen()
 
     // =========================== BUY-SIDE (highs) ===========================
-    // 1. PENETRATED: open a pending record when nothing is pending.
-    if na(pendUpPool) and not na(close[1])
+    // 1. PENETRATE or UPGRADE.
+    //    f_sweepTargetAbove is evaluated on EVERY confirmed bar, not only when
+    //    the side is idle. That second case matters: on a fast push price can
+    //    clear a minor EQH on one bar and the Asia High a bar or two later, and
+    //    by then the Asia High sits BELOW close[1] so the `p.price > refPx`
+    //    guard would make it unreachable forever. The pending record would be
+    //    stuck on the minor level -- exactly the setup we most want to catch,
+    //    shadowed by the least significant pool involved.
+    if not na(close[1])
         Pool tgtUp = f_sweepTargetAbove(high, close[1], pen, sweepMaxTier)
-        if not na(tgtUp)
+
+        // 1a. Fresh penetration: nothing was pending on this side.
+        if not na(tgtUp) and na(pendUpPool)
             pendUpPool    := tgtUp
             pendUpBar     := bar_index
             pendUpExtreme := high
             pendUpCloses  := 0
+
+        // 1b. UPGRADE: a STRICTLY more significant pool was penetrated while a
+        //     record was already pending. Equal tier does not upgrade -- only a
+        //     lower tier number, so this can fire at most twice per pending
+        //     record (T2 -> T1 -> T0) and cannot oscillate.
+        //     WHY THE CLOCKS RESTART: the more significant level was penetrated
+        //     on THIS bar, so its reclaim window has to be measured from here,
+        //     not inherited from when the minor level was poked. Same for the
+        //     breakout count -- closes beyond the EQH say nothing about whether
+        //     the Asia High is holding. The extreme is the one thing carried
+        //     forward, because the furthest price reached is a property of the
+        //     whole excursion, not of which level we happen to be tracking.
+        //     The abandoned pool is NOT consumed: it stays active and can be
+        //     penetrated again on a later approach.
+        if not na(tgtUp) and not na(pendUpPool) and tgtUp.tier < pendUpPool.tier
+            pendUpExtreme := math.max(nz(pendUpExtreme, high), high)
+            pendUpPool    := tgtUp
+            pendUpBar     := bar_index
+            pendUpCloses  := 0
+            sweepUpgradeCount += 1
 
     // 2. Evaluate the pending record. This deliberately runs on the penetration
     //    bar as well, so a single bar that pokes above and closes back below --
@@ -1064,13 +1097,25 @@ if barstate.isconfirmed
             pendUpPool := na
 
     // =========================== SELL-SIDE (lows) ===========================
-    if na(pendDnPool) and not na(close[1])
+    // Exact mirror of the buy-side penetrate/upgrade logic above; see there for
+    // why the age clock and breakout count restart on an upgrade.
+    if not na(close[1])
         Pool tgtDn = f_sweepTargetBelow(low, close[1], pen, sweepMaxTier)
-        if not na(tgtDn)
+
+        // 1a. Fresh penetration.
+        if not na(tgtDn) and na(pendDnPool)
             pendDnPool    := tgtDn
             pendDnBar     := bar_index
             pendDnExtreme := low
             pendDnCloses  := 0
+
+        // 1b. UPGRADE to a strictly more significant pool.
+        if not na(tgtDn) and not na(pendDnPool) and tgtDn.tier < pendDnPool.tier
+            pendDnExtreme := math.min(nz(pendDnExtreme, low), low)
+            pendDnPool    := tgtDn
+            pendDnBar     := bar_index
+            pendDnCloses  := 0
+            sweepUpgradeCount += 1
 
     if not na(pendDnPool)
         pendDnExtreme := math.min(pendDnExtreme, low)
@@ -1302,14 +1347,17 @@ f_structEvtStr(string kind, int dir, int bidx) =>
         s := kind + " " + (dir > 0 ? "up" : "down") + "  " + str.tostring(bar_index - bidx) + "b ago"
     s
 
-// "12 swept / 5 broke  (2.4:1)" -- the calibration ratio for
-// breakoutClosesToInvalidate.
-f_sweepRatioStr(int swept, int broke) =>
+// "12 swept / 5 broke  (2.4:1)  upg 3" -- the calibration ratio for
+// breakoutClosesToInvalidate, plus how often a pending record was upgraded to
+// a more significant pool. A high upgrade count means minor levels really were
+// shadowing the ones that matter.
+f_sweepRatioStr(int swept, int broke, int upg) =>
     string s = str.tostring(swept) + " swept / " + str.tostring(broke) + " broke"
     if broke > 0
         // *1.0 forces float division -- Pine truncates int/int, so 12/5 would
         // print 2 instead of 2.4 and the ratio would be useless.
         s := s + "  (" + str.tostring(swept * 1.0 / broke, "#.0") + ":1)"
+    s := s + "  upg " + str.tostring(upg)
     s
 
 var table dbg = na
@@ -1424,7 +1472,7 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 1, 23, armedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 24, "Sweep : breakout", bgcolor = cellBg, text_color = txt, text_size = size.small)
-    table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount, sweepUpgradeCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
