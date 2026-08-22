@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-// MNQ ICT CONFLUENCE  --  STAGE 4 of 6: SMT DIVERGENCE (MNQ vs ES)
+// MNQ ICT CONFLUENCE  --  STAGE 5 of 6: CONFLUENCE SCORING
 // -----------------------------------------------------------------------------
 // DISCLAIMER: research/education tool. NOT financial advice. Every level and
 // threshold in here is an untested hypothesis about how MNQ behaves. Trade your
@@ -45,6 +45,11 @@
 //   Q. SMT divergence against a correlated reference (ES). CONFLUENCE ONLY --
 //      it can never arm a setup by itself, and stage 5 weights it at 1 point.
 //
+// WHAT STAGE 5 ADDS
+//   R. The six-component confluence score, its mandatory gate, the per-setup
+//      score distribution, and a full breakdown of every component so a score
+//      can always be explained rather than merely reported.
+//
 // ANTI-REPAINT CONTRACT (holds for every stage of this project)
 //   1. Session membership comes from the bar's OPEN time, which is fixed the
 //      moment the bar prints, so session flags can never repaint.
@@ -65,7 +70,7 @@
 // max_bars_back is raised because stage 3 reads close[k]/open[k] with a SERIES
 // offset when it hunts backwards for an order-block anchor candle. Pine cannot
 // infer the required buffer from a variable offset, so we state it.
-indicator("MNQ ICT Confluence [S4]", shorttitle = "MNQ ICT S4", overlay = true,
+indicator("MNQ ICT Confluence [S5]", shorttitle = "MNQ ICT S5", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
      max_bars_back = 500)
 
@@ -215,6 +220,28 @@ smtRequireAtPool = input.bool(true, "Only count divergence at a liquidity pool",
 smtPoolProxTicks = input.float(12.0, "Pool proximity (ticks)", minval = 0.0, step = 0.25, group = grpSmt,
      tooltip = "MNQ tick = 0.25 pts, so 12 ticks = 3.0 pts.")
 
+// ---- Group: Scoring ----------------------------------------------------------
+grpScore = "Scoring"
+
+scoreThreshold  = input.float(7.0, "Signal threshold", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore,
+     tooltip = "A setup fires at or above this. Chosen so that the mandatory components plus the POI component cannot reach it alone: 3.0 + 2.0 + 1.5 = 6.5, so confluence is always load-bearing.")
+scoreStrongBand = input.float(8.0, "Strong band", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore,
+     tooltip = "Set at 8.0 rather than 8.5 because the Asia ceiling is 9.5, not 10: SMT is halved overnight. 8.5 would sit within a point of the Asia ceiling and be effectively unreachable there.")
+
+rangeRef = input.string("Current session", "Session P/D reference range", group = grpScore,
+     options = ["Current session", "Prior day RTH", "Prior day full"],
+     tooltip = "DELIBERATELY a different range from the dealing range, so this component is not collinear with the dealing-range location component. Price can sit in dealing-range discount while in session premium; those are two facts, not one.")
+sessionPdDepth = input.float(0.25, "Deep premium / discount threshold", minval = 0.01, maxval = 0.5, step = 0.01, group = grpScore,
+     tooltip = "0.25 means the bottom quartile of the reference range counts as deep discount for a long, the top quartile as deep premium for a short.")
+
+// Every weight is an input so the model can be re-weighted without touching code.
+wSweep     = input.float(3.0, "Weight: sweep (x poolWeight)", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+wMss       = input.float(2.0, "Weight: MSS confirming the sweep", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+wPoi       = input.float(1.5, "Weight: POI (x quality)", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+wLocation  = input.float(1.5, "Weight: dealing-range location", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+wSmt       = input.float(1.0, "Weight: SMT (x strength x session)", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+wSessionPd = input.float(1.0, "Weight: session premium / discount", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
+
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
 
@@ -317,6 +344,16 @@ color colDead     = #9e9e9e   // faded, invalidated or expired
 int MAX_FVGS  = 40
 int MAX_IFVGS = 20
 int MAX_OBS   = 20
+
+// A session range smaller than one average bar is not a range. Early in a
+// session a couple of ticks would flip the premium/discount reading from one
+// extreme to the other, so below this floor that component abstains.
+float SESS_PD_MIN_RANGE_ATR = 1.0
+
+// SMT is halved during Asia. ES overnight books are thin enough that a 3-point
+// NQ divergence maps to well under a point on ES -- inside the noise. See the
+// note at the SMT component.
+float SMT_ASIA_SCALE = 0.5
 
 // How many dead dealing-range bands to keep when showHistoricalOTE is on.
 // Each band costs one box plus three level lines.
@@ -2429,6 +2466,245 @@ plotshape(showSMT and smtEnabled ? smtMarkPx : na, title = "SMT divergence",
      color = color.new(colSmt, 0), size = size.tiny)
 
 // =============================================================================
+// SECTION R (STAGE 5): CONFLUENCE SCORING
+//
+// Six components, ten points. Two of them are MANDATORY and gate everything
+// else: without a liquidity sweep AND an MSS confirming that same sweep, the
+// score is zero regardless of how much peripheral evidence is present.
+// Peripheral points must never be able to arm a setup on their own.
+//
+// The threshold is 7.0 and the mandatory pair plus the POI component tops out
+// at 3.0 + 2.0 + 1.5 = 6.5. That gap is deliberate: it makes confluence
+// load-bearing even in the best-formed setups, rather than decorative.
+//
+// COLLINEARITY: the two location components deliberately measure DIFFERENT
+// ranges. The dealing-range component asks where price sits inside the setup's
+// own range; the session component asks where it sits inside the session or
+// prior day. Price can be in dealing-range discount and session premium at the
+// same time. If they measured the same range they would be one fact with two
+// names, which is the failure this whole model is built to avoid.
+// =============================================================================
+
+type Score
+    bool   isLong
+    bool   gateOk
+    float  sweepPts
+    float  mssPts
+    float  poiPts
+    float  locPts
+    float  smtPts
+    float  sessPts
+    float  total
+    bool   pass
+    bool   strong
+    string poolTag
+    int    poolTier
+    string poiKind
+
+// ---- A. SESSION PREMIUM / DISCOUNT (the reserved point, now live) ------------
+// Reference range, per the rangeRef input.
+f_sessRefHi() =>
+    float v = na
+    if rangeRef == "Prior day RTH"
+        v := pdhRth
+    if rangeRef == "Prior day full"
+        v := pdhFull
+    if rangeRef == "Current session"
+        // Whichever session range stage 1 is currently building. RTH is
+        // included: without it every RTH setup would take a systematic
+        // one-point penalty for a reason that has nothing to do with the setup.
+        v := inAsiaRaw ? asiaCurHigh : inLondonRaw ? lonCurHigh : inRthRaw ? rthCurHigh : na
+    v
+
+f_sessRefLo() =>
+    float v = na
+    if rangeRef == "Prior day RTH"
+        v := pdlRth
+    if rangeRef == "Prior day full"
+        v := pdlFull
+    if rangeRef == "Current session"
+        v := inAsiaRaw ? asiaCurLow : inLondonRaw ? lonCurLow : inRthRaw ? rthCurLow : na
+    v
+
+// Graded, not binary: 0 wrong side, 0.5 correct side, 1.0 beyond sessionPdDepth.
+// RETURNS 0 CLEANLY when the reference range is undefined or too small to mean
+// anything. EARLY ASIA IS THEREFORE STRUCTURALLY HARDER TO FIRE, and that is
+// intended rather than a defect: in the first bars of a session there is no
+// established range, so there is genuinely no premium/discount fact to report.
+// Abstaining is the honest answer; guessing from a three-point range would let
+// two ticks flip the reading from deep discount to deep premium.
+f_sessionPdGrade(bool isLong) =>
+    float g  = 0.0
+    float hi = f_sessRefHi()
+    float lo = f_sessRefLo()
+    if not na(hi) and not na(lo) and hi > lo
+        float span = hi - lo
+        if na(atr) or span >= SESS_PD_MIN_RANGE_ATR * atr
+            float frac  = (close - lo) / span
+            float depth = isLong ? frac : 1.0 - frac
+            if depth < 0.5
+                g := 0.50
+            if depth <= sessionPdDepth
+                g := 1.00
+    g
+
+// ---- Dealing-range location grade -------------------------------------------
+// 0 wrong side of equilibrium, 0.5 correct side outside OTE, 1.0 inside OTE.
+// inOTE() already applies oteRequireCorrectSide, so the 1.0 grade cannot be
+// reached on the wrong side of the range.
+f_locationGrade(bool isLong) =>
+    float g = 0.0
+    if not na(drRange) and drRange > 0 and not na(drEq)
+        bool correctSide = isLong ? close < drEq : close > drEq
+        if correctSide
+            g := 0.50
+        if inOTE(isLong)
+            g := 1.00
+    g
+
+// ---- B. THE MODEL -----------------------------------------------------------
+f_computeScore(bool isLong) =>
+    // A LONG setup is built on SELL-side liquidity being taken, so we ask for
+    // the sweep on the opposite side to the trade direction.
+    Sweep sw = getLiveSweep(not isLong)
+
+    // THE MANDATORY GATE. Both halves required: a live sweep, and an MSS that
+    // stage 2 actually paired with THAT sweep.
+    bool gate = false
+    if not na(sw)
+        gate := sw.mssConfirmed
+
+    float sweepPts = 0.0
+    float mssPts   = 0.0
+    float poiPts   = 0.0
+    float locPts   = 0.0
+    float smtPts   = 0.0
+    float sessPts  = 0.0
+    string pTag    = "-"
+    int    pTier   = -1
+    string pKind   = "none"
+
+    if gate
+        // 1. Sweep, scaled by how significant the level taken was.
+        sweepPts := wSweep * poolWeight(sw.poolTier)
+        pTag  := sw.poolTag
+        pTier := sw.poolTier
+
+        // 2. MSS. Binary, and given the gate it always contributes in full --
+        //    it is a floor, not a discriminator. Worth remembering when reading
+        //    the per-component breakdown.
+        mssPts := wMss
+
+        // 3. The single POI component. One query, one component: an order block
+        //    and an FVG from the same leg are one observation, not two.
+        POI p = bestPOI(isLong, close)
+        if not na(p)
+            poiPts := wPoi * p.quality
+            pKind  := p.kind
+
+        // 4. Where price sits inside the SETUP's own range.
+        locPts := wLocation * f_locationGrade(isLong)
+
+        // 5. SMT, graded by strength and halved during Asia. A bullish SMT (at
+        //    lows) supports a long, so the direction argument matches isLong.
+        if smtDivergence(isLong)
+            smtPts := wSmt * smtStrengthNow() * (inAsia ? SMT_ASIA_SCALE : 1.0)
+
+        // 6. Where price sits inside the SESSION or prior day. Different range,
+        //    so not collinear with component 4.
+        sessPts := wSessionPd * f_sessionPdGrade(isLong)
+
+    float total = sweepPts + mssPts + poiPts + locPts + smtPts + sessPts
+    Score sc = Score.new(isLong = isLong, gateOk = gate,
+             sweepPts = sweepPts, mssPts = mssPts, poiPts = poiPts,
+             locPts = locPts, smtPts = smtPts, sessPts = sessPts,
+             total = total, pass = gate and total >= scoreThreshold,
+             strong = gate and total >= scoreStrongBand,
+             poolTag = pTag, poolTier = pTier, poiKind = pKind)
+    sc
+
+// ---- Cached scores, recomputed on confirmed bars only ------------------------
+// The table and stage 6 read the cache, so a live-bar read returns the last
+// CONFIRMED score rather than something that moves intrabar.
+var Score scLong  = na
+var Score scShort = na
+
+// ---- Score distribution, one sample per ARMED SETUP -------------------------
+// Buckets: <5, 5-6, 6-7, 7-8, 8+.
+// SAMPLING CHOICE: we record the PEAK score a setup ever reached, once, when
+// the setup ends. Sampling every bar would let one long-lived sweep dominate
+// the histogram. Sampling at arm time would systematically understate the
+// location components, because on the MSS bar price is at the leg extreme and
+// has not retraced into OTE yet. The peak is what the setup was worth at its
+// best, which is the number a trader would actually have acted on.
+var array<int> scoreBuckets = array.new<int>(5, 0)
+
+f_bucketScore(float v) =>
+    int idx = v < 5.0 ? 0 : v < 6.0 ? 1 : v < 7.0 ? 2 : v < 8.0 ? 3 : 4
+    array.set(scoreBuckets, idx, array.get(scoreBuckets, idx) + 1)
+
+var float peakLong    = na
+var int   peakSwLong  = na
+var float peakShort   = na
+var int   peakSwShort = na
+
+if barstate.isconfirmed
+    scLong  := f_computeScore(true)
+    scShort := f_computeScore(false)
+
+    // --- LONG side peak tracking ---
+    Sweep swL = getLiveSweep(false)
+    bool gateL = not na(swL) and scLong.gateOk
+    if gateL and (na(peakSwLong) or peakSwLong != swL.confirmBarIdx)
+        // A different setup than the one being tracked: bank the old peak.
+        if not na(peakLong)
+            f_bucketScore(peakLong)
+        peakSwLong := swL.confirmBarIdx
+        peakLong   := scLong.total
+    if gateL and not na(peakSwLong) and peakSwLong == swL.confirmBarIdx
+        peakLong := math.max(nz(peakLong, 0.0), scLong.total)
+    if not gateL and not na(peakLong)
+        f_bucketScore(peakLong)
+        peakLong   := na
+        peakSwLong := na
+
+    // --- SHORT side peak tracking ---
+    Sweep swS = getLiveSweep(true)
+    bool gateS = not na(swS) and scShort.gateOk
+    if gateS and (na(peakSwShort) or peakSwShort != swS.confirmBarIdx)
+        if not na(peakShort)
+            f_bucketScore(peakShort)
+        peakSwShort := swS.confirmBarIdx
+        peakShort   := scShort.total
+    if gateS and not na(peakSwShort) and peakSwShort == swS.confirmBarIdx
+        peakShort := math.max(nz(peakShort, 0.0), scShort.total)
+    if not gateS and not na(peakShort)
+        f_bucketScore(peakShort)
+        peakShort   := na
+        peakSwShort := na
+
+// ---- C. PUBLIC OUTPUT --------------------------------------------------------
+// scoreFor() is the real interface: stage 6 and validation both need to know
+// WHY a number came out the way it did, not merely what it was.
+scoreFor(bool isLong) =>
+    Score sc = isLong ? scLong : scShort
+    sc
+
+currentScore(bool isLong) =>
+    Score sc = isLong ? scLong : scShort
+    float v = 0.0
+    if not na(sc)
+        v := sc.total
+    v
+
+scorePasses(bool isLong) =>
+    Score sc = isLong ? scLong : scShort
+    bool r = false
+    if not na(sc)
+        r := sc.pass
+    r
+
+// =============================================================================
 // SECTION E: DEBUG TABLE
 // The stage-1 verification surface. Everything here is read from confirmed
 // state, so if a number looks wrong the state is wrong, not the display.
@@ -2530,11 +2806,27 @@ f_bestPoiStr(POI p) =>
         s := p.kind + " @ " + str.tostring(p.ce, format.mintick) + "  q " + str.tostring(p.quality, "#.00")
     s
 
+// ---- stage-5 table helpers --------------------------------------------------
+// "2.40 / 3.00" -- earned against the component's own maximum.
+f_cmp(float earned, float maxv) =>
+    string s = str.tostring(earned, "#.00") + " / " + str.tostring(maxv, "#.00")
+    s
+
+f_bucketStr() =>
+    string s = ""
+    if array.size(scoreBuckets) == 5
+        s := str.tostring(array.get(scoreBuckets, 0)) + " / " +
+             str.tostring(array.get(scoreBuckets, 1)) + " / " +
+             str.tostring(array.get(scoreBuckets, 2)) + " / " +
+             str.tostring(array.get(scoreBuckets, 3)) + " / " +
+             str.tostring(array.get(scoreBuckets, 4))
+    s
+
 var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 36,
+        dbg := table.new(position.top_right, 2, 46,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
@@ -2561,7 +2853,7 @@ if barstate.islast and showDebugTable
                      "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
                      "  act " + str.tostring(activePoolCount())
 
-    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 4", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 5", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
@@ -2697,6 +2989,82 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 35, "SMT count", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 35, str.tostring(smtCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
+    // ---- STAGE 5 ROWS --------------------------------------------------------
+    // Show whichever side is armed. If both are, show the higher-scoring one.
+    Score shown = na
+    bool  gL = not na(scLong)  and scLong.gateOk
+    bool  gS = not na(scShort) and scShort.gateOk
+    if gL and not gS
+        shown := scLong
+    if gS and not gL
+        shown := scShort
+    if gL and gS and scLong.total >= scShort.total
+        shown := scLong
+    if gL and gS and scShort.total > scLong.total
+        shown := scShort
+
+    string armedStr2 = "none"
+    string sweepStr  = "-"
+    string mssStr    = "-"
+    string poiStr2   = "-"
+    string locStr    = "-"
+    string smtPtsStr = "-"
+    string sessStr   = "-"
+    string totalStr  = "-"
+    string verdict   = "-"
+    if not na(shown)
+        armedStr2 := shown.isLong ? "LONG" : "SHORT"
+        sweepStr  := f_cmp(shown.sweepPts, wSweep) + "  (" + shown.poolTag + " T" + str.tostring(shown.poolTier) + ")"
+        mssStr    := f_cmp(shown.mssPts, wMss)
+        poiStr2   := f_cmp(shown.poiPts, wPoi) + "  (" + shown.poiKind + ")"
+        locStr    := f_cmp(shown.locPts, wLocation)
+        smtPtsStr := f_cmp(shown.smtPts, wSmt) + (inAsia ? "  asia x0.5" : "")
+        sessStr   := f_cmp(shown.sessPts, wSessionPd)
+        totalStr  := str.tostring(shown.total, "#.00") + "  vs " + str.tostring(scoreThreshold, "#.0")
+        verdict   := shown.strong ? "PASS - STRONG" : shown.pass ? "PASS - signal" : "FAIL"
+
+    // Built with explicit ifs, not a ternary chain: Pine evaluates both arms of
+    // a ternary, and shown.strong on an na object is a runtime error.
+    color vBg = cellBg
+    if not na(shown) and shown.strong
+        vBg := color.new(color.green, 55)
+    if not na(shown) and shown.pass and not shown.strong
+        vBg := color.new(color.green, 75)
+    if not na(shown) and not shown.pass
+        vBg := color.new(color.red, 78)
+
+    table.cell(dbg, 0, 36, "S5 armed", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 36, armedStr2, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 37, "Sweep", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 37, sweepStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 38, "MSS", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 38, mssStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 39, "POI", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 39, poiStr2, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 40, "DR location", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 40, locStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 41, "SMT", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 41, smtPtsStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 42, "Session P/D", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 42, sessStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 43, "TOTAL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 43, totalStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 44, "Verdict", bgcolor = vBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 44, verdict, bgcolor = vBg, text_color = txt, text_size = size.small)
+
+    // THE diagnostic. One sample per armed setup, at its peak score. Clustering
+    // in a single bucket means the model is not discriminating.
+    table.cell(dbg, 0, 45, "Dist <5/5-6/6-7/7-8/8+", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 45, f_bucketStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
     table.delete(dbg)
@@ -2736,6 +3104,14 @@ if barstate.islast and not showDebugTable and not na(dbg)
 // SMT is confluence only. It never arms a setup and never writes to sweep,
 // structure or POI state.
 
-// ===== STAGE 5: CONFLUENCE SCORING =====
+// ===== STAGE 5: CONFLUENCE SCORING ===== IMPLEMENTED
+// Lives above the debug table, as section R.
+// Stage-5 API now available to stage 6:
+//   scoreFor(isLong)     -> Score   full breakdown, never just a number
+//   currentScore(isLong) -> float
+//   scorePasses(isLong)  -> bool
+//   scoreBuckets (array<int>, 5)  peak score per armed setup
+// The mandatory gate lives inside f_computeScore: no sweep with a paired MSS
+// means every component is zero, so peripheral evidence can never arm a setup.
 
 // ===== STAGE 6: ENTRY TRIGGER, GUARD RAILS, ALERTS =====
