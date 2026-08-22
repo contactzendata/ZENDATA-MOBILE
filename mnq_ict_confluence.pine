@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-// MNQ ICT CONFLUENCE  --  STAGE 2 of 6: DISPLACEMENT / SWEEPS / MARKET STRUCTURE
+// MNQ ICT CONFLUENCE  --  STAGE 3 of 6: FVG / IFVG / ORDER BLOCKS / OTE
 // -----------------------------------------------------------------------------
 // DISCLAIMER: research/education tool. NOT financial advice. Every level and
 // threshold in here is an untested hypothesis about how MNQ behaves. Trade your
@@ -29,6 +29,18 @@
 //      that stage 5 will score
 //   J. Stage-2 visuals, bounded
 //
+// WHAT STAGE 3 ADDS
+//   K. Zone types + the shared state enum
+//   L. Fair value gaps, and inverse FVGs when one fails on a close through
+//   M. Displacement-anchored order blocks, and breakers when one fails
+//   N. Dealing range from a sweep+MSS pair -> premium / discount / OTE
+//   O. THE UNIFIED POI API. Order blocks and FVGs are collinear evidence: the
+//      same displacement leg usually produces both at the same coordinates.
+//      Stage 5 must therefore query ONE component, not two, or it will pay
+//      itself twice for a single observation. bestPOI() is that one query;
+//      the underlying kind is retained for diagnostics only.
+//   P. Stage-3 visuals, bounded
+//
 // ANTI-REPAINT CONTRACT (holds for every stage of this project)
 //   1. Session membership comes from the bar's OPEN time, which is fixed the
 //      moment the bar prints, so session flags can never repaint.
@@ -46,8 +58,12 @@
 //      handled by TradingView. No hardcoded UTC offsets anywhere.
 // =============================================================================
 
-indicator("MNQ ICT Confluence [S2]", shorttitle = "MNQ ICT S2", overlay = true,
-     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
+// max_bars_back is raised because stage 3 reads close[k]/open[k] with a SERIES
+// offset when it hunts backwards for an order-block anchor candle. Pine cannot
+// infer the required buffer from a variable offset, so we state it.
+indicator("MNQ ICT Confluence [S3]", shorttitle = "MNQ ICT S3", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
+     max_bars_back = 500)
 
 // =============================================================================
 // INPUTS
@@ -140,6 +156,48 @@ sweepValidBars = input.int(12, "Sweep stays live for N bars", minval = 1, maxval
 carryPriorAsiaRange = input.bool(true, "Carry prior Asia range into the Asia session", group = grpSweep,
      tooltip = "Re-states the previous session's Asia high/low as fresh active pools tagged Prior Asia High/Low, so Asia has targets before its own range is finalised.")
 
+// ---- Group: FVG --------------------------------------------------------------
+grpFvg = "FVG"
+
+fvgMinTicks   = input.float(4.0, "Min gap (ticks)", minval = 0.0, step = 0.25, group = grpFvg,
+     tooltip = "MNQ tick = 0.25 pts, so 4 ticks = 1.0 pt.")
+fvgMinAtrMult = input.float(0.25, "Min gap (x ATR)", minval = 0.0, step = 0.01, group = grpFvg)
+fvgMinMode    = input.string("Max of both", "Min gap mode", group = grpFvg,
+     options = ["Ticks", "ATR", "Max of both"])
+fvgRequireDisplacement = input.bool(true, "Middle candle must be displacement", group = grpFvg,
+     tooltip = "Uses stage 2's isDisplacementUp/Down on the middle candle of the three. A gap left by three ordinary candles is a printing artefact, not an imbalance.")
+fvgMaxAgeBars   = input.int(60, "FVG max age (bars)", minval = 1, maxval = 1000, group = grpFvg)
+fvgInvalidateOn = input.string("Full fill", "FVG invalidated on", group = grpFvg,
+     options = ["Full fill", "CE breach", "Close through"],
+     tooltip = "Full fill = price traded through the far edge. CE breach = price reached the midpoint. Close through = a body close beyond the far edge.")
+
+ifvgRequireCloseThrough = input.bool(true, "IFVG needs a body close through", group = grpFvg,
+     tooltip = "When on, an FVG only flips to an inverse FVG after a CLOSE beyond its far edge. When off, a wick through is enough.")
+ifvgMaxAgeBars = input.int(40, "IFVG max age (bars)", minval = 1, maxval = 1000, group = grpFvg)
+
+// ---- Group: Order Blocks -----------------------------------------------------
+grpOb = "Order Blocks"
+
+obLookbackForAnchor = input.int(10, "Max bars back to find anchor candle", minval = 1, maxval = 50, group = grpOb,
+     tooltip = "From the structure-break bar, how far back to hunt for the last opposing candle.")
+obUseWholeCandle = input.bool(false, "Use whole candle instead of body", group = grpOb,
+     tooltip = "Off = body only (open to close), the stricter reading. On = full high/low range.")
+obMaxAgeBars = input.int(80, "OB max age (bars)", minval = 1, maxval = 1000, group = grpOb)
+obInvalidateOnCloseThrough = input.bool(true, "Close through retires the OB (becomes a breaker)", group = grpOb,
+     tooltip = "When on, a body close beyond the far edge flips the block to a BREAKER with inverted polarity. When off, only age retires it.")
+
+// ---- Group: OTE --------------------------------------------------------------
+grpOte = "OTE"
+
+oteLow  = input.float(0.62, "OTE band start (retracement)", minval = 0.0, maxval = 1.0, step = 0.01, group = grpOte)
+oteHigh = input.float(0.79, "OTE band end (retracement)",   minval = 0.0, maxval = 1.0, step = 0.01, group = grpOte)
+oteRequireCorrectSide = input.bool(true, "Longs only in discount, shorts only in premium", group = grpOte)
+drMaxAgeBars = input.int(120, "Dealing range max age (bars)", minval = 1, maxval = 2000, group = grpOte,
+     tooltip = "A dealing range with no lifetime would keep an OTE band alive forever. 120 bars is about 10 hours on a 5m chart.")
+
+poiOverlapTolTicks = input.float(4.0, "FVG / OB coincidence tolerance (ticks)", minval = 0.0, step = 0.25, group = grpOte,
+     tooltip = "How close an FVG and an order block must sit before they count as the same point of interest.")
+
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
 
@@ -152,6 +210,14 @@ showSwingMarkers   = input.bool(true, "Show confirmed swing markers", group = gr
 showDisplacement    = input.bool(true, "Highlight displacement bars", group = grpDisp)
 showSweepMarkers    = input.bool(true, "Show sweep markers",          group = grpDisp)
 showStructureLabels = input.bool(true, "Show BOS / CHoCH / MSS labels", group = grpDisp)
+
+// -- stage 3 additions to the Display group --
+showFVG  = input.bool(true, "Show fair value gaps",  group = grpDisp)
+showIFVG = input.bool(true, "Show inverse FVGs",     group = grpDisp)
+showOB   = input.bool(true, "Show order blocks",     group = grpDisp)
+showOTE  = input.bool(true, "Show OTE band",         group = grpDisp)
+fadeInvalidated = input.bool(true, "Fade invalidated zones instead of deleting", group = grpDisp,
+     tooltip = "Same reasoning as retired liquidity pools: where a zone failed is information.")
 
 // =============================================================================
 // CONSTANTS
@@ -195,6 +261,46 @@ color colDispDown = #d50000   // bright red expansion candle
 color colBOS      = #90a4ae   // blue-grey: continuation, informational
 color colCHoCH    = #ffa726   // amber: reversal warning
 color colMSS      = #ab47bc   // purple: the structural shift that counts
+
+// Zone STATE enum, shared by FVGs, inverse FVGs and order blocks. Plain ints
+// rather than a Pine enum so the ordering is usable: any state <= ST_CE_TAGGED
+// means the zone is still live, and state only ever moves forward.
+//   FRESH       untouched since creation
+//   TOUCHED     price has tagged the near edge
+//   CE_TAGGED   price has reached the midpoint. For a POI this counts as
+//               mitigated: you do not enter at a level price already visited.
+//   INVALIDATED the zone failed on its configured invalidation test
+//   EXPIRED     aged out without being invalidated
+//   BREAKER     ORDER BLOCKS ONLY. Price closed through, so the block is dead
+//               in its original polarity and live in the inverted one.
+int ST_FRESH       = 0
+int ST_TOUCHED     = 1
+int ST_CE_TAGGED   = 2
+int ST_INVALIDATED = 3
+int ST_EXPIRED     = 4
+int ST_BREAKER     = 5
+
+// Stage-3 zone colours.
+color colFvgBull  = #26a69a
+color colFvgBear  = #ef5350
+color colIfvgBull = #4dd0e1   // cyan-ish: an inverse FVG is a different animal
+color colIfvgBear = #f06292
+color colObBull   = #66bb6a
+color colObBear   = #e57373
+color colBreaker  = #ffb300   // amber, matching the CHoCH "something flipped" idea
+color colOte      = #ab47bc   // same purple as MSS: the OTE band belongs to it
+color colDead     = #9e9e9e   // faded, invalidated or expired
+
+// Stage-3 object budgets. FVG/IFVG/OB boxes plus the single OTE box stay well
+// inside max_boxes_count = 500.
+int MAX_FVGS  = 40
+int MAX_IFVGS = 20
+int MAX_OBS   = 20
+
+// How many bars after the MSS bar a zone may still be credited to the MSS
+// displacement leg. An FVG completes on its THIRD candle, so a gap left by the
+// breaking bar itself is only recorded one or two bars later.
+int MSS_LEG_GRACE_BARS = 2
 
 // Stage-2 drawing budget. Labels are recycled oldest-first so the script can
 // never approach the 500-object ceiling.
@@ -1303,6 +1409,761 @@ plotshape(showSweepMarkers ? sweepDnMarkPx : na, title = "Sell-side sweep",
      color = color.new(colSellSide, 0), size = size.tiny)
 
 // =============================================================================
+// SECTION K (STAGE 3): ZONE TYPES AND SHARED HELPERS
+// =============================================================================
+
+// --- FAIR VALUE GAP ----------------------------------------------------------
+// ce       : midpoint. The level stage 5 keys on.
+// inverted : this gap has already spawned an inverse FVG. Latch so one gap can
+//            never produce two of them.
+// bx/ceLn  : its drawing objects, carried on the record as stage 1 does.
+type FVG
+    float top
+    float bottom
+    float ce
+    bool  bullish
+    int   createdBar
+    int   expiresBar
+    int   state
+    bool  inverted
+    box   bx   = na
+    line  ceLn = na
+
+// --- INVERSE FVG -------------------------------------------------------------
+// DESIGN DECISION: a SEPARATE TYPE, not a flag on FVG.
+// A flag would leave one object simultaneously INVALIDATED as an FVG and FRESH
+// as an IFVG, holding two polarities and two expiry clocks at once -- a state
+// machine with two heads, where every consumer has to remember to apply the
+// polarity flip or read the right clock. Splitting them keeps each record's
+// invariants true of itself: the dead FVG stays an honest record of what
+// failed, and the IFVG starts a clean life with its own age limit.
+type IFVG
+    float top
+    float bottom
+    float ce
+    bool  bullish        // ALREADY FLIPPED relative to the parent gap
+    int   createdBar
+    int   expiresBar
+    int   state
+    box   bx = na
+
+// --- ORDER BLOCK -------------------------------------------------------------
+// mitigated : price returned into the zone AND closed back on the correct side,
+//             i.e. it was defended at least once.
+// fromMss   : created by an MSS rather than a plain BOS. Recorded at creation
+//             because provenance cannot be recovered later.
+type OB
+    float top
+    float bottom
+    bool  bullish
+    int   anchorBar
+    int   createdBar
+    int   expiresBar
+    int   state
+    bool  mitigated
+    bool  fromMss
+    box   bx = na
+
+// --- UNIFIED POINT OF INTEREST -----------------------------------------------
+// The ONE thing stage 5 queries. kind is diagnostic only: an FVG and an order
+// block left by the same displacement leg are the same observation seen twice,
+// and scoring both would pay the model twice for one piece of evidence.
+// inOte / fromMssLeg are surfaced because bestPOI ranks on them and stage 5
+// may want to explain its own score.
+type POI
+    float  top
+    float  bottom
+    float  ce
+    bool   bullish
+    string kind          // "FVG" / "IFVG" / "OB" / "BREAKER"
+    float  quality       // 0-1, see f_poiQuality
+    int    sourceBar
+    bool   inOte
+    bool   fromMssLeg
+
+var array<FVG>  fvgs    = array.new<FVG>()
+var array<IFVG> ifvgs   = array.new<IFVG>()
+var array<OB>   obs     = array.new<OB>()
+var array<POI>  poiBook = array.new<POI>()
+
+// How often a newly created zone landed on top of an existing zone of the other
+// kind. Surfaced in the debug table -- see the notes on collinearity above.
+var int fvgObCoincidenceCount = 0
+
+// --- shared: retire a zone's drawings ---------------------------------------
+// Fade rather than delete, for the same reason retired liquidity pools stay on
+// the chart: where a zone failed is information.
+f_retireBox(box bx) =>
+    if not na(bx) and fadeInvalidated
+        box.set_extend(bx, extend.none)
+        box.set_right(bx, bar_index)
+        box.set_bgcolor(bx, color.new(colDead, 90))
+        box.set_border_color(bx, color.new(colDead, 55))
+    if not na(bx) and not fadeInvalidated
+        box.delete(bx)
+
+f_retireLine(line ln) =>
+    if not na(ln) and fadeInvalidated
+        line.set_extend(ln, extend.none)
+        line.set_x2(ln, bar_index)
+        line.set_color(ln, color.new(colDead, 70))
+    if not na(ln) and not fadeInvalidated
+        line.delete(ln)
+
+// --- shared: caps, oldest first ----------------------------------------------
+f_capFvgs() =>
+    while array.size(fvgs) > MAX_FVGS
+        FVG g = array.shift(fvgs)
+        if not na(g.bx)
+            box.delete(g.bx)
+        if not na(g.ceLn)
+            line.delete(g.ceLn)
+
+f_capIfvgs() =>
+    while array.size(ifvgs) > MAX_IFVGS
+        IFVG g = array.shift(ifvgs)
+        if not na(g.bx)
+            box.delete(g.bx)
+
+f_capObs() =>
+    while array.size(obs) > MAX_OBS
+        OB o = array.shift(obs)
+        if not na(o.bx)
+            box.delete(o.bx)
+
+// --- shared: interval intersection with a tolerance --------------------------
+f_poiTol() =>
+    float t = poiOverlapTolTicks * syminfo.mintick
+    t
+
+f_zonesOverlap(float t1, float b1, float t2, float b2, float tol) =>
+    bool r = (b1 - tol) <= t2 and (t1 + tol) >= b2
+    r
+
+// --- shared: does this zone sit on top of a live zone of the other kind? -----
+f_fvgCoincidesWithOb(float top, float bottom, bool bullish) =>
+    bool r = false
+    float tol = f_poiTol()
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            OB o = array.get(obs, i)
+            if not r and o.state <= ST_CE_TAGGED and o.bullish == bullish and f_zonesOverlap(top, bottom, o.top, o.bottom, tol)
+                r := true
+    r
+
+f_obCoincidesWithFvg(float top, float bottom, bool bullish) =>
+    bool r = false
+    float tol = f_poiTol()
+    if array.size(fvgs) > 0
+        for i = 0 to array.size(fvgs) - 1
+            FVG g = array.get(fvgs, i)
+            if not r and g.state <= ST_CE_TAGGED and g.bullish == bullish and f_zonesOverlap(top, bottom, g.top, g.bottom, tol)
+                r := true
+    r
+
+// =============================================================================
+// SECTION L (STAGE 3): FAIR VALUE GAPS + INVERSE FVGs
+// A three-candle imbalance: the wick of candle 1 and the wick of candle 3 never
+// met, so a band of price was skipped. On its own that is just a printing
+// artefact, which is why the middle candle is required to be displacement --
+// then the gap is the signature of someone lifting through the book.
+// =============================================================================
+
+f_fvgMinSize() =>
+    float tTicks = fvgMinTicks * syminfo.mintick
+    float tAtr   = fvgMinAtrMult * nz(atr)
+    float res    = switch fvgMinMode
+        "Ticks" => tTicks
+        "ATR"   => tAtr
+        => math.max(tTicks, tAtr)
+    res
+
+if barstate.isconfirmed
+    // ---- 1. STATE MACHINE for existing gaps ---------------------------------
+    // Runs before creation, so a gap can never be created and transitioned on
+    // the same bar off its own third candle.
+    if array.size(fvgs) > 0
+        for i = 0 to array.size(fvgs) - 1
+            FVG g = array.get(fvgs, i)
+
+            // Expiry applies to any gap that has not already aged out, including
+            // INVALIDATED ones -- otherwise a dead gap would linger forever as
+            // an inverse-FVG candidate.
+            if g.state != ST_EXPIRED and bar_index > g.expiresBar
+                if g.state <= ST_CE_TAGGED
+                    f_retireBox(g.bx)
+                    f_retireLine(g.ceLn)
+                g.state := ST_EXPIRED
+
+            // Live transitions. Invalidation is tested first: once the gap has
+            // failed, a touch or CE tag on the same bar is meaningless.
+            if g.state <= ST_CE_TAGGED
+                bool inval = false
+                if g.bullish
+                    inval := fvgInvalidateOn == "Full fill" ? low <= g.bottom :
+                             fvgInvalidateOn == "CE breach" ? low <= g.ce : close < g.bottom
+                if not g.bullish
+                    inval := fvgInvalidateOn == "Full fill" ? high >= g.top :
+                             fvgInvalidateOn == "CE breach" ? high >= g.ce : close > g.top
+
+                if inval
+                    g.state := ST_INVALIDATED
+                    f_retireBox(g.bx)
+                    f_retireLine(g.ceLn)
+
+                // Touch / CE tag, most advanced first so one bar can jump two
+                // states. State only ever moves forward.
+                if not inval and g.bullish and low <= g.ce and g.state < ST_CE_TAGGED
+                    g.state := ST_CE_TAGGED
+                if not inval and g.bullish and low <= g.top and g.state < ST_TOUCHED
+                    g.state := ST_TOUCHED
+                if not inval and not g.bullish and high >= g.ce and g.state < ST_CE_TAGGED
+                    g.state := ST_CE_TAGGED
+                if not inval and not g.bullish and high >= g.bottom and g.state < ST_TOUCHED
+                    g.state := ST_TOUCHED
+
+            // ---- 2. INVERSE FVG conversion -----------------------------------
+            // Deliberately evaluated even when the gap is ALREADY invalidated:
+            // under "Full fill" a wick can kill the gap on one bar while the
+            // decisive body close arrives a bar or two later, and that close is
+            // the event that flips polarity. The `inverted` latch keeps it to
+            // one conversion per gap.
+            if not g.inverted and g.state != ST_EXPIRED
+                bool through = false
+                if g.bullish
+                    through := ifvgRequireCloseThrough ? close < g.bottom : low < g.bottom
+                if not g.bullish
+                    through := ifvgRequireCloseThrough ? close > g.top : high > g.top
+                if through
+                    g.inverted := true
+                    if g.state <= ST_CE_TAGGED
+                        g.state := ST_INVALIDATED
+                        f_retireBox(g.bx)
+                        f_retireLine(g.ceLn)
+                    // Same coordinates, OPPOSITE polarity: a failed bearish gap
+                    // is now support, a failed bullish gap is now resistance.
+                    bool ivBull = not g.bullish
+                    IFVG iv = IFVG.new(top = g.top, bottom = g.bottom, ce = g.ce,
+                             bullish = ivBull, createdBar = bar_index,
+                             expiresBar = bar_index + ifvgMaxAgeBars, state = ST_FRESH)
+                    if showIFVG
+                        color ic = ivBull ? colIfvgBull : colIfvgBear
+                        iv.bx := box.new(bar_index, g.top, bar_index + 1, g.bottom,
+                                 xloc = xloc.bar_index, extend = extend.right,
+                                 bgcolor = color.new(ic, 88),
+                                 border_color = color.new(ic, 40),
+                                 border_width = 1, border_style = line.style_solid)
+                    array.push(ifvgs, iv)
+                    f_capIfvgs()
+
+    // ---- 3. CREATION --------------------------------------------------------
+    // Three-candle definition, read off CONFIRMED bars only. bar_index >= 2
+    // guards the history access.
+    if bar_index >= 2
+        float minSz = f_fvgMinSize()
+
+        // Bullish: candle 1's high never met candle 3's low.
+        bool bullGap = high[2] < low
+        if bullGap
+            float gTop = low
+            float gBot = high[2]
+            bool szOk   = (gTop - gBot) >= minSz
+            bool dispOk = not fvgRequireDisplacement or isDisplacementUp[1]
+            if szOk and dispOk
+                float gCe = (gTop + gBot) / 2
+                bool coi = f_fvgCoincidesWithOb(gTop, gBot, true)
+                if coi
+                    fvgObCoincidenceCount += 1
+                FVG g = FVG.new(top = gTop, bottom = gBot, ce = gCe, bullish = true,
+                         createdBar = bar_index, expiresBar = bar_index + fvgMaxAgeBars,
+                         state = ST_FRESH, inverted = false)
+                if showFVG
+                    g.bx := box.new(bar_index - 2, gTop, bar_index + 1, gBot,
+                             xloc = xloc.bar_index, extend = extend.right,
+                             bgcolor = color.new(colFvgBull, 90),
+                             border_color = color.new(colFvgBull, 55),
+                             border_width = 1, border_style = line.style_dotted)
+                    g.ceLn := line.new(bar_index - 2, gCe, bar_index + 1, gCe,
+                             xloc = xloc.bar_index, extend = extend.right,
+                             color = color.new(colFvgBull, 35),
+                             style = line.style_dashed, width = 1)
+                array.push(fvgs, g)
+                f_capFvgs()
+
+        // Bearish: candle 1's low never met candle 3's high.
+        bool bearGap = low[2] > high
+        if bearGap
+            float gTopB = low[2]
+            float gBotB = high
+            bool szOkB   = (gTopB - gBotB) >= minSz
+            bool dispOkB = not fvgRequireDisplacement or isDisplacementDown[1]
+            if szOkB and dispOkB
+                float gCeB = (gTopB + gBotB) / 2
+                bool coiB = f_fvgCoincidesWithOb(gTopB, gBotB, false)
+                if coiB
+                    fvgObCoincidenceCount += 1
+                FVG gb = FVG.new(top = gTopB, bottom = gBotB, ce = gCeB, bullish = false,
+                         createdBar = bar_index, expiresBar = bar_index + fvgMaxAgeBars,
+                         state = ST_FRESH, inverted = false)
+                if showFVG
+                    gb.bx := box.new(bar_index - 2, gTopB, bar_index + 1, gBotB,
+                             xloc = xloc.bar_index, extend = extend.right,
+                             bgcolor = color.new(colFvgBear, 90),
+                             border_color = color.new(colFvgBear, 55),
+                             border_width = 1, border_style = line.style_dotted)
+                    gb.ceLn := line.new(bar_index - 2, gCeB, bar_index + 1, gCeB,
+                             xloc = xloc.bar_index, extend = extend.right,
+                             color = color.new(colFvgBear, 35),
+                             style = line.style_dashed, width = 1)
+                array.push(fvgs, gb)
+                f_capFvgs()
+
+    // ---- 4. INVERSE FVG state machine ---------------------------------------
+    // Simpler than the gap it came from: an IFVG is a level that already proved
+    // it flips, so it only tracks touch, CE tag, close-through death and age.
+    if array.size(ifvgs) > 0
+        for i = 0 to array.size(ifvgs) - 1
+            IFVG iv = array.get(ifvgs, i)
+            if iv.state != ST_EXPIRED and bar_index > iv.expiresBar
+                if iv.state <= ST_CE_TAGGED
+                    f_retireBox(iv.bx)
+                iv.state := ST_EXPIRED
+            if iv.state <= ST_CE_TAGGED
+                bool ivDead = iv.bullish ? close < iv.bottom : close > iv.top
+                if ivDead
+                    iv.state := ST_INVALIDATED
+                    f_retireBox(iv.bx)
+                if not ivDead and iv.bullish and low <= iv.ce and iv.state < ST_CE_TAGGED
+                    iv.state := ST_CE_TAGGED
+                if not ivDead and iv.bullish and low <= iv.top and iv.state < ST_TOUCHED
+                    iv.state := ST_TOUCHED
+                if not ivDead and not iv.bullish and high >= iv.ce and iv.state < ST_CE_TAGGED
+                    iv.state := ST_CE_TAGGED
+                if not ivDead and not iv.bullish and high >= iv.bottom and iv.state < ST_TOUCHED
+                    iv.state := ST_TOUCHED
+
+// =============================================================================
+// SECTION M (STAGE 3): ORDER BLOCKS / BREAKERS
+// DISPLACEMENT-ANCHORED definition. Not "the last down candle before an up
+// move", which fires on every second bar and means nothing. A block only
+// exists if the leg that left it BROKE STRUCTURE.
+//
+// ANTI-REPAINT, INHERITED: creation is triggered by stage 2's BOS/MSS events.
+// Those fire only inside `if barstate.isconfirmed`, and only against
+// lastConfirmedSwingHigh / lastConfirmedSwingLow, which stage 1 writes only on
+// a pivot CONFIRMATION bar -- pivotLen bars after the pivot itself. So an order
+// block can never be anchored to a leg whose break was not already public
+// knowledge at the close of the bar that created it. The backward hunt for the
+// anchor candle reads close[k]/open[k], which are settled history.
+// =============================================================================
+
+if barstate.isconfirmed
+    // ---- 1. STATE MACHINE ---------------------------------------------------
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            OB o = array.get(obs, i)
+
+            if o.state != ST_EXPIRED and bar_index > o.expiresBar
+                if o.state <= ST_CE_TAGGED or o.state == ST_BREAKER
+                    f_retireBox(o.bx)
+                o.state := ST_EXPIRED
+
+            if o.state <= ST_CE_TAGGED
+                // A body close beyond the far edge does not merely kill the
+                // block, it INVERTS it: the orders that were supposed to defend
+                // this level are now trapped on the wrong side.
+                bool through = o.bullish ? close < o.bottom : close > o.top
+                bool flips   = obInvalidateOnCloseThrough and through
+                if flips
+                    o.state := ST_BREAKER
+                    if not na(o.bx)
+                        box.set_bgcolor(o.bx, color.new(colBreaker, 88))
+                        box.set_border_color(o.bx, color.new(colBreaker, 35))
+                        box.set_border_style(o.bx, line.style_dashed)
+
+                // Mitigation: price came back INTO the zone and still closed on
+                // the correct side of it. Entering and closing straight through
+                // is not a defence, it is a failure, and that is the branch
+                // above.
+                bool entered = low <= o.top and high >= o.bottom
+                bool reacted = entered and (o.bullish ? close > o.bottom : close < o.top)
+                if not flips and entered and o.state < ST_TOUCHED
+                    o.state := ST_TOUCHED
+                if not flips and reacted
+                    o.mitigated := true
+
+    // ---- 2. CREATION on a confirmed structure break -------------------------
+    bool structNow  = not na(lastStructBar) and lastStructBar == bar_index
+    bool structIsBrk = lastStructType == "BOS" or lastStructType == "MSS"
+    if structNow and structIsBrk
+        bool upBreak = lastStructDir > 0
+        // Hunt back for the LAST opposing candle before the leg. k starts at 1
+        // so the breaking bar itself is never the anchor: the block has to
+        // precede the leg, not be part of it.
+        int anchorK = -1
+        for k = 1 to obLookbackForAnchor
+            if anchorK < 0
+                bool opposing = upBreak ? (close[k] < open[k]) : (close[k] > open[k])
+                if opposing
+                    anchorK := k
+        if anchorK >= 0
+            float aTop = obUseWholeCandle ? high[anchorK] : math.max(open[anchorK], close[anchorK])
+            float aBot = obUseWholeCandle ? low[anchorK]  : math.min(open[anchorK], close[anchorK])
+            if aTop > aBot
+                bool coiOb = f_obCoincidesWithFvg(aTop, aBot, upBreak)
+                if coiOb
+                    fvgObCoincidenceCount += 1
+                OB o = OB.new(top = aTop, bottom = aBot, bullish = upBreak,
+                         anchorBar = bar_index - anchorK, createdBar = bar_index,
+                         expiresBar = bar_index + obMaxAgeBars, state = ST_FRESH,
+                         mitigated = false, fromMss = lastStructType == "MSS")
+                if showOB
+                    color oc = upBreak ? colObBull : colObBear
+                    o.bx := box.new(bar_index - anchorK, aTop, bar_index + 1, aBot,
+                             xloc = xloc.bar_index, extend = extend.right,
+                             bgcolor = color.new(oc, 90),
+                             border_color = color.new(oc, 30),
+                             border_width = 2, border_style = line.style_solid)
+                array.push(obs, o)
+                f_capObs()
+
+// =============================================================================
+// SECTION N (STAGE 3): DEALING RANGE, PREMIUM / DISCOUNT, OTE
+// The dealing range is NOT an arbitrary swing-to-swing box. It is defined by
+// the setup itself: from the liquidity that was taken (the sweep extreme) to
+// where the leg that broke structure ran out (the leg terminus). Everything
+// below 50% of that range is discount, everything above is premium, and the
+// OTE band is the slice of the retracement where an entry gets paid for the
+// move that already happened.
+// =============================================================================
+
+var float drLow    = na
+var float drHigh   = na
+var bool  drIsLong = false
+var int   drBar    = na
+
+// Running leg extreme since each side's most recent sweep. This is how we name
+// the leg terminus WITHOUT a variable-length ta.highest(), which would have to
+// be called unconditionally on every bar to keep its history correct and would
+// still be measuring the wrong window whenever a new sweep landed.
+var float legHighSinceSellSweep = na
+var float legLowSinceBuySweep   = na
+
+// The most recent MSS and the bar its breaking leg started from. Used by the
+// POI ranking to prefer zones the MSS leg actually created.
+var int lastMssBar      = na
+var int lastMssLegStart = na
+
+if barstate.isconfirmed
+    Sweep swSell = getLiveSweep(false)
+    Sweep swBuy  = getLiveSweep(true)
+    bool sellSweepNow = not na(swSell) and swSell.confirmBarIdx == bar_index
+    bool buySweepNow  = not na(swBuy)  and swBuy.confirmBarIdx  == bar_index
+
+    if sellSweepNow
+        legHighSinceSellSweep := high
+    if not sellSweepNow and not na(legHighSinceSellSweep)
+        legHighSinceSellSweep := math.max(legHighSinceSellSweep, high)
+    if buySweepNow
+        legLowSinceBuySweep := low
+    if not buySweepNow and not na(legLowSinceBuySweep)
+        legLowSinceBuySweep := math.min(legLowSinceBuySweep, low)
+
+    // ---- Define the range when an MSS pairs with a sweep ---------------------
+    bool mssNow = not na(lastStructBar) and lastStructBar == bar_index and lastStructType == "MSS"
+
+    if mssNow and lastStructDir > 0
+        lastMssBar      := bar_index
+        lastMssLegStart := brokenSwingHighBar
+    if mssNow and lastStructDir < 0
+        lastMssBar      := bar_index
+        lastMssLegStart := brokenSwingLowBar
+
+    // LONG setup: sell-side liquidity taken, then a bullish MSS. Range runs
+    // from the swept low up to the terminus of the leg that broke structure.
+    if mssNow and lastStructDir > 0 and not na(swSell) and swSell.mssConfirmed and not na(legHighSinceSellSweep)
+        if legHighSinceSellSweep > swSell.sweepExtreme
+            drLow    := swSell.sweepExtreme
+            drHigh   := legHighSinceSellSweep
+            drIsLong := true
+            drBar    := bar_index
+
+    // SHORT setup: mirror.
+    if mssNow and lastStructDir < 0 and not na(swBuy) and swBuy.mssConfirmed and not na(legLowSinceBuySweep)
+        if swBuy.sweepExtreme > legLowSinceBuySweep
+            drHigh   := swBuy.sweepExtreme
+            drLow    := legLowSinceBuySweep
+            drIsLong := false
+            drBar    := bar_index
+
+    // ---- Maintain / kill the range ------------------------------------------
+    // A live leg EXTENDS its range: if price keeps making highs on a long
+    // setup, the leg is still the leg and the OTE band re-anchors to it. The
+    // range only dies when its PREMISE dies -- a close back beyond the swept
+    // extreme -- or when it simply gets too old to mean anything.
+    if not na(drLow) and not na(drHigh) and not na(drBar)
+        bool drDead = bar_index - drBar > drMaxAgeBars
+        if drIsLong and close < drLow
+            drDead := true
+        if not drIsLong and close > drHigh
+            drDead := true
+        if not drDead and drIsLong
+            drHigh := math.max(drHigh, high)
+        if not drDead and not drIsLong
+            drLow := math.min(drLow, low)
+        if drDead
+            drLow  := na
+            drHigh := na
+            drBar  := na
+
+// ---- Derived levels, recomputed every bar from confirmed state --------------
+// These sit OUTSIDE the confirmed block on purpose: they are pure functions of
+// drLow/drHigh, which only ever change on a confirmed bar, so reading them on
+// the live bar returns the last confirmed geometry rather than something that
+// moves intrabar.
+float drRange = na(drLow) or na(drHigh) ? na : drHigh - drLow
+float drEq    = na(drRange) ? na : (drHigh + drLow) / 2
+
+// OTE band for a LONG: a retracement DOWN from the leg high, so oteHigh (0.79)
+// gives the LOWER price. For a SHORT: a retracement UP from the leg low.
+float oteLongLo  = na(drRange) ? na : drHigh - drRange * oteHigh
+float oteLongHi  = na(drRange) ? na : drHigh - drRange * oteLow
+float oteShortLo = na(drRange) ? na : drLow  + drRange * oteLow
+float oteShortHi = na(drRange) ? na : drLow  + drRange * oteHigh
+
+// The classic 0.705 sweet spot, drawn for whichever direction the range is.
+float ote62  = na(drRange) ? na : (drIsLong ? drHigh - drRange * oteLow  : drLow + drRange * oteLow)
+float ote705 = na(drRange) ? na : (drIsLong ? drHigh - drRange * 0.705   : drLow + drRange * 0.705)
+float ote79  = na(drRange) ? na : (drIsLong ? drHigh - drRange * oteHigh : drLow + drRange * oteHigh)
+
+// ---- PUBLIC accessors -------------------------------------------------------
+// drLow / drHigh are na when no range is defined; the booleans return false
+// rather than na, because "no range" must never read as a permissive signal.
+hasDealingRange() =>
+    bool r = not na(drLow) and not na(drHigh)
+    r
+
+inDiscount() =>
+    bool r = false
+    if not na(drEq)
+        r := close < drEq
+    r
+
+inPremium() =>
+    bool r = false
+    if not na(drEq)
+        r := close > drEq
+    r
+
+inOTE(bool isLong) =>
+    bool r = false
+    if not na(drRange)
+        float lo = isLong ? oteLongLo : oteShortLo
+        float hi = isLong ? oteLongHi : oteShortHi
+        r := close >= lo and close <= hi
+        if oteRequireCorrectSide and isLong
+            r := r and close < drEq
+        if oteRequireCorrectSide and not isLong
+            r := r and close > drEq
+    r
+
+// =============================================================================
+// SECTION O (STAGE 3): THE UNIFIED POI API
+//
+// WHY THIS EXISTS: a displacement leg that breaks structure normally leaves an
+// order block AND a fair value gap, anchored to adjacent candles, covering
+// almost the same prices. They are not two independent confirmations. They are
+// one event observed twice. Stage 5 therefore gets ONE query -- bestPOI() --
+// worth ONE component, and the overlap is expressed as a QUALITY BONUS rather
+// than a second score line.
+//
+// ELIGIBILITY (what counts as unmitigated):
+//   FVG / IFVG : state FRESH or TOUCHED. A CE tag is the gap's mitigation --
+//                you do not enter at a level price has already visited and left.
+//   OB         : state up to CE_TAGGED and not yet mitigated.
+//   BREAKER    : state BREAKER, polarity INVERTED from the original block.
+// =============================================================================
+
+// Does this zone intersect the OTE band for its own direction?
+f_zoneInOte(float top, float bottom, bool bullish) =>
+    bool r = false
+    float lo = bullish ? oteLongLo : oteShortLo
+    float hi = bullish ? oteLongHi : oteShortHi
+    if not na(lo) and not na(hi)
+        r := bottom <= hi and top >= lo
+    r
+
+// Was this zone created by the displacement leg of the most recent MSS?
+f_fromMssLeg(int srcBar) =>
+    bool r = false
+    if not na(lastMssBar) and not na(lastMssLegStart)
+        r := srcBar >= lastMssLegStart and srcBar <= lastMssBar + MSS_LEG_GRACE_BARS
+    r
+
+// --- QUALITY, 0.40 to 1.00 ---------------------------------------------------
+// base       0.40  A valid, unmitigated, correctly-polarised zone is real
+//                  evidence on its own. Stage 5's 2-point POI component must
+//                  not collapse to zero just because the location is ordinary.
+// + OTE      0.25  The largest bonus, because WHERE the zone sits is the
+//                  strongest independent filter available: a long POI sitting
+//                  in premium is a worse entry no matter how it was formed.
+// + MSS leg  0.20  Provenance. A zone left by the leg that actually broke
+//                  structure is where the initiating orders sat. Weighted
+//                  below OTE because it is partly correlated with it -- MSS-leg
+//                  zones often land in the OTE band anyway -- and correlated
+//                  evidence must not stack at full weight.
+// + overlap  0.15  The SMALLEST bonus, deliberately. FVG/OB coincidence is the
+//                  most collinear of the three: both are products of the same
+//                  displacement leg. It is confirming, so it earns something,
+//                  but treating it as a full extra factor would reintroduce the
+//                  double-count this whole section exists to prevent.
+f_poiQuality(bool inOte, bool fromMss, bool coincident) =>
+    float q = 0.40
+    if inOte
+        q += 0.25
+    if fromMss
+        q += 0.20
+    if coincident
+        q += 0.15
+    q
+
+// --- Rebuild the book on every confirmed bar ---------------------------------
+// Rebuilt rather than incrementally maintained because quality depends on the
+// OTE band and the current MSS leg, both of which move. Rebuilding on confirmed
+// bars only means a live-bar query returns the last confirmed book, which is
+// exactly the anti-repaint behaviour we want.
+if barstate.isconfirmed
+    array.clear(poiBook)
+
+    if array.size(fvgs) > 0
+        for i = 0 to array.size(fvgs) - 1
+            FVG g = array.get(fvgs, i)
+            if g.state <= ST_TOUCHED
+                bool ote = f_zoneInOte(g.top, g.bottom, g.bullish)
+                bool mss = f_fromMssLeg(g.createdBar)
+                bool coi = f_fvgCoincidesWithOb(g.top, g.bottom, g.bullish)
+                array.push(poiBook, POI.new(top = g.top, bottom = g.bottom, ce = g.ce,
+                         bullish = g.bullish, kind = "FVG",
+                         quality = f_poiQuality(ote, mss, coi), sourceBar = g.createdBar,
+                         inOte = ote, fromMssLeg = mss))
+
+    if array.size(ifvgs) > 0
+        for i = 0 to array.size(ifvgs) - 1
+            IFVG iv = array.get(ifvgs, i)
+            if iv.state <= ST_TOUCHED
+                bool oteI = f_zoneInOte(iv.top, iv.bottom, iv.bullish)
+                bool mssI = f_fromMssLeg(iv.createdBar)
+                bool coiI = f_fvgCoincidesWithOb(iv.top, iv.bottom, iv.bullish)
+                array.push(poiBook, POI.new(top = iv.top, bottom = iv.bottom, ce = iv.ce,
+                         bullish = iv.bullish, kind = "IFVG",
+                         quality = f_poiQuality(oteI, mssI, coiI), sourceBar = iv.createdBar,
+                         inOte = oteI, fromMssLeg = mssI))
+
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            OB o = array.get(obs, i)
+            float oCe = (o.top + o.bottom) / 2
+            // Live block, original polarity.
+            if o.state <= ST_CE_TAGGED and not o.mitigated
+                bool oteO = f_zoneInOte(o.top, o.bottom, o.bullish)
+                bool mssO = o.fromMss or f_fromMssLeg(o.anchorBar)
+                bool coiO = f_obCoincidesWithFvg(o.top, o.bottom, o.bullish)
+                array.push(poiBook, POI.new(top = o.top, bottom = o.bottom, ce = oCe,
+                         bullish = o.bullish, kind = "OB",
+                         quality = f_poiQuality(oteO, mssO, coiO), sourceBar = o.anchorBar,
+                         inOte = oteO, fromMssLeg = mssO))
+            // Failed block, INVERTED polarity.
+            if o.state == ST_BREAKER
+                bool bkBull = not o.bullish
+                bool oteB = f_zoneInOte(o.top, o.bottom, bkBull)
+                bool mssB = f_fromMssLeg(o.anchorBar)
+                bool coiB = f_obCoincidesWithFvg(o.top, o.bottom, bkBull)
+                array.push(poiBook, POI.new(top = o.top, bottom = o.bottom, ce = oCe,
+                         bullish = bkBull, kind = "BREAKER",
+                         quality = f_poiQuality(oteB, mssB, coiB), sourceBar = o.anchorBar,
+                         inOte = oteB, fromMssLeg = mssB))
+
+// --- PUBLIC: the single query stage 5 makes ----------------------------------
+// Ranking is strictly lexicographic, matching the stated order:
+//   1. polarity + eligibility  (already applied when the book was built)
+//   2. intersects the OTE band
+//   3. created by the most recent MSS leg
+//   4. nearest to px
+// rank = 2*inOte + 1*fromMssLeg reproduces 2-then-3 exactly, because an OTE
+// hit alone (2) outranks an MSS-leg hit alone (1).
+bestPOI(bool isLong, float px) =>
+    POI best = na
+    if array.size(poiBook) > 0
+        for i = 0 to array.size(poiBook) - 1
+            POI c = array.get(poiBook, i)
+            if c.bullish == isLong
+                if na(best)
+                    best := c
+                if not na(best)
+                    int cRank = (c.inOte ? 2 : 0) + (c.fromMssLeg ? 1 : 0)
+                    int bRank = (best.inOte ? 2 : 0) + (best.fromMssLeg ? 1 : 0)
+                    bool better = false
+                    if cRank > bRank
+                        better := true
+                    if cRank == bRank and math.abs(c.ce - px) < math.abs(best.ce - px)
+                        better := true
+                    if better
+                        best := c
+    best
+
+// =============================================================================
+// SECTION P (STAGE 3): OTE VISUALS
+// Only the LIVE dealing range is drawn. A dealing range is a claim about right
+// now; once its premise is dead, leaving the band on the chart would suggest a
+// context that no longer exists. The numbers stay in the debug table.
+// Cost is fixed: one box and three lines, reused, never accumulated.
+// =============================================================================
+
+var box  oteBx    = na
+var line oteLn62  = na
+var line oteLn705 = na
+var line oteLn79  = na
+
+if barstate.islast
+    bool oteLive = showOTE and not na(drRange) and not na(drBar)
+
+    if oteLive
+        float bandLo = drIsLong ? oteLongLo : oteShortLo
+        float bandHi = drIsLong ? oteLongHi : oteShortHi
+        if na(oteBx)
+            oteBx := box.new(drBar, bandHi, bar_index, bandLo, xloc = xloc.bar_index,
+                     extend = extend.right, bgcolor = color.new(colOte, 90),
+                     border_color = color.new(colOte, 45), border_width = 1,
+                     border_style = line.style_dashed)
+            oteLn62  := line.new(drBar, ote62,  bar_index, ote62,  xloc = xloc.bar_index,
+                     extend = extend.right, color = color.new(colOte, 55), style = line.style_dotted)
+            oteLn705 := line.new(drBar, ote705, bar_index, ote705, xloc = xloc.bar_index,
+                     extend = extend.right, color = color.new(colOte, 15), style = line.style_solid)
+            oteLn79  := line.new(drBar, ote79,  bar_index, ote79,  xloc = xloc.bar_index,
+                     extend = extend.right, color = color.new(colOte, 55), style = line.style_dotted)
+        if not na(oteBx)
+            box.set_left(oteBx, drBar)
+            box.set_right(oteBx, bar_index)
+            box.set_top(oteBx, bandHi)
+            box.set_bottom(oteBx, bandLo)
+            line.set_xy1(oteLn62,  drBar, ote62)
+            line.set_xy2(oteLn62,  bar_index, ote62)
+            line.set_xy1(oteLn705, drBar, ote705)
+            line.set_xy2(oteLn705, bar_index, ote705)
+            line.set_xy1(oteLn79,  drBar, ote79)
+            line.set_xy2(oteLn79,  bar_index, ote79)
+
+    if not oteLive and not na(oteBx)
+        box.delete(oteBx)
+        line.delete(oteLn62)
+        line.delete(oteLn705)
+        line.delete(oteLn79)
+        oteBx    := na
+        oteLn62  := na
+        oteLn705 := na
+        oteLn79  := na
+
+// =============================================================================
 // SECTION E: DEBUG TABLE
 // The stage-1 verification surface. Everything here is read from confirmed
 // state, so if a number looks wrong the state is wrong, not the display.
@@ -1360,11 +2221,55 @@ f_sweepRatioStr(int swept, int broke, int upg) =>
     s := s + "  upg " + str.tostring(upg)
     s
 
+// ---- stage-3 table helpers --------------------------------------------------
+f_countFvgActive(bool bullish) =>
+    int n = 0
+    if array.size(fvgs) > 0
+        for i = 0 to array.size(fvgs) - 1
+            FVG g = array.get(fvgs, i)
+            if g.state <= ST_CE_TAGGED and g.bullish == bullish
+                n += 1
+    n
+
+f_countIfvgActive() =>
+    int n = 0
+    if array.size(ifvgs) > 0
+        for i = 0 to array.size(ifvgs) - 1
+            if array.get(ifvgs, i).state <= ST_CE_TAGGED
+                n += 1
+    n
+
+f_countObState(bool breakers) =>
+    int n = 0
+    if array.size(obs) > 0
+        for i = 0 to array.size(obs) - 1
+            OB o = array.get(obs, i)
+            if breakers and o.state == ST_BREAKER
+                n += 1
+            if not breakers and o.state <= ST_CE_TAGGED
+                n += 1
+    n
+
+// "23150.25 - 23198.50  LONG" or "none".
+f_drStr() =>
+    string s = "none"
+    if not na(drLow) and not na(drHigh)
+        s := str.tostring(drLow, format.mintick) + " - " + str.tostring(drHigh, format.mintick)
+        s := s + (drIsLong ? "  LONG" : "  SHORT")
+    s
+
+// "FVG @ 23172.75  q 0.85" or "none".
+f_bestPoiStr(POI p) =>
+    string s = "none"
+    if not na(p)
+        s := p.kind + " @ " + str.tostring(p.ce, format.mintick) + "  q " + str.tostring(p.quality, "#.00")
+    s
+
 var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 25,
+        dbg := table.new(position.top_right, 2, 33,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
@@ -1391,7 +2296,7 @@ if barstate.islast and showDebugTable
                      "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
                      "  act " + str.tostring(activePoolCount())
 
-    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 2", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 3", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
@@ -1474,6 +2379,37 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 24, "Sweep : breakout", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount, sweepUpgradeCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
+    // ---- STAGE 3 ROWS --------------------------------------------------------
+    POI poiLong  = bestPOI(true,  close)
+    POI poiShort = bestPOI(false, close)
+    string oteNowStr = inOTE(true) ? "LONG" : inOTE(false) ? "SHORT" : "no"
+    if not hasDealingRange()
+        oteNowStr := "no range"
+
+    table.cell(dbg, 0, 25, "S3 FVG b/s", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 25, str.tostring(f_countFvgActive(true)) + " bull / " + str.tostring(f_countFvgActive(false)) + " bear", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 26, "IFVG active", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 26, str.tostring(f_countIfvgActive()), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 27, "OB / breaker", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 27, str.tostring(f_countObState(false)) + " / " + str.tostring(f_countObState(true)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 28, "Dealing range", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 28, f_drStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 29, "In OTE now", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 29, oteNowStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 30, "bestPOI long", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 30, f_bestPoiStr(poiLong), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 31, "bestPOI short", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 31, f_bestPoiStr(poiShort), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 32, "FVG+OB overlap", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 32, str.tostring(fvgObCoincidenceCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
     table.delete(dbg)
@@ -1494,7 +2430,15 @@ if barstate.islast and not showDebugTable and not na(dbg)
 //   structBias, lastStructType / lastStructDir / lastStructBar
 //   lastBreakoutDir, sweepConfirmedCount, breakoutRejectedCount
 
-// ===== STAGE 3: FVG / IFVG / ORDER BLOCKS / OTE =====
+// ===== STAGE 3: FVG / IFVG / ORDER BLOCKS / OTE ===== IMPLEMENTED
+// Lives above the debug table, as sections K / L / M / N / O / P.
+// Stage-3 API now available to later stages:
+//   bestPOI(isLong, px) -> POI     THE single query. One component, not two.
+//   poiBook (array<POI>), rebuilt on every confirmed bar
+//   hasDealingRange(), inDiscount(), inPremium(), inOTE(isLong)
+//   drLow / drHigh / drEq / drIsLong, na when no range is defined
+//   fvgs / ifvgs / obs arrays and the ST_* state enum
+//   fvgObCoincidenceCount
 
 // ===== STAGE 4: SMT DIVERGENCE (MNQ vs ES) =====
 
