@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-// MNQ ICT CONFLUENCE  --  STAGE 3 of 6: FVG / IFVG / ORDER BLOCKS / OTE
+// MNQ ICT CONFLUENCE  --  STAGE 4 of 6: SMT DIVERGENCE (MNQ vs ES)
 // -----------------------------------------------------------------------------
 // DISCLAIMER: research/education tool. NOT financial advice. Every level and
 // threshold in here is an untested hypothesis about how MNQ behaves. Trade your
@@ -41,6 +41,10 @@
 //      the underlying kind is retained for diagnostics only.
 //   P. Stage-3 visuals, bounded
 //
+// WHAT STAGE 4 ADDS
+//   Q. SMT divergence against a correlated reference (ES). CONFLUENCE ONLY --
+//      it can never arm a setup by itself, and stage 5 weights it at 1 point.
+//
 // ANTI-REPAINT CONTRACT (holds for every stage of this project)
 //   1. Session membership comes from the bar's OPEN time, which is fixed the
 //      moment the bar prints, so session flags can never repaint.
@@ -61,7 +65,7 @@
 // max_bars_back is raised because stage 3 reads close[k]/open[k] with a SERIES
 // offset when it hunts backwards for an order-block anchor candle. Pine cannot
 // infer the required buffer from a variable offset, so we state it.
-indicator("MNQ ICT Confluence [S3]", shorttitle = "MNQ ICT S3", overlay = true,
+indicator("MNQ ICT Confluence [S4]", shorttitle = "MNQ ICT S4", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
      max_bars_back = 500)
 
@@ -198,6 +202,19 @@ drMaxAgeBars = input.int(120, "Dealing range max age (bars)", minval = 1, maxval
 poiOverlapTolTicks = input.float(4.0, "FVG / OB coincidence tolerance (ticks)", minval = 0.0, step = 0.25, group = grpOte,
      tooltip = "How close an FVG and an order block must sit before they count as the same point of interest.")
 
+// ---- Group: SMT --------------------------------------------------------------
+grpSmt = "SMT"
+
+smtEnabled = input.bool(true, "SMT enabled", group = grpSmt)
+smtSymbol  = input.string("CME_MINI:ES1!", "Correlated reference symbol", group = grpSmt,
+     tooltip = "ES is the natural pair for NQ: same exchange, same session, different index. The request uses ignore_invalid_symbol, so a typo degrades to no signal rather than a script error.")
+smtLookbackBars = input.int(20, "Swing comparison window (bars)", minval = 2, maxval = 200, group = grpSmt,
+     tooltip = "How far apart two confirmed pivots may sit and still be compared. Also how long a detected divergence stays live.")
+smtRequireAtPool = input.bool(true, "Only count divergence at a liquidity pool", group = grpSmt,
+     tooltip = "Divergence in open space is noise. At a mapped pool it is a statement about who is defending that level.")
+smtPoolProxTicks = input.float(12.0, "Pool proximity (ticks)", minval = 0.0, step = 0.25, group = grpSmt,
+     tooltip = "MNQ tick = 0.25 pts, so 12 ticks = 3.0 pts.")
+
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
 
@@ -218,6 +235,9 @@ showOB   = input.bool(true, "Show order blocks",     group = grpDisp)
 showOTE  = input.bool(true, "Show OTE band",         group = grpDisp)
 fadeInvalidated = input.bool(true, "Fade invalidated zones instead of deleting", group = grpDisp,
      tooltip = "Same reasoning as retired liquidity pools: where a zone failed is information.")
+showSMT = input.bool(true, "Show SMT markers", group = grpDisp)
+showHistoricalOTE = input.bool(false, "Keep dead OTE bands (validation mode)", group = grpDisp,
+     tooltip = "Off is correct for live trading: a dealing range is a claim about right now. On is for scrolling back to audit whether the dealing-range logic was right on past setups.")
 
 // =============================================================================
 // CONSTANTS
@@ -289,6 +309,7 @@ color colObBull   = #66bb6a
 color colObBear   = #e57373
 color colBreaker  = #ffb300   // amber, matching the CHoCH "something flipped" idea
 color colOte      = #ab47bc   // same purple as MSS: the OTE band belongs to it
+color colSmt      = #3949ab   // indigo, deliberately unlike the sweep cross
 color colDead     = #9e9e9e   // faded, invalidated or expired
 
 // Stage-3 object budgets. FVG/IFVG/OB boxes plus the single OTE box stay well
@@ -296,6 +317,10 @@ color colDead     = #9e9e9e   // faded, invalidated or expired
 int MAX_FVGS  = 40
 int MAX_IFVGS = 20
 int MAX_OBS   = 20
+
+// How many dead dealing-range bands to keep when showHistoricalOTE is on.
+// Each band costs one box plus three level lines.
+int MAX_OTE_HIST = 12
 
 // How many bars after the MSS bar a zone may still be credited to the MSS
 // displacement leg. An FVG completes on its THIRD candle, so a gap left by the
@@ -1793,6 +1818,18 @@ if barstate.isconfirmed
                     o.mitigated := true
 
     // ---- 2. CREATION on a confirmed structure break -------------------------
+    // WHY CHoCH IS EXCLUDED, and why the exclusion is definitional rather than
+    // a preference: under the displacement-anchored definition an order block
+    // only exists if the leg that left it carried intent. Stage 2 promotes a
+    // CHoCH to MSS exactly when its breaking leg contains displacement, so a
+    // break that is STILL labelled CHoCH is precisely the reversal break that
+    // lacked displacement -- the one case the definition rules out. Admitting
+    // CHoCH here would readmit the sloppy "last opposing candle" behaviour by
+    // the back door.
+    // SELF-CORRECTING: if requireDisplacementForMSS is ever set false, stage 2
+    // labels every reversal break MSS and nothing is ever left as CHoCH, so
+    // this filter stops excluding anything and order blocks are created on all
+    // structure breaks. The input change does the work; no edit needed here.
     bool structNow  = not na(lastStructBar) and lastStructBar == bar_index
     bool structIsBrk = lastStructType == "BOS" or lastStructType == "MSS"
     if structNow and structIsBrk
@@ -2113,10 +2150,12 @@ bestPOI(bool isLong, float px) =>
 
 // =============================================================================
 // SECTION P (STAGE 3): OTE VISUALS
-// Only the LIVE dealing range is drawn. A dealing range is a claim about right
-// now; once its premise is dead, leaving the band on the chart would suggest a
-// context that no longer exists. The numbers stay in the debug table.
-// Cost is fixed: one box and three lines, reused, never accumulated.
+// The band is maintained on CONFIRMED bars, not just on the last bar, so that
+// a range which lived and died in the middle of history can still be frozen at
+// the bar it actually died on. An islast-only version could never do that,
+// because islast never runs on those bars.
+// Live cost is fixed: one box and three lines, reused. extend.right means the
+// right edge never needs touching while the band is alive.
 // =============================================================================
 
 var box  oteBx    = na
@@ -2124,7 +2163,22 @@ var line oteLn62  = na
 var line oteLn705 = na
 var line oteLn79  = na
 
-if barstate.islast
+// Archive of dead bands, only populated when showHistoricalOTE is on.
+var array<box>  oteHistBx = array.new<box>()
+var array<line> oteHistLn = array.new<line>()
+
+f_archiveOteBand(box b, line l1, line l2, line l3) =>
+    array.push(oteHistBx, b)
+    array.push(oteHistLn, l1)
+    array.push(oteHistLn, l2)
+    array.push(oteHistLn, l3)
+    while array.size(oteHistBx) > MAX_OTE_HIST
+        box.delete(array.shift(oteHistBx))
+        line.delete(array.shift(oteHistLn))
+        line.delete(array.shift(oteHistLn))
+        line.delete(array.shift(oteHistLn))
+
+if barstate.isconfirmed
     bool oteLive = showOTE and not na(drRange) and not na(drBar)
 
     if oteLive
@@ -2142,8 +2196,8 @@ if barstate.islast
             oteLn79  := line.new(drBar, ote79,  bar_index, ote79,  xloc = xloc.bar_index,
                      extend = extend.right, color = color.new(colOte, 55), style = line.style_dotted)
         if not na(oteBx)
+            // The band re-anchors as the leg extends, so top/bottom move.
             box.set_left(oteBx, drBar)
-            box.set_right(oteBx, bar_index)
             box.set_top(oteBx, bandHi)
             box.set_bottom(oteBx, bandLo)
             line.set_xy1(oteLn62,  drBar, ote62)
@@ -2153,15 +2207,226 @@ if barstate.islast
             line.set_xy1(oteLn79,  drBar, ote79)
             line.set_xy2(oteLn79,  bar_index, ote79)
 
+    // The range died. Either archive the band frozen at this bar, or drop it.
     if not oteLive and not na(oteBx)
-        box.delete(oteBx)
-        line.delete(oteLn62)
-        line.delete(oteLn705)
-        line.delete(oteLn79)
+        if showHistoricalOTE
+            box.set_extend(oteBx, extend.none)
+            box.set_right(oteBx, bar_index)
+            box.set_bgcolor(oteBx, color.new(colDead, 92))
+            box.set_border_color(oteBx, color.new(colDead, 60))
+            line.set_extend(oteLn62,  extend.none)
+            line.set_extend(oteLn705, extend.none)
+            line.set_extend(oteLn79,  extend.none)
+            line.set_x2(oteLn62,  bar_index)
+            line.set_x2(oteLn705, bar_index)
+            line.set_x2(oteLn79,  bar_index)
+            line.set_color(oteLn62,  color.new(colDead, 75))
+            line.set_color(oteLn705, color.new(colDead, 55))
+            line.set_color(oteLn79,  color.new(colDead, 75))
+            f_archiveOteBand(oteBx, oteLn62, oteLn705, oteLn79)
+        if not showHistoricalOTE
+            box.delete(oteBx)
+            line.delete(oteLn62)
+            line.delete(oteLn705)
+            line.delete(oteLn79)
         oteBx    := na
         oteLn62  := na
         oteLn705 := na
         oteLn79  := na
+
+// =============================================================================
+// SECTION Q (STAGE 4): SMT DIVERGENCE (MNQ vs ES)
+//
+// SMT is the observation that two instruments which normally move together
+// stopped agreeing at a level: NQ takes out its high while ES cannot. That is
+// evidence the push was one index running stops rather than the market bidding.
+//
+// IT IS CONFLUENCE ONLY. Nothing in this section arms a setup, sets a bias, or
+// touches sweep / structure / POI state. It publishes two read-only values and
+// stage 5 weights them at one point.
+// =============================================================================
+
+// WHY [1] AND lookahead_off, on a SAME-TIMEFRAME request:
+//   lookahead_off alone stops TradingView handing historical bars a value the
+//   reference had not published yet. The [1] then guarantees we are reading a
+//   reference bar that has CLOSED, which matters because the debug table reads
+//   these on the live bar -- without the offset the value would move intrabar
+//   and the "is the feed alive" row would be lying about what the logic saw.
+//   The cost is that we compare our bar N against the reference's bar N-1. Over
+//   a 20-bar swing-structure comparison that one-bar skew is immaterial; the
+//   guarantee is not.
+// WHY ignore_invalid_symbol:
+//   ES and NQ share a session, but the reference can still return na -- the
+//   17:00-18:00 ET maintenance break, a holiday, a contract roll gap, or simply
+//   a mistyped symbol. Without this flag a bad symbol is a hard script error.
+//   With it, every na is handled below as "no opinion", never as "the reference
+//   failed to make a higher high", which would manufacture divergences out of
+//   missing data.
+[refHigh, refLow, refClose] = request.security(smtSymbol, timeframe.period,
+     [high[1], low[1], close[1]], lookahead = barmerge.lookahead_off,
+     ignore_invalid_symbol = true)
+
+var int   smtLastBar      = na
+var int   smtLastDir      = 0     // +1 bullish (at lows), -1 bearish (at highs)
+var float smtLastPx       = na
+var float smtLastStrength = 0.0
+var int   smtCount        = 0
+
+// Per-bar marker price, reset every bar.
+float smtMarkPx = na
+
+// --- reference extreme in a window AROUND a given bar offset ----------------
+// The two feeds do not print their extremes on the same bar, so comparing a
+// single reference bar against an MNQ pivot would be brittle. A +/- halfWin
+// window absorbs that skew. na values are SKIPPED, never treated as extremes.
+f_refHighAround(int barsBack, int halfWin) =>
+    float m = na
+    for k = barsBack - halfWin to barsBack + halfWin
+        if k >= 0
+            float v = refHigh[k]
+            if not na(v) and (na(m) or v > m)
+                m := v
+    m
+
+f_refLowAround(int barsBack, int halfWin) =>
+    float m = na
+    for k = barsBack - halfWin to barsBack + halfWin
+        if k >= 0
+            float v = refLow[k]
+            if not na(v) and (na(m) or v < m)
+                m := v
+    m
+
+// --- reference range over the lookback, na-safe ------------------------------
+// Used to normalise the divergence gap. Normalising by the REFERENCE's own
+// range is essential: NQ moves roughly three to four times ES in points, so an
+// absolute gap would be meaningless across the pair.
+f_refRange(int lb) =>
+    float hi = na
+    float lo = na
+    for k = 0 to lb - 1
+        float hv = refHigh[k]
+        float lv = refLow[k]
+        if not na(hv) and (na(hi) or hv > hi)
+            hi := hv
+        if not na(lv) and (na(lo) or lv < lo)
+            lo := lv
+    float r = na(hi) or na(lo) ? na : hi - lo
+    r
+
+// --- is this extreme sitting on a mapped pool? ------------------------------
+// Deliberately does NOT require pool.active. The highest-value SMT is the one
+// that prints exactly as a level is swept, and by that bar stage 2 has already
+// marked the pool consumed. Requiring active would filter out the best cases.
+f_anyPoolNear(float price, float tol, bool buySide) =>
+    bool r = false
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if not r and p.buySide == buySide and math.abs(p.price - price) <= tol
+                r := true
+    r
+
+if barstate.isconfirmed and smtEnabled
+    float poolTol = smtPoolProxTicks * syminfo.mintick
+
+    // ---- BEARISH SMT: MNQ higher high, reference fails to follow ------------
+    // Triggered only when a NEW MNQ pivot high CONFIRMS, and compared against
+    // the PREVIOUS confirmed pivot high. Using two confirmed pivots is what
+    // stops a single spiky bar from manufacturing a divergence -- neither side
+    // of the comparison is a raw bar high.
+    if not na(ph) and array.size(swingHighPrices) >= 2
+        int   nH      = array.size(swingHighPrices)
+        float mnqCur  = array.get(swingHighPrices, nH - 1)
+        float mnqPrev = array.get(swingHighPrices, nH - 2)
+        int   curBar  = array.get(swingHighBars,   nH - 1)
+        int   prevBar = array.get(swingHighBars,   nH - 2)
+
+        bool inWindow = (curBar - prevBar) <= smtLookbackBars and (bar_index - prevBar) <= smtLookbackBars + 2 * pivotLen
+        if mnqCur > mnqPrev and inWindow
+            float refCur  = f_refHighAround(bar_index - curBar,  pivotLen)
+            float refPrev = f_refHighAround(bar_index - prevBar, pivotLen)
+            // Both must be real numbers. A missing reference is "no opinion".
+            if not na(refCur) and not na(refPrev) and refCur <= refPrev
+                bool atPool = f_anyPoolNear(mnqCur, poolTol, true)
+                if atPool or not smtRequireAtPool
+                    float rr   = f_refRange(smtLookbackBars)
+                    float frac = na(rr) or rr <= 0 ? 0.0 : math.min((refPrev - refCur) / rr, 1.0)
+                    smtLastStrength := 0.5 + 0.3 * frac + (atPool ? 0.2 : 0.0)
+                    smtLastDir      := -1
+                    smtLastBar      := bar_index
+                    smtLastPx       := mnqCur
+                    smtMarkPx       := mnqCur
+                    smtCount        += 1
+                    if showSMT
+                        f_pushS2Label(label.new(curBar, mnqCur,
+                                 "SMT " + str.tostring(smtLastStrength, "#.00"),
+                                 xloc = xloc.bar_index, style = label.style_label_down,
+                                 color = color.new(colSmt, 80), textcolor = color.new(colSmt, 0),
+                                 size = size.tiny))
+
+    // ---- BULLISH SMT: MNQ lower low, reference refuses to follow ------------
+    if not na(pl) and array.size(swingLowPrices) >= 2
+        int   nL       = array.size(swingLowPrices)
+        float mnqCurL  = array.get(swingLowPrices, nL - 1)
+        float mnqPrevL = array.get(swingLowPrices, nL - 2)
+        int   curBarL  = array.get(swingLowBars,   nL - 1)
+        int   prevBarL = array.get(swingLowBars,   nL - 2)
+
+        bool inWindowL = (curBarL - prevBarL) <= smtLookbackBars and (bar_index - prevBarL) <= smtLookbackBars + 2 * pivotLen
+        if mnqCurL < mnqPrevL and inWindowL
+            float refCurL  = f_refLowAround(bar_index - curBarL,  pivotLen)
+            float refPrevL = f_refLowAround(bar_index - prevBarL, pivotLen)
+            if not na(refCurL) and not na(refPrevL) and refCurL >= refPrevL
+                bool atPoolL = f_anyPoolNear(mnqCurL, poolTol, false)
+                if atPoolL or not smtRequireAtPool
+                    float rrL   = f_refRange(smtLookbackBars)
+                    float fracL = na(rrL) or rrL <= 0 ? 0.0 : math.min((refCurL - refPrevL) / rrL, 1.0)
+                    smtLastStrength := 0.5 + 0.3 * fracL + (atPoolL ? 0.2 : 0.0)
+                    smtLastDir      := 1
+                    smtLastBar      := bar_index
+                    smtLastPx       := mnqCurL
+                    smtMarkPx       := mnqCurL
+                    smtCount        += 1
+                    if showSMT
+                        f_pushS2Label(label.new(curBarL, mnqCurL,
+                                 "SMT " + str.tostring(smtLastStrength, "#.00"),
+                                 xloc = xloc.bar_index, style = label.style_label_up,
+                                 color = color.new(colSmt, 80), textcolor = color.new(colSmt, 0),
+                                 size = size.tiny))
+
+// --- PUBLIC: is a divergence live on this side? -----------------------------
+// A divergence goes stale after smtLookbackBars. Reusing that input rather than
+// adding a validity knob keeps one number describing one idea: how far back
+// swing structure is still comparable.
+smtDivergence(bool bullish) =>
+    bool r = false
+    if smtEnabled and not na(smtLastBar) and bar_index - smtLastBar <= smtLookbackBars
+        r := bullish ? smtLastDir > 0 : smtLastDir < 0
+    r
+
+// --- PUBLIC: graded strength, 0 to 1 ----------------------------------------
+// GRADED RATHER THAN BOOLEAN, on purpose. A divergence where ES prints a
+// decisively lower high is a different observation from one where it prints a
+// high a tick short of its last -- the second is inside the noise of an
+// overnight book. A boolean scores those identically; stage 5 multiplying its
+// 1 point by this does not.
+//   0.5  base, a confirmed two-pivot divergence
+// + 0.3  scaled by how far the reference fell short, as a fraction of the
+//        reference's own lookback range
+// + 0.2  the divergent extreme sits on a mapped pool
+smtStrengthNow() =>
+    float v = 0.0
+    if smtEnabled and not na(smtLastBar) and bar_index - smtLastBar <= smtLookbackBars
+        v := smtLastStrength
+    v
+
+// --- Visuals -----------------------------------------------------------------
+// A diamond, not the sweep's cross, and indigo rather than the red/teal pool
+// palette, so an SMT can never be mistaken for a sweep at a glance.
+plotshape(showSMT and smtEnabled ? smtMarkPx : na, title = "SMT divergence",
+     style = shape.diamond, location = location.absolute,
+     color = color.new(colSmt, 0), size = size.tiny)
 
 // =============================================================================
 // SECTION E: DEBUG TABLE
@@ -2269,7 +2534,7 @@ var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 33,
+        dbg := table.new(position.top_right, 2, 36,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
@@ -2296,7 +2561,7 @@ if barstate.islast and showDebugTable
                      "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
                      "  act " + str.tostring(activePoolCount())
 
-    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 3", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 4", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
@@ -2410,6 +2675,28 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 32, "FVG+OB overlap", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 32, str.tostring(fvgObCoincidenceCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
+    // ---- STAGE 4 ROWS --------------------------------------------------------
+    string smtStateStr = "none"
+    if smtDivergence(true)
+        smtStateStr := "BULLISH  " + str.tostring(smtStrengthNow(), "#.00")
+    if smtDivergence(false)
+        smtStateStr := "BEARISH  " + str.tostring(smtStrengthNow(), "#.00")
+    if not smtEnabled
+        smtStateStr := "disabled"
+
+    // If this reads "no feed" the reference is not delivering and every SMT
+    // result below is silently absent rather than wrong.
+    string refFeedStr = na(refClose) ? "no feed" : str.tostring(refClose, format.mintick)
+
+    table.cell(dbg, 0, 33, "S4 SMT", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 33, smtStateStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 34, "Ref feed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 34, smtSymbol + "  " + refFeedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 35, "SMT count", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 35, str.tostring(smtCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
     table.delete(dbg)
@@ -2440,7 +2727,14 @@ if barstate.islast and not showDebugTable and not na(dbg)
 //   fvgs / ifvgs / obs arrays and the ST_* state enum
 //   fvgObCoincidenceCount
 
-// ===== STAGE 4: SMT DIVERGENCE (MNQ vs ES) =====
+// ===== STAGE 4: SMT DIVERGENCE (MNQ vs ES) ===== IMPLEMENTED
+// Lives above the debug table, as section Q.
+// Stage-4 API now available to later stages:
+//   smtDivergence(bullish) -> bool
+//   smtStrengthNow()       -> float 0-1   (graded; see the note at the function)
+//   smtCount, refHigh / refLow / refClose (na when the reference has no data)
+// SMT is confluence only. It never arms a setup and never writes to sweep,
+// structure or POI state.
 
 // ===== STAGE 5: CONFLUENCE SCORING =====
 
