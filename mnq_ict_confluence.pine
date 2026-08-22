@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-// MNQ ICT CONFLUENCE  --  STAGE 1 of 6: FOUNDATION
+// MNQ ICT CONFLUENCE  --  STAGE 2 of 6: DISPLACEMENT / SWEEPS / MARKET STRUCTURE
 // -----------------------------------------------------------------------------
 // DISCLAIMER: research/education tool. NOT financial advice. Every level and
 // threshold in here is an untested hypothesis about how MNQ behaves. Trade your
@@ -19,7 +19,15 @@
 //   C. Liquidity pool map (Asia range, PDH/PDL, PWH/PWL, swings, EQH/EQL)
 //   D. Anti-repaint fractal swing pivots
 //   E. Debug verification table
-//   F. Empty, clearly-marked stubs for stages 2-6
+//   F. Empty, clearly-marked stubs for stages 3-6
+//
+// WHAT STAGE 2 ADDS
+//   G. Displacement bars (expansion candles with real bodies)
+//   H. Liquidity sweep detection as an explicit per-pool state machine
+//      (PENETRATED -> SWEPT | BROKEN OUT | EXPIRED), plus a Sweep record book
+//   I. BOS / CHoCH / MSS from confirmed pivots only, and the sweep+MSS pairing
+//      that stage 5 will score
+//   J. Stage-2 visuals, bounded
 //
 // ANTI-REPAINT CONTRACT (holds for every stage of this project)
 //   1. Session membership comes from the bar's OPEN time, which is fixed the
@@ -38,7 +46,7 @@
 //      handled by TradingView. No hardcoded UTC offsets anywhere.
 // =============================================================================
 
-indicator("MNQ ICT Confluence [S1]", shorttitle = "MNQ ICT S1", overlay = true,
+indicator("MNQ ICT Confluence [S2]", shorttitle = "MNQ ICT S2", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100)
 
 // =============================================================================
@@ -70,6 +78,12 @@ pivotLen = input.int(2, "Pivot length (bars each side)", minval = 1, maxval = 20
      tooltip = "Fractal confirmation. A pivot is only KNOWN pivotLen bars after it prints.")
 atrLen = input.int(14, "ATR length", minval = 1, group = grpStruct)
 
+// -- stage 2 additions to the Structure group --
+requireDisplacementForMSS = input.bool(true, "MSS requires displacement in the breaking leg", group = grpStruct,
+     tooltip = "When off, MSS is identical to CHoCH. When on, a CHoCH is only promoted to MSS if the leg from the broken swing to the break contains a displacement bar in the same direction.")
+mssMaxBarsAfterSweep = input.int(10, "Max bars from sweep to MSS", minval = 1, maxval = 100, group = grpStruct,
+     tooltip = "An MSS further than this from the sweep confirmation is treated as unrelated and does not arm the pair.")
+
 // ---- Group: Liquidity Pools --------------------------------------------------
 grpPools = "Liquidity Pools"
 
@@ -88,10 +102,43 @@ pdhlSource = input.string("RTH 09:30-16:00", "Prior day high/low source", group 
      options = ["RTH 09:30-16:00", "Full session"],
      tooltip = "RTH builds the level natively from intraday bars. Full session reads the prior CLOSED daily bar.")
 
-maxPools = input.int(40, "Max pools kept (drawings capped)", minval = 5, maxval = 200, group = grpPools,
+maxPools = input.int(56, "Max pools kept (drawings capped)", minval = 5, maxval = 200, group = grpPools,
      tooltip = "Hard cap on stored pools and their line/label objects. Transient (swing) pools are evicted first; protected levels never are.")
 maxEqualPools = input.int(8, "Max EQH / EQL pools (each side)", minval = 1, maxval = 50, group = grpPools,
      tooltip = "Per-tag cap on equal-high and equal-low clusters. Without this the EQ pools grow without bound and saturate the book.")
+
+// ---- Group: Displacement -----------------------------------------------------
+grpDisplace = "Displacement"
+
+dispMode = input.string("Either", "Displacement size test", group = grpDisplace,
+     options = ["ATR multiple", "Median range multiple", "Either"],
+     tooltip = "ATR adapts slowly; the median of recent bar ranges adapts fast. Either = the bar qualifies if it clears one of them.")
+dispAtrMult    = input.float(1.5, "Displacement x ATR", minval = 0.1, step = 0.1, group = grpDisplace)
+dispMedianMult = input.float(1.5, "Displacement x median bar range", minval = 0.1, step = 0.1, group = grpDisplace)
+dispMedianLen  = input.int(20, "Median bar-range lookback", minval = 2, maxval = 200, group = grpDisplace,
+     tooltip = "Bars used for the rolling median of bar range. The CURRENT bar is excluded from its own median.")
+dispRequireBodyPct = input.float(0.5, "Min body as fraction of bar range", minval = 0.0, maxval = 1.0, step = 0.05, group = grpDisplace,
+     tooltip = "Rejects huge-wick dojis. 0.5 means the body must be at least half the bar's total range.")
+
+// ---- Group: Sweeps -----------------------------------------------------------
+grpSweep = "Sweeps"
+
+sweepMinTier = input.string("Protected + Equal", "Sweep target significance", group = grpSweep,
+     options = ["Protected only", "Protected + Equal", "All including swings"],
+     tooltip = "Swing-only sweeps are noise on a 5m chart. Opt in deliberately.")
+sweepPenTicks   = input.float(2.0, "Penetration (ticks)", minval = 0.0, step = 0.25, group = grpSweep,
+     tooltip = "MNQ tick = 0.25 pts, so 2 ticks = 0.5 pts. Price must clear the pool by at least this before it counts as penetrated.")
+sweepPenAtrMult = input.float(0.05, "Penetration (x ATR)", minval = 0.0, step = 0.01, group = grpSweep)
+sweepPenMode    = input.string("Max of both", "Penetration mode", group = grpSweep,
+     options = ["Ticks", "ATR", "Max of both"])
+sweepReclaimBars = input.int(1, "Bars allowed to reclaim", minval = 0, maxval = 20, group = grpSweep,
+     tooltip = "After penetration, price has this many FURTHER bars to close back on the correct side. The penetration bar itself always counts, so a single rejection wick confirms immediately.")
+breakoutClosesToInvalidate = input.int(2, "Consecutive closes beyond = breakout", minval = 1, maxval = 10, group = grpSweep,
+     tooltip = "This many consecutive closes beyond the pool means the level failed. The pool is consumed and no sweep is recorded.")
+sweepValidBars = input.int(12, "Sweep stays live for N bars", minval = 1, maxval = 200, group = grpSweep,
+     tooltip = "How long a confirmed sweep remains available to pair with an MSS.")
+carryPriorAsiaRange = input.bool(true, "Carry prior Asia range into the Asia session", group = grpSweep,
+     tooltip = "Re-states the previous session's Asia high/low as fresh active pools tagged Prior Asia High/Low, so Asia has targets before its own range is finalised.")
 
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
@@ -100,6 +147,11 @@ showDebugTable     = input.bool(true, "Show debug table",      group = grpDisp)
 showSessionShading = input.bool(true, "Show session shading",  group = grpDisp)
 showSwingMarkers   = input.bool(true, "Show confirmed swing markers", group = grpDisp,
      tooltip = "Triangles are drawn back at the TRUE pivot bar, but only appear pivotLen bars later. That visible lag IS the anti-repaint guarantee.")
+
+// -- stage 2 additions to the Display group --
+showDisplacement    = input.bool(true, "Highlight displacement bars", group = grpDisp)
+showSweepMarkers    = input.bool(true, "Show sweep markers",          group = grpDisp)
+showStructureLabels = input.bool(true, "Show BOS / CHoCH / MSS labels", group = grpDisp)
 
 // =============================================================================
 // CONSTANTS
@@ -134,6 +186,20 @@ int TIER_TRANSIENT   = 2
 // Pool colours: buy-side liquidity sits ABOVE price (red), sell-side BELOW (teal).
 color colBuySide  = #ef5350
 color colSellSide = #26a69a
+
+// Stage-2 colours. Displacement gets its own hue pair so it is never confused
+// with an ordinary green/red candle; structure events are ranked by how much
+// they matter -- BOS is the least interesting, MSS is the one we trade around.
+color colDispUp   = #00c853   // bright green expansion candle
+color colDispDown = #d50000   // bright red expansion candle
+color colBOS      = #90a4ae   // blue-grey: continuation, informational
+color colCHoCH    = #ffa726   // amber: reversal warning
+color colMSS      = #ab47bc   // purple: the structural shift that counts
+
+// Stage-2 drawing budget. Labels are recycled oldest-first so the script can
+// never approach the 500-object ceiling.
+int MAX_S2_LABELS = 60
+int MAX_SWEEPS    = 20
 
 // =============================================================================
 // SECTION B (part 1): ATR + TOLERANCE
@@ -246,8 +312,10 @@ removePoolsByTag(string tag) =>
 // One source of truth, so the public addPool() cannot mis-tier a level.
 f_tierForTag(string tag) =>
     int t = switch tag
-        "Asia High" => TIER_PROTECTED
-        "Asia Low"  => TIER_PROTECTED
+        "Asia High"       => TIER_PROTECTED
+        "Asia Low"        => TIER_PROTECTED
+        "Prior Asia High" => TIER_PROTECTED
+        "Prior Asia Low"  => TIER_PROTECTED
         "PDH"       => TIER_PROTECTED
         "PDL"       => TIER_PROTECTED
         "PWH"       => TIER_PROTECTED
@@ -700,6 +768,454 @@ if barstate.isconfirmed
         if eqCountL >= 1 and not na(eqlHit)
             setPoolPrice(eqlHit, math.min(eqlHit.price, eqExtremeL))
 
+// =============================================================================
+// SECTION G (STAGE 2): DISPLACEMENT
+// A displacement bar is an expansion candle: unusually large range FOR ITS OWN
+// RECENT CONTEXT, mostly body rather than wick, closing in the direction it
+// travelled. It is the footprint of intent, and stages 3-6 use it to separate a
+// real structural break from a slow drift through a level.
+// =============================================================================
+
+// Median bar range over the last dispMedianLen bars, EXCLUDING the current bar.
+// The [1] is what excludes it. Without that offset a huge bar would inflate the
+// very median it is being measured against and could never qualify.
+float dispMedianRange = ta.median(high - low, dispMedianLen)[1]
+
+float barRange = high - low
+float barBody  = math.abs(close - open)
+
+// The body must be a real fraction of the bar, so a huge-wick doji is rejected
+// even when its total range is enormous.
+bool dispBodyOk = barRange > 0 and barBody >= dispRequireBodyPct * barRange
+
+// The two size tests, and the mode that selects between them.
+bool dispAtrOk = not na(atr) and barRange >= dispAtrMult * atr
+bool dispMedOk = not na(dispMedianRange) and dispMedianRange > 0 and barRange >= dispMedianMult * dispMedianRange
+bool dispSizeOk = switch dispMode
+    "ATR multiple"          => dispAtrOk
+    "Median range multiple" => dispMedOk
+    => dispAtrOk or dispMedOk
+
+// ANTI-REPAINT: both flags are gated on barstate.isconfirmed, so a bar that
+// looks like displacement mid-formation and then shrinks never announces
+// itself. On the live bar both read false until the bar actually closes.
+bool isDisplacementUp   = barstate.isconfirmed and dispSizeOk and dispBodyOk and close > open
+bool isDisplacementDown = barstate.isconfirmed and dispSizeOk and dispBodyOk and close < open
+
+// Most recent displacement bar in each direction. Section I uses these to test
+// whether a breaking leg actually contained intent.
+var int lastDispUpBar   = na
+var int lastDispDownBar = na
+if barstate.isconfirmed
+    if isDisplacementUp
+        lastDispUpBar := bar_index
+    if isDisplacementDown
+        lastDispDownBar := bar_index
+
+// ---- Stage-2 label budget ---------------------------------------------------
+// Every stage-2 label goes through this ring buffer, so sweep and structure
+// annotations can never accumulate past MAX_S2_LABELS.
+var array<label> s2Labels = array.new<label>()
+
+f_pushS2Label(label lb) =>
+    array.push(s2Labels, lb)
+    while array.size(s2Labels) > MAX_S2_LABELS
+        label.delete(array.shift(s2Labels))
+
+// =============================================================================
+// SECTION H (STAGE 2): LIQUIDITY SWEEP STATE MACHINE
+// A sweep is not "price touched a level". It is: price cleared the level by a
+// meaningful amount, then FAILED TO HOLD there. Those are two separate
+// observations on two different bars, so this is modelled as an explicit state
+// machine per side rather than a bundle of ad hoc flags:
+//
+//   (idle) --penetration--> PENETRATED --close back inside--> SWEPT
+//                                |
+//                                +--N consecutive closes beyond--> BROKEN OUT
+//                                |
+//                                +--reclaim window elapsed------> EXPIRED
+//
+// SWEPT and BROKEN OUT both consume the pool, so one level can never produce
+// two signals. EXPIRED leaves it active.
+// =============================================================================
+
+// side          : buySide = true means BUY-side liquidity (above highs) was
+//                 taken, which is a bearish/short setup. Named buySide rather
+//                 than "side" to match Pool.buySide from stage 1.
+// sweepExtreme  : furthest high (or low) reached while the pool was penetrated
+// expiresAtBarIdx : after this bar the sweep is stale and is pruned
+// mssConfirmed  : set by section I when an opposite MSS lands in time
+type Sweep
+    bool   buySide
+    string poolTag
+    int    poolTier
+    float  poolPrice
+    float  sweepExtreme
+    int    confirmBarIdx
+    int    expiresAtBarIdx
+    bool   mssConfirmed
+
+var array<Sweep> sweeps = array.new<Sweep>()
+
+// Resolve the significance filter to a maxTier the stage-1 pool API understands.
+int sweepMaxTier = switch sweepMinTier
+    "Protected only"    => TIER_PROTECTED
+    "Protected + Equal" => TIER_SIGNIFICANT
+    => TIER_TRANSIENT
+
+// Penetration threshold in PRICE units, same three-mode shape as f_equalTol().
+f_sweepPen() =>
+    float tTicks = sweepPenTicks * syminfo.mintick
+    float tAtr   = sweepPenAtrMult * nz(atr)
+    float res    = switch sweepPenMode
+        "Ticks" => tTicks
+        "ATR"   => tAtr
+        => math.max(tTicks, tAtr)
+    res
+
+// --- internal: which pool did THIS bar penetrate, above price? --------------
+// CLUSTER RULE (this is the one handling rule, chosen deliberately):
+// when a single bar clears several pools at once we take the MOST SIGNIFICANT
+// one, i.e. the lowest tier number, breaking ties by DEEPEST penetration.
+// WHY: equal highs habitually form a few points under a session high, so a
+// "nearest one wins" rule would hand the sweep to the EQH and stage 5 would
+// score it with poolWeight(1) = 0.6 instead of poolWeight(0) = 1.0. Taking the
+// most significant level keeps the score honest. Pools that were penetrated but
+// not selected stay ACTIVE and remain valid targets on a later bar.
+// `refPx` is the previous confirmed close: the pool must have been ABOVE us
+// before this bar, otherwise clearing its price is not taking resting
+// liquidity, it is just continuing a move we were already inside.
+f_sweepTargetAbove(float barHigh, float refPx, float pen, int maxTier) =>
+    Pool best = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.active and p.buySide and p.tier <= maxTier and p.price > refPx and barHigh >= p.price + pen
+                if na(best)
+                    best := p
+                else if p.tier < best.tier
+                    best := p
+                else if p.tier == best.tier and p.price < best.price
+                    best := p                       // lower price = deeper penetration
+    best
+
+// --- internal: mirror of the above, below price -----------------------------
+f_sweepTargetBelow(float barLow, float refPx, float pen, int maxTier) =>
+    Pool best = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            Pool p = array.get(pools, i)
+            if p.active and not p.buySide and p.tier <= maxTier and p.price < refPx and barLow <= p.price - pen
+                if na(best)
+                    best := p
+                else if p.tier < best.tier
+                    best := p
+                else if p.tier == best.tier and p.price > best.price
+                    best := p                       // higher price = deeper penetration
+    best
+
+// --- internal: retire a pool and show that it is retired --------------------
+// The line stays on the chart but goes dashed and grey, and the label gains an
+// "x", so a consumed level is visually distinct from a live one.
+f_markPoolConsumed(Pool p) =>
+    p.active := false
+    if not na(p.ln)
+        line.set_style(p.ln, line.style_dashed)
+        line.set_color(p.ln, color.new(color.gray, 70))
+    if not na(p.lb)
+        label.set_text(p.lb, "x " + p.tag)
+        label.set_textcolor(p.lb, color.new(color.gray, 40))
+
+// --- internal: drop stale sweeps, then cap the book -------------------------
+f_pruneSweeps() =>
+    if array.size(sweeps) > 0
+        for i = array.size(sweeps) - 1 to 0
+            if bar_index > array.get(sweeps, i).expiresAtBarIdx
+                array.remove(sweeps, i)
+    while array.size(sweeps) > MAX_SWEEPS
+        array.shift(sweeps)
+
+// --- PUBLIC: most recent unexpired sweep on `buySide`, or na ----------------
+// Iterating backwards means the first match found is the newest.
+getLiveSweep(bool buySide) =>
+    Sweep best = na
+    if array.size(sweeps) > 0
+        for i = array.size(sweeps) - 1 to 0
+            Sweep sw = array.get(sweeps, i)
+            if na(best) and sw.buySide == buySide and bar_index <= sw.expiresAtBarIdx
+                best := sw
+    best
+
+// --- PUBLIC: is there a live sweep on this side that an MSS has confirmed? --
+// isSweepMssPair(false) = LONG setup  (sell-side liquidity taken, then bullish MSS)
+// isSweepMssPair(true)  = SHORT setup (buy-side liquidity taken, then bearish MSS)
+isSweepMssPair(bool buySide) =>
+    Sweep sw = getLiveSweep(buySide)
+    bool ok = false
+    if not na(sw)
+        ok := sw.mssConfirmed
+    ok
+
+// ---- Pending penetration state, one per side --------------------------------
+// We store the Pool OBJECT, not its array index. The book is mutated between
+// bars (eviction, re-statement), so an index would go stale; a Pine object
+// reference stays valid even after the pool leaves the array.
+var Pool  pendUpPool    = na
+var int   pendUpBar     = na
+var float pendUpExtreme = na
+var int   pendUpCloses  = 0
+
+var Pool  pendDnPool    = na
+var int   pendDnBar     = na
+var float pendDnExtreme = na
+var int   pendDnCloses  = 0
+
+// Cumulative calibration counters for the debug table.
+var int sweepConfirmedCount   = 0
+var int breakoutRejectedCount = 0
+var int lastBreakoutDir       = 0      // +1 up, -1 down. For later stages.
+
+// Per-bar marker prices. Not `var`, so they reset to na every bar.
+float sweepUpMarkPx = na
+float sweepDnMarkPx = na
+
+if barstate.isconfirmed
+    // ---- 0a. Carry the previous Asia range into the live Asia session -------
+    // We REPLACE the old "Asia High"/"Asia Low" pools rather than adding
+    // alongside them: they sit at exactly the same prices, so adding would
+    // draw two lines on top of each other. Re-stating also resets `active`,
+    // so a level consumed during London or RTH is a valid target again for
+    // the new Asia session.
+    if carryPriorAsiaRange and asiaOpenRaw and not na(asiaRangeHigh) and not na(asiaRangeLow)
+        removePoolsByTag("Asia High")
+        removePoolsByTag("Asia Low")
+        removePoolsByTag("Prior Asia High")
+        removePoolsByTag("Prior Asia Low")
+        f_addPool(asiaRangeHigh, "Prior Asia High", true,  TIER_PROTECTED, showAsiaRange)
+        f_addPool(asiaRangeLow,  "Prior Asia Low",  false, TIER_PROTECTED, showAsiaRange)
+
+    // ---- 0b. Asia closed: stage 1 has already stated the NEW Asia range
+    //          earlier on this same bar, so the carried pools are superseded.
+    if asiaJustClosedRaw
+        removePoolsByTag("Prior Asia High")
+        removePoolsByTag("Prior Asia Low")
+
+    f_pruneSweeps()
+    float pen = f_sweepPen()
+
+    // =========================== BUY-SIDE (highs) ===========================
+    // 1. PENETRATED: open a pending record when nothing is pending.
+    if na(pendUpPool) and not na(close[1])
+        Pool tgtUp = f_sweepTargetAbove(high, close[1], pen, sweepMaxTier)
+        if not na(tgtUp)
+            pendUpPool    := tgtUp
+            pendUpBar     := bar_index
+            pendUpExtreme := high
+            pendUpCloses  := 0
+
+    // 2. Evaluate the pending record. This deliberately runs on the penetration
+    //    bar as well, so a single bar that pokes above and closes back below --
+    //    the canonical rejection wick -- confirms immediately instead of
+    //    waiting a bar it does not need.
+    if not na(pendUpPool)
+        pendUpExtreme := math.max(pendUpExtreme, high)
+        pendUpCloses  := close > pendUpPool.price ? pendUpCloses + 1 : 0
+        int   ageUp     = bar_index - pendUpBar
+        // The reclaim window and the breakout window are DECOUPLED on purpose.
+        // A reclaim only counts inside sweepReclaimBars, but the record has to
+        // stay alive long enough for breakoutClosesToInvalidate consecutive
+        // closes to accumulate -- otherwise setting, say, reclaim = 1 and
+        // breakout = 4 would make a breakout literally unreachable and the
+        // sweep:breakout ratio in the debug table would be meaningless.
+        int   holdUp    = math.max(sweepReclaimBars, breakoutClosesToInvalidate - 1)
+        bool  brokeUp   = pendUpCloses >= breakoutClosesToInvalidate
+        bool  reclaimUp = close < pendUpPool.price and ageUp <= sweepReclaimBars
+        bool  expireUp  = ageUp > holdUp
+
+        // BREAKOUT: the level did not hold. Consume it so it cannot later also
+        // register as a sweep, and remember the direction for later stages.
+        if brokeUp
+            f_markPoolConsumed(pendUpPool)
+            breakoutRejectedCount += 1
+            lastBreakoutDir := 1
+            pendUpPool := na
+
+        // SWEEP CONFIRMED.
+        if not brokeUp and reclaimUp
+            f_markPoolConsumed(pendUpPool)
+            sweepConfirmedCount += 1
+            array.push(sweeps, Sweep.new(buySide = true, poolTag = pendUpPool.tag,
+                     poolTier = pendUpPool.tier, poolPrice = pendUpPool.price,
+                     sweepExtreme = pendUpExtreme, confirmBarIdx = bar_index,
+                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false))
+            sweepUpMarkPx := pendUpExtreme
+            if showSweepMarkers
+                f_pushS2Label(label.new(bar_index, pendUpExtreme, "swept: " + pendUpPool.tag,
+                         xloc = xloc.bar_index, style = label.style_label_down,
+                         color = color.new(colBuySide, 82), textcolor = color.new(colBuySide, 0),
+                         size = size.tiny))
+            pendUpPool := na
+
+        // EXPIRED: neither reclaimed in time nor decisively broken. Leave the
+        // pool ACTIVE. If price is still above it, the `p.price > refPx` guard
+        // in f_sweepTargetAbove stops it re-triggering until price comes back
+        // below and pokes through again.
+        if not brokeUp and not reclaimUp and expireUp
+            pendUpPool := na
+
+    // =========================== SELL-SIDE (lows) ===========================
+    if na(pendDnPool) and not na(close[1])
+        Pool tgtDn = f_sweepTargetBelow(low, close[1], pen, sweepMaxTier)
+        if not na(tgtDn)
+            pendDnPool    := tgtDn
+            pendDnBar     := bar_index
+            pendDnExtreme := low
+            pendDnCloses  := 0
+
+    if not na(pendDnPool)
+        pendDnExtreme := math.min(pendDnExtreme, low)
+        pendDnCloses  := close < pendDnPool.price ? pendDnCloses + 1 : 0
+        int   ageDn     = bar_index - pendDnBar
+        int   holdDn    = math.max(sweepReclaimBars, breakoutClosesToInvalidate - 1)
+        bool  brokeDn   = pendDnCloses >= breakoutClosesToInvalidate
+        bool  reclaimDn = close > pendDnPool.price and ageDn <= sweepReclaimBars
+        bool  expireDn  = ageDn > holdDn
+
+        if brokeDn
+            f_markPoolConsumed(pendDnPool)
+            breakoutRejectedCount += 1
+            lastBreakoutDir := -1
+            pendDnPool := na
+
+        if not brokeDn and reclaimDn
+            f_markPoolConsumed(pendDnPool)
+            sweepConfirmedCount += 1
+            array.push(sweeps, Sweep.new(buySide = false, poolTag = pendDnPool.tag,
+                     poolTier = pendDnPool.tier, poolPrice = pendDnPool.price,
+                     sweepExtreme = pendDnExtreme, confirmBarIdx = bar_index,
+                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false))
+            sweepDnMarkPx := pendDnExtreme
+            if showSweepMarkers
+                f_pushS2Label(label.new(bar_index, pendDnExtreme, "swept: " + pendDnPool.tag,
+                         xloc = xloc.bar_index, style = label.style_label_up,
+                         color = color.new(colSellSide, 82), textcolor = color.new(colSellSide, 0),
+                         size = size.tiny))
+            pendDnPool := na
+
+        if not brokeDn and not reclaimDn and expireDn
+            pendDnPool := na
+
+// =============================================================================
+// SECTION I (STAGE 2): BOS / CHoCH / MSS
+//
+// ANTI-REPAINT PROOF -- why a break can never be registered against a swing
+// that was not yet confirmed when the break happened:
+//   lastConfirmedSwingHigh / lastConfirmedSwingLow are written by stage 1 ONLY
+//   inside `if barstate.isconfirmed` and ONLY on a bar where ta.pivothigh /
+//   ta.pivotlow returned non-na. That bar is, by construction, pivotLen bars
+//   AFTER the pivot bar itself. So at any bar B those variables can only hold a
+//   pivot whose confirmation bar is <= B, i.e. whose pivot bar is <= B-pivotLen.
+//   This section reads nothing else -- no ta.pivot* call of its own, no history
+//   offset into the future, no `[-n]` -- so the value it compares close against
+//   was already public knowledge at bar B's close.
+//   The degenerate case is also safe: a pivot high confirmed ON bar B cannot be
+//   broken by bar B, because ta.pivothigh only returns it if the following
+//   pivotLen highs (bar B's included) are all below it, hence close < pivot.
+// =============================================================================
+
+// Swing sequence state. +1 = higher than the previous swing on that side,
+// -1 = lower, 0 = not yet known.
+var int   highSeq         = 0
+var int   lowSeq          = 0
+var float prevSwingHighPx = na
+var float prevSwingLowPx  = na
+
+// Structural bias: +1 bull, -1 bear, 0 neutral. Derived ONLY from the HH/HL vs
+// LH/LL sequence, never from the break events themselves.
+var int structBias = 0
+
+// Last structure event, for the debug table and later stages.
+var string lastStructType = ""     // "BOS" / "CHoCH" / "MSS"
+var int    lastStructDir  = 0      // +1 break up, -1 break down
+var int    lastStructBar  = na
+
+// Which swing has already been broken, keyed by its TRUE pivot bar index. This
+// is what makes CHoCH the FIRST close beyond a swing rather than every close.
+var int brokenSwingHighBar = na
+var int brokenSwingLowBar  = na
+
+f_structColor(string kind) =>
+    color c = switch kind
+        "BOS"   => colBOS
+        "CHoCH" => colCHoCH
+        => colMSS
+    c
+
+if barstate.isconfirmed
+    // ---- 1. Swing sequence -> structural bias -------------------------------
+    if not na(ph)
+        if not na(prevSwingHighPx)
+            highSeq := ph > prevSwingHighPx ? 1 : ph < prevSwingHighPx ? -1 : highSeq
+        prevSwingHighPx := ph
+    if not na(pl)
+        if not na(prevSwingLowPx)
+            lowSeq := pl > prevSwingLowPx ? 1 : pl < prevSwingLowPx ? -1 : lowSeq
+        prevSwingLowPx := pl
+    structBias := highSeq > 0 and lowSeq > 0 ? 1 : highSeq < 0 and lowSeq < 0 ? -1 : 0
+
+    // ---- 2. Break detection --------------------------------------------------
+    // The na() guards on the "already broken" trackers matter: in Pine an
+    // int != na comparison yields na, not true, which would suppress the very
+    // first break of the chart.
+    bool brokeHigh = not na(lastConfirmedSwingHigh) and close > lastConfirmedSwingHigh and (na(brokenSwingHighBar) or lastSwingHighBar != brokenSwingHighBar)
+    bool brokeLow  = not na(lastConfirmedSwingLow)  and close < lastConfirmedSwingLow  and (na(brokenSwingLowBar)  or lastSwingLowBar  != brokenSwingLowBar)
+
+    // ---- 3. Classify an UP break --------------------------------------------
+    if brokeHigh
+        brokenSwingHighBar := lastSwingHighBar
+        // Continuation only when bias is ALREADY bullish. Neutral bias counts
+        // as a change of character: with no established trend, the first close
+        // beyond a confirmed swing IS the structural statement.
+        bool contUp = structBias > 0
+        // Breaking leg = from the broken swing's own bar to this bar. A
+        // displacement up anywhere inside that window means the break carried
+        // intent rather than drifting through.
+        bool legDispUp = not na(lastDispUpBar) and lastDispUpBar >= lastSwingHighBar
+        string kindUp = contUp ? "BOS" : (requireDisplacementForMSS ? (legDispUp ? "MSS" : "CHoCH") : "MSS")
+        lastStructType := kindUp
+        lastStructDir  := 1
+        lastStructBar  := bar_index
+        // A bullish MSS pairs with a SELL-side sweep: lows taken, then up.
+        if kindUp == "MSS"
+            Sweep swUp = getLiveSweep(false)
+            if not na(swUp) and bar_index - swUp.confirmBarIdx <= mssMaxBarsAfterSweep
+                swUp.mssConfirmed := true
+        if showStructureLabels
+            f_pushS2Label(label.new(bar_index, high, kindUp,
+                     xloc = xloc.bar_index, style = label.style_label_down,
+                     color = color.new(f_structColor(kindUp), 82),
+                     textcolor = f_structColor(kindUp), size = size.tiny))
+
+    // ---- 4. Classify a DOWN break -------------------------------------------
+    if brokeLow
+        brokenSwingLowBar := lastSwingLowBar
+        bool contDn = structBias < 0
+        bool legDispDn = not na(lastDispDownBar) and lastDispDownBar >= lastSwingLowBar
+        string kindDn = contDn ? "BOS" : (requireDisplacementForMSS ? (legDispDn ? "MSS" : "CHoCH") : "MSS")
+        lastStructType := kindDn
+        lastStructDir  := -1
+        lastStructBar  := bar_index
+        // A bearish MSS pairs with a BUY-side sweep: highs taken, then down.
+        if kindDn == "MSS"
+            Sweep swDn = getLiveSweep(true)
+            if not na(swDn) and bar_index - swDn.confirmBarIdx <= mssMaxBarsAfterSweep
+                swDn.mssConfirmed := true
+        if showStructureLabels
+            f_pushS2Label(label.new(bar_index, low, kindDn,
+                     xloc = xloc.bar_index, style = label.style_label_up,
+                     color = color.new(f_structColor(kindDn), 82),
+                     textcolor = f_structColor(kindDn), size = size.tiny))
+
 // ---- Keep pool labels pinned near the right edge ----------------------------
 // Only on the last bar, so historical bars do no drawing work at all.
 if barstate.islast and array.size(pools) > 0
@@ -717,6 +1233,29 @@ plotshape(showSwingMarkers and not na(ph), title = "Confirmed swing high",
 plotshape(showSwingMarkers and not na(pl), title = "Confirmed swing low",
      style = shape.triangleup, location = location.belowbar, offset = -pivotLen,
      color = color.new(colSellSide, 20), size = size.tiny)
+
+// =============================================================================
+// SECTION J (STAGE 2): VISUALS
+// Sweep crosses are PLOTS, not drawing objects, so they cost nothing against
+// the 500-object ceiling. The text labels beside them, and the structure
+// labels, go through the s2Labels ring buffer instead.
+// =============================================================================
+
+// Displacement bar highlight. Because isDisplacement* are confirmed-bar gated,
+// the live bar stays its normal colour until it closes -- if it recolours on
+// close, that is the anti-repaint gate doing its job, not a glitch.
+barcolor(showDisplacement and isDisplacementUp   ? colDispUp :
+         showDisplacement and isDisplacementDown ? colDispDown : na,
+     title = "Displacement bar")
+
+// The "x" sits at the sweep extreme -- the furthest price reached while the
+// pool was penetrated -- drawn on the bar the sweep was CONFIRMED.
+plotshape(showSweepMarkers ? sweepUpMarkPx : na, title = "Buy-side sweep",
+     style = shape.xcross, location = location.absolute,
+     color = color.new(colBuySide, 0), size = size.tiny)
+plotshape(showSweepMarkers ? sweepDnMarkPx : na, title = "Sell-side sweep",
+     style = shape.xcross, location = location.absolute,
+     color = color.new(colSellSide, 0), size = size.tiny)
 
 // =============================================================================
 // SECTION E: DEBUG TABLE
@@ -746,11 +1285,38 @@ f_poolStr(Pool p) =>
         s := str.tostring(p.price, format.mintick) + " (" + p.tag + ")"
     s
 
+// "Asia High T0  7b left  MSS" for a live sweep, or "none".
+f_liveSweepStr(Sweep sw) =>
+    string s = "none"
+    if not na(sw)
+        s := sw.poolTag + "  T" + str.tostring(sw.poolTier) +
+             "  " + str.tostring(sw.expiresAtBarIdx - bar_index) + "b left"
+        if sw.mssConfirmed
+            s := s + "  +MSS"
+    s
+
+// "MSS up  3b ago" for the last structure event, or "none".
+f_structEvtStr(string kind, int dir, int bidx) =>
+    string s = "none"
+    if kind != "" and not na(bidx)
+        s := kind + " " + (dir > 0 ? "up" : "down") + "  " + str.tostring(bar_index - bidx) + "b ago"
+    s
+
+// "12 swept / 5 broke  (2.4:1)" -- the calibration ratio for
+// breakoutClosesToInvalidate.
+f_sweepRatioStr(int swept, int broke) =>
+    string s = str.tostring(swept) + " swept / " + str.tostring(broke) + " broke"
+    if broke > 0
+        // *1.0 forces float division -- Pine truncates int/int, so 12/5 would
+        // print 2 instead of 2.4 and the ratio would be useless.
+        s := s + "  (" + str.tostring(swept * 1.0 / broke, "#.0") + ":1)"
+    s
+
 var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 18,
+        dbg := table.new(position.top_right, 2, 25,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
@@ -768,12 +1334,16 @@ if barstate.islast and showDebugTable
 
     // Tier breakdown + saturation. If T2 is pinned and the total sits at the
     // cap, the book is under eviction pressure.
+    // Tier breakdown, saturation, and how many are still ACTIVE. Stage 2
+    // consumes pools on sweeps and breakouts, so act < total is now normal and
+    // a large gap means most of the book has already been taken out.
     string tierStr = "T0 " + str.tostring(f_tierCount(TIER_PROTECTED)) +
                      " | T1 " + str.tostring(f_tierCount(TIER_SIGNIFICANT)) +
                      " | T2 " + str.tostring(f_tierCount(TIER_TRANSIENT)) +
-                     "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")"
+                     "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
+                     "  act " + str.tostring(activePoolCount())
 
-    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 1", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 2", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
@@ -827,6 +1397,35 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 17, "Nearest pool", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 17, "up " + f_poolStr(nBuy) + " | dn " + f_poolStr(nSell), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
+    // ---- STAGE 2 ROWS --------------------------------------------------------
+    string biasStr = structBias > 0 ? "BULL" : structBias < 0 ? "BEAR" : "NEUTRAL"
+    string dispStr = isDisplacementUp ? "UP" : isDisplacementDown ? "DOWN" : "none"
+    bool   longArmed  = isSweepMssPair(false)   // sell-side swept, bullish MSS
+    bool   shortArmed = isSweepMssPair(true)    // buy-side swept, bearish MSS
+    string armedStr = longArmed and shortArmed ? "BOTH (?)" :
+                      longArmed ? "LONG" : shortArmed ? "SHORT" : "none"
+
+    table.cell(dbg, 0, 18, "S2 bias", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 18, biasStr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 19, "Displacement", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 19, dispStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 20, "Live sweep BUY", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 20, f_liveSweepStr(getLiveSweep(true)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 21, "Live sweep SELL", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 21, f_liveSweepStr(getLiveSweep(false)), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 22, "Last structure", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 22, f_structEvtStr(lastStructType, lastStructDir, lastStructBar), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 23, "Sweep+MSS armed", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 23, armedStr, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 24, "Sweep : breakout", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 24, f_sweepRatioStr(sweepConfirmedCount, breakoutRejectedCount), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
     table.delete(dbg)
@@ -838,9 +1437,14 @@ if barstate.islast and not showDebugTable and not na(dbg)
 // fills in its own block and touches nothing else.
 // =============================================================================
 
-// ===== STAGE 2: DISPLACEMENT / SWEEP DETECTION =====
-// Will consume: nearestBuySideAbove() / nearestSellSideBelow(), the Pool.active
-// flag, atr, asiaMedRange / londonMedRange, and the confirmed swing arrays.
+// ===== STAGE 2: DISPLACEMENT / SWEEP DETECTION ===== IMPLEMENTED
+// Lives above the debug table, as sections G / H / I / J, because the table
+// consumes its output and Pine requires declaration before use.
+// Stage-2 API now available to later stages:
+//   isDisplacementUp / isDisplacementDown
+//   getLiveSweep(buySide) -> Sweep, isSweepMssPair(buySide) -> bool
+//   structBias, lastStructType / lastStructDir / lastStructBar
+//   lastBreakoutDir, sweepConfirmedCount, breakoutRejectedCount
 
 // ===== STAGE 3: FVG / IFVG / ORDER BLOCKS / OTE =====
 
