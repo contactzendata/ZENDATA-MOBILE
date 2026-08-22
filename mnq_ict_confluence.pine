@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-// MNQ ICT CONFLUENCE  --  STAGE 5 of 6: CONFLUENCE SCORING
+// MNQ ICT CONFLUENCE  --  STAGE 6 of 6: ENTRY, GUARD RAILS, ALERTS  [COMPLETE]
 // -----------------------------------------------------------------------------
 // DISCLAIMER: research/education tool. NOT financial advice. Every level and
 // threshold in here is an untested hypothesis about how MNQ behaves. Trade your
@@ -50,6 +50,12 @@
 //      score distribution, and a full breakdown of every component so a score
 //      can always be explained rather than merely reported.
 //
+// WHAT STAGE 6 ADDS
+//   S. The entry trigger, the structural stop, the two-target plan, position
+//      sizing, every guard rail with its own counter, and alert() calls.
+//      This is an INDICATOR: nothing here places an order. The "position" it
+//      tracks is virtual, and exists so TP1/stop/runner alerts can fire.
+//
 // ANTI-REPAINT CONTRACT (holds for every stage of this project)
 //   1. Session membership comes from the bar's OPEN time, which is fixed the
 //      moment the bar prints, so session flags can never repaint.
@@ -70,7 +76,7 @@
 // max_bars_back is raised because stage 3 reads close[k]/open[k] with a SERIES
 // offset when it hunts backwards for an order-block anchor candle. Pine cannot
 // infer the required buffer from a variable offset, so we state it.
-indicator("MNQ ICT Confluence [S5]", shorttitle = "MNQ ICT S5", overlay = true,
+indicator("MNQ ICT Confluence [S6]", shorttitle = "MNQ ICT", overlay = true,
      max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
      max_bars_back = 500)
 
@@ -242,6 +248,69 @@ wLocation  = input.float(1.5, "Weight: dealing-range location", minval = 0.0, ma
 wSmt       = input.float(1.0, "Weight: SMT (x strength x session)", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
 wSessionPd = input.float(1.0, "Weight: session premium / discount", minval = 0.0, maxval = 10.0, step = 0.1, group = grpScore)
 
+// ---- Group: Entry ------------------------------------------------------------
+grpEntry = "Entry"
+
+entryMode = input.string("Retest limit", "Entry trigger", group = grpEntry,
+     options = ["Retest limit", "MSS close", "Either"],
+     tooltip = "Retest limit waits for price to trade back into the bestPOI zone between its CE and far edge. MSS close takes the close of the MSS confirmation bar. Either prefers the retest and falls back to a market entry when the retest window expires -- see the note in section S on why the fallback cannot be the MSS bar's own price.")
+entryRetestBars = input.int(5, "Retest window (bars)", minval = 1, maxval = 100, group = grpEntry)
+entryRequireScoreAtTrigger = input.bool(true, "Score must still pass on the trigger bar", group = grpEntry,
+     tooltip = "A score that passed three bars ago and has since decayed must not fire. The score AT the trigger is recorded separately from the setup's peak; they are different numbers.")
+
+// ---- Group: Stop -------------------------------------------------------------
+grpStop = "Stop"
+
+stopMode = input.string("Wider of the two", "Stop anchor", group = grpStop,
+     options = ["Beyond swept extreme", "Beyond POI far edge", "Wider of the two"])
+stopBufferTicks   = input.float(2.0, "Stop buffer (ticks)", minval = 0.0, step = 0.25, group = grpStop)
+stopBufferAtrMult = input.float(0.10, "Stop buffer (x ATR)", minval = 0.0, step = 0.01, group = grpStop)
+stopBufferMode    = input.string("Max of both", "Stop buffer mode", group = grpStop,
+     options = ["Ticks", "ATR", "Max of both"])
+stopMinPts = input.float(8.0,  "Min structural stop (pts)", minval = 0.25, step = 0.25, group = grpStop)
+stopMaxPts = input.float(30.0, "Max structural stop (pts)", minval = 0.25, step = 0.25, group = grpStop,
+     tooltip = "Outside this band the signal is SUPPRESSED, never clamped. A 45-point structural stop is the structure telling us it is not what we think it is; clamping would hide that and quietly change the trade.")
+
+// ---- Group: Targets ----------------------------------------------------------
+grpTgt = "Targets"
+
+tp1R   = input.float(1.0, "TP1 at R multiple", minval = 0.1, step = 0.1, group = grpTgt)
+tp1Pct = input.float(50.0, "Percent taken at TP1", minval = 1.0, maxval = 100.0, step = 5.0, group = grpTgt)
+moveToBeAfterTp1 = input.bool(true, "Move stop to break-even after TP1", group = grpTgt)
+runnerTarget = input.string("Next opposing pool", "Runner target", group = grpTgt,
+     options = ["Next opposing pool", "Fixed R multiple", "Either whichever first"])
+runnerFixedR = input.float(2.0, "Runner fixed R multiple", minval = 0.1, step = 0.1, group = grpTgt)
+
+// ---- Group: Guard Rails ------------------------------------------------------
+grpGuard = "Guard Rails"
+
+minBarsBetweenSameDir = input.int(18, "Min bars between same-direction signals", minval = 0, maxval = 500, group = grpGuard,
+     tooltip = "Secondary guard. The PRIMARY debounce is the spent flag on the Sweep object: a sweep that produced a trigger can never produce another. This one catches a genuinely new sweep armed by a stale reversal leg.")
+maxSignalsPerSession = input.int(2, "Max signals per session, per direction", minval = 1, maxval = 20, group = grpGuard)
+exhaustMult = input.float(1.5, "Exhaustion: session range x median", minval = 0.5, step = 0.1, group = grpGuard,
+     tooltip = "No entry once the session has already travelled more than this multiple of its own 20-session median range. Skipped when the median is na.")
+ambiguityMargin = input.float(0.75, "Ambiguity margin", minval = 0.0, step = 0.05, group = grpGuard,
+     tooltip = "If both sides pass and their scores are within this, take NEITHER. Two opposing setups scoring the same is the model being confused, not two opportunities.")
+
+asiaCutoff    = input.session("0145-0200", "Asia no-new-entries window (ET)", group = grpGuard,
+     tooltip = "Expressed as a WINDOW running from the cutoff time to the session end, because that is the DST-safe way to say 'from this time onward' in Pine. If you change the session preset, change this to end where that session ends.")
+asiaFlatten   = input.session("0155-0200", "Asia flatten window (ET)", group = grpGuard)
+londonCutoff  = input.session("0445-0500", "London no-new-entries window (ET)", group = grpGuard,
+     tooltip = "Sized for the default Killzone 02:00-05:00 preset. Switching London to Extended or Legacy REQUIRES changing this to match, or entries resume after 05:00.")
+londonFlatten = input.session("0455-0500", "London flatten window (ET)", group = grpGuard)
+
+// ---- Group: Risk -------------------------------------------------------------
+grpRisk = "Risk"
+
+riskUSD = input.float(200.0, "Risk per trade (USD)", minval = 1.0, step = 10.0, group = grpRisk,
+     tooltip = "MNQ point value is fixed at $2.00 in code, not exposed, because changing it silently would make every size and every dollar figure wrong.")
+
+// ---- Group: Alerts -----------------------------------------------------------
+grpAlert = "Alerts"
+
+alertPrefix = input.string("MNQ-ICT", "Alert prefix", group = grpAlert,
+     tooltip = "Tags every alert() message so multiple charts can be routed apart.")
+
 // ---- Group: Display ----------------------------------------------------------
 grpDisp = "Display"
 
@@ -263,6 +332,7 @@ showOTE  = input.bool(true, "Show OTE band",         group = grpDisp)
 fadeInvalidated = input.bool(true, "Fade invalidated zones instead of deleting", group = grpDisp,
      tooltip = "Same reasoning as retired liquidity pools: where a zone failed is information.")
 showSMT = input.bool(true, "Show SMT markers", group = grpDisp)
+showSignals = input.bool(true, "Show entry / stop / target lines", group = grpDisp)
 showHistoricalOTE = input.bool(false, "Keep dead OTE bands (validation mode)", group = grpDisp,
      tooltip = "Off is correct for live trading: a dealing range is a claim about right now. On is for scrolling back to audit whether the dealing-range logic was right on past setups.")
 
@@ -344,6 +414,14 @@ color colDead     = #9e9e9e   // faded, invalidated or expired
 int MAX_FVGS  = 40
 int MAX_IFVGS = 20
 int MAX_OBS   = 20
+
+// MNQ point value. FIXED, deliberately not an input: every contract count and
+// every dollar figure in the alerts is derived from it, so a silent change
+// would make all of them wrong at once.
+float MNQ_POINT_VALUE = 2.00
+
+// Stage-6 drawing budget: four lines per signal.
+int MAX_SIG_LINES = 40
 
 // A session range smaller than one average bar is not a range. Early in a
 // session a couple of ticks would flip the premium/discount reading from one
@@ -1016,6 +1094,12 @@ f_pushS2Label(label lb) =>
 // sweepExtreme  : furthest high (or low) reached while the pool was penetrated
 // expiresAtBarIdx : after this bar the sweep is stale and is pruned
 // mssConfirmed  : set by section I when an opposite MSS lands in time
+// spent         : STAGE 6 PRIMARY DEBOUNCE. Set once this sweep has produced an
+//                 entry trigger, after which it can never produce another. We
+//                 debounce on the SWEEP rather than on the MSS event because a
+//                 single reversal leg can legitimately fire several MSS events
+//                 while structural bias lags behind it. The sweep is the setup;
+//                 the MSS is only its confirmation.
 type Sweep
     bool   buySide
     string poolTag
@@ -1025,6 +1109,7 @@ type Sweep
     int    confirmBarIdx
     int    expiresAtBarIdx
     bool   mssConfirmed
+    bool   spent
 
 var array<Sweep> sweeps = array.new<Sweep>()
 
@@ -1248,7 +1333,8 @@ if barstate.isconfirmed
             array.push(sweeps, Sweep.new(buySide = true, poolTag = pendUpPool.tag,
                      poolTier = pendUpPool.tier, poolPrice = pendUpPool.price,
                      sweepExtreme = pendUpExtreme, confirmBarIdx = bar_index,
-                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false))
+                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false,
+                     spent = false))
             sweepUpMarkPx := pendUpExtreme
             if showSweepMarkers
                 f_pushS2Label(label.new(bar_index, pendUpExtreme, "swept: " + pendUpPool.tag,
@@ -1306,7 +1392,8 @@ if barstate.isconfirmed
             array.push(sweeps, Sweep.new(buySide = false, poolTag = pendDnPool.tag,
                      poolTier = pendDnPool.tier, poolPrice = pendDnPool.price,
                      sweepExtreme = pendDnExtreme, confirmBarIdx = bar_index,
-                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false))
+                     expiresAtBarIdx = bar_index + sweepValidBars, mssConfirmed = false,
+                     spent = false))
             sweepDnMarkPx := pendDnExtreme
             if showSweepMarkers
                 f_pushS2Label(label.new(bar_index, pendDnExtreme, "swept: " + pendDnPool.tag,
@@ -2705,6 +2792,454 @@ scorePasses(bool isLong) =>
     r
 
 // =============================================================================
+// SECTION S (STAGE 6): ENTRY TRIGGER, GUARD RAILS, SIZING, ALERTS
+//
+// THIS IS AN INDICATOR. Nothing below places an order. It maintains a VIRTUAL
+// position so that TP1, stop and runner alerts can fire, and it reports what a
+// trade WOULD have been. Every number is display and alert payload.
+//
+// GUARD RAIL COUNTING PRINCIPLE: a counter increments when a guard blocks a
+// would-be TRIGGER, not on every bar the guard happens to be true. Counting
+// per bar would let one long-lived condition swamp the breakdown and tell you
+// nothing about which rail is actually doing work. The two exceptions are the
+// spent debounce and the ambiguity guard, which are counted once per episode
+// for the same reason.
+// =============================================================================
+
+// ---- Buffer resolution, same three-mode shape as everywhere else ------------
+f_stopBuffer() =>
+    float tTicks = stopBufferTicks * syminfo.mintick
+    float tAtr   = stopBufferAtrMult * nz(atr)
+    float res    = switch stopBufferMode
+        "Ticks" => tTicks
+        "ATR"   => tAtr
+        => math.max(tTicks, tAtr)
+    res
+
+// ---- Session windows, DST-safe via time() -----------------------------------
+bool pastAsiaCutoff   = not na(time(timeframe.period, asiaCutoff,    TZ))
+bool pastLondonCutoff = not na(time(timeframe.period, londonCutoff,  TZ))
+bool inAsiaFlatten    = not na(time(timeframe.period, asiaFlatten,   TZ))
+bool inLondonFlatten  = not na(time(timeframe.period, londonFlatten, TZ))
+bool pastCutoff  = (inAsiaRaw and pastAsiaCutoff) or (inLondonRaw and pastLondonCutoff)
+bool flattenNow  = (inAsiaRaw and inAsiaFlatten)  or (inLondonRaw and inLondonFlatten)
+
+// ---- Virtual position state -------------------------------------------------
+var int    posDir      = 0        // 0 flat, +1 long, -1 short
+var float  posEntry    = na
+var float  posStop     = na
+var float  posTp1      = na
+var float  posRunner   = na
+var bool   posTp1Hit   = false
+var int    posBar      = na
+var int    posQty      = 0
+
+// ---- Last signal, for the table and for the min-bars guard -------------------
+var int    lastSigDir     = 0
+var float  lastSigScore   = na    // score AT TRIGGER
+var float  lastSigPeak    = na    // peak the setup reached, a different number
+var float  lastSigEntry   = na
+var float  lastSigStop    = na
+var float  lastSigTp1     = na
+var float  lastSigRunner  = na
+var float  lastSigStopPts = na
+var int    lastSigQty     = 0
+var float  lastSigRisk    = na
+var int    lastSigBar     = na
+var string lastSigSess    = "-"
+var string lastSigSwept   = "-"
+var string lastSigTrig    = "-"
+var int    lastSigBarLong  = na
+var int    lastSigBarShort = na
+
+// ---- Per-session signal counts, per direction -------------------------------
+var int sigAsiaLong  = 0
+var int sigAsiaShort = 0
+var int sigLdnLong   = 0
+var int sigLdnShort  = 0
+
+// ---- Suppression counters. One per guard rail. ------------------------------
+var int supSpent     = 0   // sweep already produced a trigger (primary debounce)
+var int supInPos     = 0   // a virtual position is already open
+var int supOutSess   = 0   // outside the signal-eligible session windows
+var int supCutoff    = 0   // past the session no-new-entries cutoff
+var int supExhaust   = 0   // session has already travelled too far
+var int supMaxSess   = 0   // per-session, per-direction cap reached
+var int supMinBars   = 0   // too close to the previous same-direction signal
+var int supDecay     = 0   // score no longer passed on the trigger bar
+var int supStopBand  = 0   // structural stop outside the min/max band
+var int supAmbig     = 0   // both sides passed within the ambiguity margin
+var int runnerFallbk = 0   // opposing pool unusable, fell back to fixed R
+
+// Episode latches, so per-bar states are counted once rather than every bar.
+var int  lastSpentCounted = na
+var bool wasAmbiguous     = false
+
+// ---- Per-bar visual outputs, reset every bar --------------------------------
+float entryMarkLong  = na
+float entryMarkShort = na
+
+// ---- Signal line budget ------------------------------------------------------
+var array<line> sigLines = array.new<line>()
+
+f_pushSigLine(line l) =>
+    array.push(sigLines, l)
+    while array.size(sigLines) > MAX_SIG_LINES
+        line.delete(array.shift(sigLines))
+
+// ---- Alert message builders --------------------------------------------------
+// alert(), NOT alertcondition(). alertcondition() does not fire through the
+// "Any alert() function call" channel, which is the only practical way to route
+// these to a phone. Messages are key=value pairs so they can be parsed
+// downstream rather than only read.
+f_sessName() =>
+    string sname = inAsiaRaw ? "ASIA" : inLondonRaw ? "LONDON" : "OFF"
+    sname
+
+f_entryAlertMsg(bool isLong, float sc, float pk, float e, float st, float t1,
+     float rn, float spts, string swept, int tier, string poiK, int qty,
+     float riskAct, string trig) =>
+    string m = alertPrefix + " | evt=ENTRY" +
+             " | side=" + (isLong ? "LONG" : "SHORT") +
+             " | score=" + str.tostring(sc, "#.00") +
+             " | peak=" + str.tostring(pk, "#.00") +
+             " | entry=" + str.tostring(e, format.mintick) +
+             " | stop=" + str.tostring(st, format.mintick) +
+             " | tp1=" + str.tostring(t1, format.mintick) +
+             " | tp1pct=" + str.tostring(tp1Pct, "#") +
+             " | runner=" + str.tostring(rn, format.mintick) +
+             " | stopPts=" + str.tostring(spts, "#.00") +
+             " | swept=" + swept +
+             " | tier=" + str.tostring(tier) +
+             " | poi=" + poiK +
+             " | trigger=" + trig +
+             " | session=" + f_sessName() +
+             " | qty=" + str.tostring(qty) +
+             " | risk=" + str.tostring(riskAct, "#.00")
+    m
+
+f_exitAlertMsg(string evt, bool isLong, float px, string extra) =>
+    string m = alertPrefix + " | evt=" + evt +
+             " | side=" + (isLong ? "LONG" : "SHORT") +
+             " | price=" + str.tostring(px, format.mintick) +
+             " | session=" + f_sessName() + extra
+    m
+
+if barstate.isconfirmed
+    // =========================================================================
+    // 1. SESSION BOOKKEEPING
+    // =========================================================================
+    if asiaOpenRaw
+        sigAsiaLong  := 0
+        sigAsiaShort := 0
+    if londonOpenRaw
+        sigLdnLong  := 0
+        sigLdnShort := 0
+
+    // Snapshot BEFORE exit management, so a stop-out and a fresh entry can
+    // never land on the same bar.
+    bool wasFlat = posDir == 0
+
+    // =========================================================================
+    // 2. MANAGE THE OPEN VIRTUAL POSITION
+    // Stop is checked FIRST. On a bar that reaches both the stop and TP1 we
+    // cannot know the order from bar data, and assuming the good fill first
+    // would flatter every result.
+    // =========================================================================
+    if posDir != 0
+        bool isL = posDir > 0
+        bool hitStop = isL ? low <= posStop : high >= posStop
+        bool hitTp1  = isL ? high >= posTp1 : low <= posTp1
+        bool hitRun  = isL ? high >= posRunner : low <= posRunner
+
+        if hitStop
+            alert(f_exitAlertMsg(posTp1Hit ? "BREAKEVEN_STOP" : "STOP", isL, posStop,
+                     " | qty=" + str.tostring(posQty)), alert.freq_once_per_bar_close)
+            posDir := 0
+        if not hitStop and hitTp1 and not posTp1Hit
+            posTp1Hit := true
+            alert(f_exitAlertMsg("TP1", isL, posTp1,
+                     " | pct=" + str.tostring(tp1Pct, "#") +
+                     " | qty=" + str.tostring(posQty)), alert.freq_once_per_bar_close)
+            if moveToBeAfterTp1
+                posStop := posEntry
+        if not hitStop and hitRun
+            alert(f_exitAlertMsg("RUNNER_TARGET", isL, posRunner,
+                     " | qty=" + str.tostring(posQty)), alert.freq_once_per_bar_close)
+            posDir := 0
+        // Session flatten overrides everything still open.
+        if posDir != 0 and flattenNow
+            alert(f_exitAlertMsg("SESSION_FLATTEN", isL, close,
+                     " | qty=" + str.tostring(posQty)), alert.freq_once_per_bar_close)
+            posDir := 0
+
+    // =========================================================================
+    // 3. WHICH SIDE, IF ANY
+    // Highest score wins. But two opposing setups scoring within the ambiguity
+    // margin is the model being confused, not two opportunities: take neither.
+    // =========================================================================
+    bool  passL = scorePasses(true)
+    bool  passS = scorePasses(false)
+    float totL  = currentScore(true)
+    float totS  = currentScore(false)
+
+    bool ambiguous = passL and passS and math.abs(totL - totS) < ambiguityMargin
+    if ambiguous and not wasAmbiguous
+        supAmbig += 1
+    wasAmbiguous := ambiguous
+
+    int wantDir = 0
+    if passL and not passS
+        wantDir := 1
+    if passS and not passL
+        wantDir := -1
+    if passL and passS and not ambiguous and totL > totS
+        wantDir := 1
+    if passL and passS and not ambiguous and totS > totL
+        wantDir := -1
+
+    // =========================================================================
+    // 4. TRIGGER, THEN GUARD RAILS
+    // =========================================================================
+    if wantDir != 0
+        bool  isLong = wantDir > 0
+        Sweep sw     = getLiveSweep(not isLong)
+        bool  ok     = not na(sw)
+
+        // --- PRIMARY DEBOUNCE, evaluated first so a spent sweep cannot spam
+        //     the trigger logic. Counted once per sweep, not once per bar.
+        if ok and sw.spent
+            if na(lastSpentCounted) or lastSpentCounted != sw.confirmBarIdx
+                supSpent += 1
+                lastSpentCounted := sw.confirmBarIdx
+            ok := false
+
+        // --- Resolve the trigger --------------------------------------------
+        POI   p        = na
+        bool  fire     = false
+        float entryPx  = na
+        string trigStr = "-"
+        if ok
+            p := bestPOI(isLong, close)
+
+            // Retest: price trades back to the zone's CE and the bar still
+            // closes on the correct side of its far edge. A bar that closes
+            // beyond the far edge did not retest the zone, it broke it.
+            bool trigRetest = false
+            if not na(p) and isLong and low <= p.ce and close > p.bottom
+                trigRetest := true
+            if not na(p) and not isLong and high >= p.ce and close < p.top
+                trigRetest := true
+
+            bool mssBarNow = not na(lastStructBar) and lastStructBar == bar_index and lastStructType == "MSS" and ((isLong and lastStructDir > 0) or (not isLong and lastStructDir < 0))
+
+            // The retest window is measured from the sweep's own MSS pairing,
+            // which is the earliest bar the setup could have been armed.
+            int  armBar     = sw.confirmBarIdx
+            bool windowOpen = (bar_index - armBar) <= entryRetestBars + mssMaxBarsAfterSweep
+            bool windowEnd  = (bar_index - armBar) == entryRetestBars + mssMaxBarsAfterSweep
+
+            if entryMode == "MSS close" and mssBarNow
+                fire    := true
+                entryPx := close
+                trigStr := "MSS_CLOSE"
+            if entryMode == "Retest limit" and trigRetest and windowOpen
+                fire    := true
+                entryPx := p.ce
+                trigStr := "RETEST"
+            if entryMode == "Either" and trigRetest and windowOpen
+                fire    := true
+                entryPx := p.ce
+                trigStr := "RETEST"
+            // FALLBACK NOTE: "fall back to MSS close" cannot mean filling at the
+            // MSS bar's price -- that price is several bars in the past and
+            // claiming it would be look-back pricing. The honest fallback is a
+            // market entry at the close of the bar the window expires on, and
+            // the alert says MARKET_FALLBACK so it is never mistaken for a
+            // retest fill.
+            if entryMode == "Either" and not trigRetest and windowEnd
+                fire    := true
+                entryPx := close
+                trigStr := "MARKET_FALLBACK"
+
+            ok := fire
+
+        // --- Guard rails. Each one counts only when it blocks a real trigger.
+        if ok and not wasFlat
+            supInPos += 1
+            ok := false
+        if ok and not (inAsiaSignal or inLondon)
+            // inAsiaSignal is stage 1's signal-eligible Asia: it drops the
+            // 00:00-02:00 tail when asiaExcludeLate is on.
+            supOutSess += 1
+            ok := false
+        if ok and pastCutoff
+            supCutoff += 1
+            ok := false
+        if ok
+            float med = inAsiaRaw ? asiaMedRange : inLondonRaw ? londonMedRange : na
+            if not na(med) and not na(curSessRange) and curSessRange > exhaustMult * med
+                supExhaust += 1
+                ok := false
+        if ok
+            int used = inAsiaRaw ? (isLong ? sigAsiaLong : sigAsiaShort) :
+                       inLondonRaw ? (isLong ? sigLdnLong : sigLdnShort) : 0
+            if used >= maxSignalsPerSession
+                supMaxSess += 1
+                ok := false
+        if ok
+            int lastBarSameDir = isLong ? lastSigBarLong : lastSigBarShort
+            if not na(lastBarSameDir) and (bar_index - lastBarSameDir) < minBarsBetweenSameDir
+                supMinBars += 1
+                ok := false
+        if ok and entryRequireScoreAtTrigger
+            // Re-read the score on THIS bar. scLong/scShort were recomputed
+            // earlier in this same confirmed pass, so this is the trigger-bar
+            // score, not a stale one.
+            if not scorePasses(isLong)
+                supDecay += 1
+                ok := false
+
+        // --- Stop, and the suppression band ---------------------------------
+        float buf     = f_stopBuffer()
+        float stopPx  = na
+        float stopPts = na
+        if ok
+            float stopSwept = isLong ? sw.sweepExtreme - buf : sw.sweepExtreme + buf
+            float stopPoi   = na
+            if not na(p)
+                stopPoi := isLong ? p.bottom - buf : p.top + buf
+            if stopMode == "Beyond swept extreme"
+                stopPx := stopSwept
+            if stopMode == "Beyond POI far edge"
+                stopPx := na(stopPoi) ? stopSwept : stopPoi
+            if stopMode == "Wider of the two"
+                stopPx := na(stopPoi) ? stopSwept : (isLong ? math.min(stopSwept, stopPoi) : math.max(stopSwept, stopPoi))
+            stopPts := isLong ? entryPx - stopPx : stopPx - entryPx
+            // SUPPRESS, never clamp. A stop outside the band is the structure
+            // saying it is not the structure we thought we had.
+            if na(stopPts) or stopPts < stopMinPts or stopPts > stopMaxPts
+                supStopBand += 1
+                ok := false
+
+        // --- Targets, sizing, and fire --------------------------------------
+        if ok
+            float tp1Px = isLong ? entryPx + tp1R * stopPts : entryPx - tp1R * stopPts
+
+            Pool  opp     = isLong ? nearestBuySideAboveTier(entryPx, sweepMaxTier) : nearestSellSideBelowTier(entryPx, sweepMaxTier)
+            // Built with an if, not a ternary: Pine evaluates both arms and
+            // opp.price on an na object is a runtime error.
+            float runPool = na
+            if not na(opp)
+                runPool := opp.price
+            float runFix  = isLong ? entryPx + runnerFixedR * stopPts : entryPx - runnerFixedR * stopPts
+            // A pool nearer than TP1 is not a runner target, it is an obstacle.
+            bool poolUnusable = na(runPool)
+            if not na(runPool) and isLong and runPool <= tp1Px
+                poolUnusable := true
+            if not na(runPool) and not isLong and runPool >= tp1Px
+                poolUnusable := true
+
+            float runnerPx = runFix
+            if runnerTarget == "Next opposing pool" and not poolUnusable
+                runnerPx := runPool
+            if runnerTarget == "Either whichever first" and not poolUnusable
+                runnerPx := isLong ? math.min(runPool, runFix) : math.max(runPool, runFix)
+            if poolUnusable and runnerTarget != "Fixed R multiple"
+                runnerFallbk += 1
+
+            // Sizing. floor() then a floor of 1 contract, and we report the
+            // ACTUAL dollar risk so the rounding error is visible rather than
+            // implied.
+            int   qty       = math.max(1, int(math.floor(riskUSD / (stopPts * MNQ_POINT_VALUE))))
+            float riskAct   = qty * stopPts * MNQ_POINT_VALUE
+            float peakNow   = isLong ? nz(peakLong, currentScore(true)) : nz(peakShort, currentScore(false))
+            float scoreNow  = currentScore(isLong)
+
+            // Burn the sweep. THE primary debounce.
+            sw.spent := true
+
+            posDir    := wantDir
+            posEntry  := entryPx
+            posStop   := stopPx
+            posTp1    := tp1Px
+            posRunner := runnerPx
+            posTp1Hit := false
+            posBar    := bar_index
+            posQty    := qty
+
+            lastSigDir     := wantDir
+            lastSigScore   := scoreNow
+            lastSigPeak    := peakNow
+            lastSigEntry   := entryPx
+            lastSigStop    := stopPx
+            lastSigTp1     := tp1Px
+            lastSigRunner  := runnerPx
+            lastSigStopPts := stopPts
+            lastSigQty     := qty
+            lastSigRisk    := riskAct
+            lastSigBar     := bar_index
+            lastSigSess    := f_sessName()
+            lastSigSwept   := sw.poolTag
+            lastSigTrig    := trigStr
+            if isLong
+                lastSigBarLong := bar_index
+            if not isLong
+                lastSigBarShort := bar_index
+
+            if inAsiaRaw and isLong
+                sigAsiaLong += 1
+            if inAsiaRaw and not isLong
+                sigAsiaShort += 1
+            if inLondonRaw and isLong
+                sigLdnLong += 1
+            if inLondonRaw and not isLong
+                sigLdnShort += 1
+
+            if isLong
+                entryMarkLong := entryPx
+            if not isLong
+                entryMarkShort := entryPx
+
+            string poiKindNow = "none"
+            if not na(p)
+                poiKindNow := p.kind
+            alert(f_entryAlertMsg(isLong, scoreNow, peakNow, entryPx, stopPx, tp1Px,
+                     runnerPx, stopPts, sw.poolTag, sw.poolTier, poiKindNow, qty,
+                     riskAct, trigStr), alert.freq_once_per_bar_close)
+
+            // --- Drawings: four short segments, not extended, so they cannot
+            //     accumulate into a wall of lines across the chart.
+            if showSignals
+                color sc2 = isLong ? colSellSide : colBuySide
+                f_pushSigLine(line.new(bar_index, entryPx, bar_index + 20, entryPx,
+                         xloc = xloc.bar_index, color = color.new(sc2, 0), width = 2))
+                f_pushSigLine(line.new(bar_index, stopPx, bar_index + 20, stopPx,
+                         xloc = xloc.bar_index, color = color.new(color.red, 20),
+                         style = line.style_dashed, width = 1))
+                f_pushSigLine(line.new(bar_index, tp1Px, bar_index + 20, tp1Px,
+                         xloc = xloc.bar_index, color = color.new(color.green, 20),
+                         style = line.style_dotted, width = 1))
+                f_pushSigLine(line.new(bar_index, runnerPx, bar_index + 20, runnerPx,
+                         xloc = xloc.bar_index, color = color.new(color.green, 45),
+                         style = line.style_dotted, width = 1))
+                f_pushS2Label(label.new(bar_index, entryPx,
+                         (isLong ? "LONG " : "SHORT ") + str.tostring(scoreNow, "#.00") +
+                         "  x" + str.tostring(qty),
+                         xloc = xloc.bar_index,
+                         style = isLong ? label.style_label_up : label.style_label_down,
+                         color = color.new(sc2, 75), textcolor = color.new(sc2, 0),
+                         size = size.small))
+
+// ---- Entry markers -----------------------------------------------------------
+plotshape(showSignals ? entryMarkLong : na, title = "Long entry",
+     style = shape.triangleup, location = location.absolute,
+     color = color.new(colSellSide, 0), size = size.small)
+plotshape(showSignals ? entryMarkShort : na, title = "Short entry",
+     style = shape.triangledown, location = location.absolute,
+     color = color.new(colBuySide, 0), size = size.small)
+
+// =============================================================================
 // SECTION E: DEBUG TABLE
 // The stage-1 verification surface. Everything here is read from confirmed
 // state, so if a number looks wrong the state is wrong, not the display.
@@ -2822,11 +3357,30 @@ f_bucketStr() =>
              str.tostring(array.get(scoreBuckets, 4))
     s
 
+// ---- stage-6 table helpers --------------------------------------------------
+f_sigSideStr() =>
+    string r = "none"
+    if lastSigDir > 0
+        r := "LONG"
+    if lastSigDir < 0
+        r := "SHORT"
+    r
+
+f_posStr() =>
+    string r = "flat"
+    if posDir > 0
+        r := "LONG open"
+    if posDir < 0
+        r := "SHORT open"
+    if posDir != 0 and posTp1Hit
+        r := r + ", TP1 taken"
+    r
+
 var table dbg = na
 
 if barstate.islast and showDebugTable
     if na(dbg)
-        dbg := table.new(position.top_right, 2, 46,
+        dbg := table.new(position.top_right, 2, 54,
              border_width = 1, border_color = color.new(color.gray, 60),
              frame_width  = 1, frame_color  = color.new(color.gray, 40))
 
@@ -2853,7 +3407,7 @@ if barstate.islast and showDebugTable
                      "  (" + str.tostring(array.size(pools)) + "/" + str.tostring(maxPools) + ")" +
                      "  act " + str.tostring(activePoolCount())
 
-    table.cell(dbg, 0, 0, "MNQ ICT  STAGE 5", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 0, 0, "MNQ ICT  COMPLETE", bgcolor = hdrBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 0, "confirmed bars only", bgcolor = hdrBg, text_color = txt, text_size = size.small)
 
     table.cell(dbg, 0, 1, "Trading day", bgcolor = cellBg, text_color = txt, text_size = size.small)
@@ -3065,6 +3619,59 @@ if barstate.islast and showDebugTable
     table.cell(dbg, 0, 45, "Dist <5/5-6/6-7/7-8/8+", bgcolor = cellBg, text_color = txt, text_size = size.small)
     table.cell(dbg, 1, 45, f_bucketStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
 
+    // ---- STAGE 6 ROWS --------------------------------------------------------
+    string sigHdr = "none"
+    string sigLv1 = "-"
+    string sigLv2 = "-"
+    string sigLv3 = "-"
+    if lastSigDir != 0
+        sigHdr := f_sigSideStr() + "  " + str.tostring(lastSigScore, "#.00") +
+                  "  (peak " + str.tostring(lastSigPeak, "#.00") + ")"
+        sigLv1 := "e " + str.tostring(lastSigEntry, format.mintick) +
+                  "  s " + str.tostring(lastSigStop, format.mintick) +
+                  "  (" + str.tostring(lastSigStopPts, "#.0") + "pt)"
+        sigLv2 := "t1 " + str.tostring(lastSigTp1, format.mintick) +
+                  "  run " + str.tostring(lastSigRunner, format.mintick)
+        sigLv3 := "x" + str.tostring(lastSigQty) + "  $" + str.tostring(lastSigRisk, "#.00") +
+                  "  " + lastSigSess + "  " + lastSigTrig
+
+    table.cell(dbg, 0, 46, "S6 last signal", bgcolor = hdrBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 46, sigHdr, bgcolor = hdrBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 47, "Entry / stop", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 47, sigLv1, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 48, "TP1 / runner", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 48, sigLv2, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 49, "Size / risk", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 49, sigLv3, bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 50, "Swept / position", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 50, lastSigSwept + "  |  " + f_posStr(), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 51, "Session signals", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 51, "Asia L" + str.tostring(sigAsiaLong) + " S" + str.tostring(sigAsiaShort) +
+             "  |  Ldn L" + str.tostring(sigLdnLong) + " S" + str.tostring(sigLdnShort) +
+             "  (max " + str.tostring(maxSignalsPerSession) + ")", bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    // Which guard rail is actually doing the work. Each counts blocked
+    // TRIGGERS, not bars, so these are comparable to each other.
+    table.cell(dbg, 0, 52, "Sup: debounce", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 52, "spent " + str.tostring(supSpent) +
+             " | inpos " + str.tostring(supInPos) +
+             " | bars " + str.tostring(supMinBars) +
+             " | max " + str.tostring(supMaxSess) +
+             " | ambig " + str.tostring(supAmbig), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
+    table.cell(dbg, 0, 53, "Sup: context", bgcolor = cellBg, text_color = txt, text_size = size.small)
+    table.cell(dbg, 1, 53, "sess " + str.tostring(supOutSess) +
+             " | cut " + str.tostring(supCutoff) +
+             " | exh " + str.tostring(supExhaust) +
+             " | stop " + str.tostring(supStopBand) +
+             " | decay " + str.tostring(supDecay) +
+             " | runFB " + str.tostring(runnerFallbk), bgcolor = cellBg, text_color = txt, text_size = size.small)
+
 // Remove the table if the user switches it off mid-session.
 if barstate.islast and not showDebugTable and not na(dbg)
     table.delete(dbg)
@@ -3114,4 +3721,13 @@ if barstate.islast and not showDebugTable and not na(dbg)
 // The mandatory gate lives inside f_computeScore: no sweep with a paired MSS
 // means every component is zero, so peripheral evidence can never arm a setup.
 
-// ===== STAGE 6: ENTRY TRIGGER, GUARD RAILS, ALERTS =====
+// ===== STAGE 6: ENTRY TRIGGER, GUARD RAILS, ALERTS ===== IMPLEMENTED
+// Lives above the debug table, as section S. All six stages are now complete.
+//
+// ALERT SETUP: create ONE alert on this indicator with the condition set to
+// "Any alert() function call". alertcondition() is deliberately not used
+// anywhere in this script, because alertcondition alerts do not fire through
+// that channel and cannot carry a computed message.
+//
+// Alert events, all key=value parseable:
+//   ENTRY | TP1 | STOP | BREAKEVEN_STOP | RUNNER_TARGET | SESSION_FLATTEN
