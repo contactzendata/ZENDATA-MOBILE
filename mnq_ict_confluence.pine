@@ -2254,7 +2254,15 @@ if barstate.isconfirmed
                          quality = f_poiQuality(oteO, mssO, coiO), sourceBar = o.anchorBar,
                          inOte = oteO, fromMssLeg = mssO))
             // Failed block, INVERTED polarity.
-            if o.state == ST_BREAKER
+            // The `not o.mitigated` test matches every other zone type, so
+            // breakers are no longer syntactically privileged. SEE THE REPORT:
+            // on its own this is close to a no-op, because the OB state machine
+            // stops running once state == ST_BREAKER, so mitigated freezes at
+            // whatever it was at the flip -- and a block that flips did so by
+            // closing THROUGH the zone, which is the branch that never sets
+            // mitigated. Removing the asymmetry for real needs the state
+            // machine to keep tracking breakers in their inverted polarity.
+            if o.state == ST_BREAKER and not o.mitigated
                 bool bkBull = not o.bullish
                 bool oteB = f_zoneInOte(o.top, o.bottom, bkBull)
                 bool mssB = f_fromMssLeg(o.anchorBar)
@@ -2941,6 +2949,24 @@ var bool   posTp1Hit   = false
 var int    posBar      = na
 var int    posQty      = 0
 
+// ---- POI SNAPSHOT, one per armed setup per side ------------------------------
+// PART A. The retest trigger must NOT re-derive bestPOI every bar. Stage 3's
+// POI book excludes any zone whose CE has been tagged, and stage 3's state
+// machine runs earlier in the same confirmed bar -- so on the exact bar price
+// first reaches a zone's CE, that zone is promoted to CE_TAGGED and dropped
+// from the book BEFORE the entry logic looks at it. bestPOI then returns some
+// other zone whose CE price has not reached, the test is false, and the trigger
+// can never fire on the zone it was waiting for.
+//
+// Snapshotting at arm time also happens to be the honest model of the trade: a
+// trader identifies the zone when the setup forms and rests a limit at its CE.
+// The order does not re-pick a different zone every five minutes, and it does
+// not cancel itself because the fill tagged the level it was resting on.
+var POI armedPoiL   = na
+var int armedPoiSwL = na
+var POI armedPoiS   = na
+var int armedPoiSwS = na
+
 // ---- Last signal, for the table and for the min-bars guard -------------------
 var int    lastSigDir     = 0
 var float  lastSigScore   = na    // score AT TRIGGER
@@ -2977,6 +3003,12 @@ var int supDecay     = 0   // score no longer passed on the trigger bar
 var int supStopBand  = 0   // structural stop outside the min/max band
 var int supAmbig     = 0   // both sides passed within the ambiguity margin
 var int runnerFallbk = 0   // opposing pool unusable, fell back to fixed R
+
+// PART B. Trigger conditions that resolved TRUE, counted before any guard runs.
+// Without this denominator the suppression breakdown is uninterpretable: a
+// counter reading 0 could mean the guard never fired, or that nothing ever
+// reached it. Only the pair distinguishes those.
+var int triggersRaw = 0
 
 // Episode latches, so per-bar states are counted once rather than every bar.
 var int  lastSpentCounted = na
@@ -3095,6 +3127,26 @@ if barstate.isconfirmed
         supAmbig += 1
     wasAmbiguous := ambiguous
 
+    // ---- POI snapshot, taken once per armed setup, per side -----------------
+    // Refreshes while the snapshot is still na (no eligible zone existed yet at
+    // arm time), then locks for the life of that sweep.
+    Sweep swPoiL = getLiveSweep(false)
+    Sweep swPoiS = getLiveSweep(true)
+
+    if na(swPoiL)
+        armedPoiL   := na
+        armedPoiSwL := na
+    if passL and not na(swPoiL) and (na(armedPoiSwL) or armedPoiSwL != swPoiL.confirmBarIdx or na(armedPoiL))
+        armedPoiL   := bestPOI(true, close)
+        armedPoiSwL := swPoiL.confirmBarIdx
+
+    if na(swPoiS)
+        armedPoiS   := na
+        armedPoiSwS := na
+    if passS and not na(swPoiS) and (na(armedPoiSwS) or armedPoiSwS != swPoiS.confirmBarIdx or na(armedPoiS))
+        armedPoiS   := bestPOI(false, close)
+        armedPoiSwS := swPoiS.confirmBarIdx
+
     int wantDir = 0
     if passL and not passS
         wantDir := 1
@@ -3122,13 +3174,14 @@ if barstate.isconfirmed
             ok := false
 
         // --- Resolve the trigger --------------------------------------------
-        POI   p        = na
+        // p is the SNAPSHOT taken when this setup armed, not a fresh bestPOI
+        // call. See the note at armedPoiL for why re-deriving it here made the
+        // retest structurally unable to fire.
+        POI   p        = isLong ? armedPoiL : armedPoiS
         bool  fire     = false
         float entryPx  = na
         string trigStr = "-"
         if ok
-            p := bestPOI(isLong, close)
-
             // Retest: price trades back to the zone's CE and the bar still
             // closes on the correct side of its far edge. A bar that closes
             // beyond the far edge did not retest the zone, it broke it.
@@ -3168,6 +3221,11 @@ if barstate.isconfirmed
                 fire    := true
                 entryPx := close
                 trigStr := "MARKET_FALLBACK"
+
+            // Counted BEFORE any guard, so the suppression counters below have
+            // a denominator.
+            if fire
+                triggersRaw += 1
 
             ok := fire
 
@@ -3556,7 +3614,8 @@ if barstate.islast and showDebugTable
         table.cell(dbg, 1, 3, f_bucketStr(), bgcolor = kHdr, text_color = kTx, text_size = size.small)
 
         table.cell(dbg, 0, 4, "Sup: debounce", bgcolor = kBg, text_color = kTx, text_size = size.small)
-        table.cell(dbg, 1, 4, "spent " + str.tostring(supSpent) +
+        table.cell(dbg, 1, 4, "trig " + str.tostring(triggersRaw) +
+                 " | spent " + str.tostring(supSpent) +
                  " | inpos " + str.tostring(supInPos) +
                  " | bars " + str.tostring(supMinBars) +
                  " | max " + str.tostring(supMaxSess) +
@@ -3861,7 +3920,8 @@ if barstate.islast and showDebugTable
         // Which guard rail is actually doing the work. Each counts blocked
         // TRIGGERS, not bars, so these are comparable to each other.
         table.cell(dbg, 0, 52, "Sup: debounce", bgcolor = cellBg, text_color = txt, text_size = size.small)
-        table.cell(dbg, 1, 52, "spent " + str.tostring(supSpent) +
+        table.cell(dbg, 1, 52, "trig " + str.tostring(triggersRaw) +
+                 " | spent " + str.tostring(supSpent) +
                  " | inpos " + str.tostring(supInPos) +
                  " | bars " + str.tostring(supMinBars) +
                  " | max " + str.tostring(supMaxSess) +
