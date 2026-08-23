@@ -2082,6 +2082,28 @@ var float drWidthMssSum  = 0.0
 var float drWidthEndSum  = 0.0
 var int   drWidthN       = 0
 
+// ---- TEMPORARY: retracement-depth distribution ------------------------------
+// Does price retrace AT ALL, or just not into the 0.62-0.79 band? One sample
+// per dealing range, taken at death, recording the DEEPEST retracement that
+// range ever saw as a fraction of its width.
+//
+// Measured TWICE on purpose. inOTE tests `close`, but the retest trigger tests
+// `low <= p.ce` -- a wick. If the wick distribution is materially deeper than
+// the close distribution, price DOES reach the band and simply does not close
+// there, and the fix is to make inOTE wick-aware rather than to move the band.
+// That is a far less invasive change and it should be ruled out first.
+var float drMaxRetraceWick  = 0.0
+var float drMaxRetraceClose = 0.0
+var array<int> retraceBuckets = array.new<int>(5, 0)
+var float retraceWickSum  = 0.0
+var float retraceCloseSum = 0.0
+var int   retraceN        = 0
+
+// Buckets: <0.20 | 0.20-0.40 | 0.40-0.62 | 0.62-0.79 | >=0.79
+f_retraceBucket(float v) =>
+    int idx = v < 0.20 ? 0 : v < 0.40 ? 1 : v < 0.62 ? 2 : v < 0.79 ? 3 : 4
+    array.set(retraceBuckets, idx, array.get(retraceBuckets, idx) + 1)
+
 // Running leg extreme since each side's most recent sweep. This is how we name
 // the leg terminus WITHOUT a variable-length ta.highest(), which would have to
 // be called unconditionally on every bar to keep its history correct and would
@@ -2129,6 +2151,8 @@ if barstate.isconfirmed
             drBar    := bar_index
             drWidthAtMss   := legHighSinceSellSweep - swSell.sweepExtreme
             drCapBoundThis := false
+            drMaxRetraceWick  := 0.0
+            drMaxRetraceClose := 0.0
 
     // SHORT setup: mirror.
     if mssNow and lastStructDir < 0 and not na(swBuy) and swBuy.mssConfirmed and not na(legLowSinceBuySweep)
@@ -2139,6 +2163,8 @@ if barstate.isconfirmed
             drBar    := bar_index
             drWidthAtMss   := swBuy.sweepExtreme - legLowSinceBuySweep
             drCapBoundThis := false
+            drMaxRetraceWick  := 0.0
+            drMaxRetraceClose := 0.0
 
     // ---- Maintain / kill the range ------------------------------------------
     // A live leg EXTENDS its range: if price keeps making highs on a long
@@ -2151,6 +2177,16 @@ if barstate.isconfirmed
             drDead := true
         if not drIsLong and close > drHigh
             drDead := true
+        // Deepest retracement so far, measured against the range as it stood on
+        // THIS bar rather than against the final width. Runs before the
+        // extension for the same reason.
+        if drHigh > drLow
+            float wR = drHigh - drLow
+            float fWick  = drIsLong ? (drHigh - low)   / wR : (high  - drLow) / wR
+            float fClose = drIsLong ? (drHigh - close) / wR : (close - drLow) / wR
+            drMaxRetraceWick  := math.max(drMaxRetraceWick,  fWick)
+            drMaxRetraceClose := math.max(drMaxRetraceClose, fClose)
+
         // EXTENSION, NOW CAPPED. The swept extreme never moves -- it is a real
         // price where real liquidity was taken, and a stop anchored to a
         // drifting level is not a stop. Only the far side extends, and only to
@@ -2175,6 +2211,10 @@ if barstate.isconfirmed
                 drWidthN      += 1
                 if drCapBoundThis
                     drCapRanges += 1
+                f_retraceBucket(drMaxRetraceWick)
+                retraceWickSum  += drMaxRetraceWick
+                retraceCloseSum += drMaxRetraceClose
+                retraceN        += 1
             drLow          := na
             drHigh         := na
             drBar          := na
@@ -3899,6 +3939,19 @@ if barstate.islast and showDebugTable
 
         // TEMPORARY: settles the dPoi contradiction. Compare ht/2 + buf against
         // the "poi" figure on the Stop last row -- they must be equal.
+        // TEMPORARY: the retracement-depth question. Shape matters more than N.
+        table.cell(dbg, 0, 20, "Retrace depth (wick)", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 20, "u.20 " + str.tostring(array.get(retraceBuckets, 0)) +
+                 " | .2-.4 " + str.tostring(array.get(retraceBuckets, 1)) +
+                 " | .4-.62 " + str.tostring(array.get(retraceBuckets, 2)) +
+                 " | .62-.79 " + str.tostring(array.get(retraceBuckets, 3)) +
+                 " | o.79 " + str.tostring(array.get(retraceBuckets, 4)) +
+                 "  (n " + str.tostring(retraceN) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 21, "Retrace mean w | c", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 21, "wick " + f_meanStr(retraceWickSum, retraceN) +
+                 "  |  close " + f_meanStr(retraceCloseSum, retraceN), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 17, "Stop-pop zone ht", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 17, "mean " + f_meanStr(stopZoneHtSum, stopDiagN) +
                  "  (n " + str.tostring(stopDiagN) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
