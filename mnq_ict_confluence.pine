@@ -3781,12 +3781,54 @@ var int  ceArmedA      = 0
 var int  ceArmedB      = 0
 var int  ceArmedNone   = 0
 
+// ---- THE DECIDING MEASUREMENT: does score separate world A from world B? ----
+// Peak score is tracked per RANGE rather than read from Section R's per-SWEEP
+// peak, so it is always available at range death regardless of whether the
+// sweep record has already been retired. The two coincide in practice: a
+// break-in-window range dies inside the sweep's own lifetime.
+var float drPeakScore = 0.0
+var float ceA_sum = 0.0
+var int   ceA_n   = 0
+var float ceA_min = na
+var float ceA_max = na
+var float ceB_sum = 0.0
+var int   ceB_n   = 0
+var float ceB_min = na
+var float ceB_max = na
+
+// The would-have-lost count. World A means CE filled and the stop level was
+// LATER reached -- it does not mean the trade lost, because TP1 sits at 1R
+// above the fill and may have been tagged first, moving the stop to break-even.
+// 14 is an upper bound on losses, not a loss count.
+var float drCeEntry   = na
+var float drCeTp1     = na
+var float drCeStopPts = na
+var int   drCeFillBar = na
+var bool  drCeTp1Hit  = false
+var int   ceA_tp1     = 0    // TP1 reached before the break
+var int   ceA_inBand  = 0    // stop would have passed the band test, so a real trade
+
+f_rangeStr(float mn, float mx) =>
+    string r = "-"
+    if not na(mn)
+        r := "[" + str.tostring(mn, "#.0") + "-" + str.tostring(mx, "#.0") + "]"
+    r
+
 if barstate.isconfirmed
     if drDefinedNow
         drShadowPoi   := bestPOI(drIsLong, close)
         drShadowCeHit := false
         drArmedPoi    := drIsLong ? armedPoiL : armedPoiS
         drArmedCeHit  := false
+        drPeakScore   := 0.0
+        drCeEntry     := na
+        drCeTp1       := na
+        drCeStopPts   := na
+        drCeFillBar   := na
+        drCeTp1Hit    := false
+
+    if hasDealingRange()
+        drPeakScore := math.max(drPeakScore, currentScore(drIsLong))
 
     // The armed snapshot often does not exist until the score first passes,
     // which can be several bars after the range is defined. Adopt it whenever
@@ -3796,8 +3838,32 @@ if barstate.isconfirmed
 
     if hasDealingRange() and not na(drShadowPoi)
         bool hitS = drIsLong ? low <= drShadowPoi.ce : high >= drShadowPoi.ce
+        // First touch: reconstruct the trade the trigger would have set up.
+        // drLow on a long range IS the swept extreme and never moves, so the
+        // swept anchor is available here without the Sweep record.
+        if hitS and not drShadowCeHit
+            drShadowCeHit := true
+            drCeFillBar   := bar_index
+            float bufC   = f_stopBuffer()
+            float sSwept = drIsLong ? drLow - bufC : drHigh + bufC
+            float sPoi   = drIsLong ? drShadowPoi.bottom - bufC : drShadowPoi.top + bufC
+            float sPx    = sSwept
+            if stopMode == "Beyond POI far edge"
+                sPx := sPoi
+            if stopMode == "Wider of the two"
+                sPx := drIsLong ? math.min(sSwept, sPoi) : math.max(sSwept, sPoi)
+            drCeEntry   := drShadowPoi.ce
+            drCeStopPts := drIsLong ? drCeEntry - sPx : sPx - drCeEntry
+            drCeTp1     := drIsLong ? drCeEntry + tp1R * drCeStopPts : drCeEntry - tp1R * drCeStopPts
         if hitS
             drShadowCeHit := true
+        // TP1 only on bars STRICTLY AFTER the fill. Bar data cannot order two
+        // levels inside one bar, and the live position manager already refuses
+        // to assume the favourable one -- this keeps the same convention.
+        if drShadowCeHit and not na(drCeTp1) and not na(drCeFillBar) and bar_index > drCeFillBar
+            bool tp1Hit = drIsLong ? high >= drCeTp1 : low <= drCeTp1
+            if tp1Hit
+                drCeTp1Hit := true
     if hasDealingRange() and not na(drArmedPoi)
         bool hitA = drIsLong ? low <= drArmedPoi.ce : high >= drArmedPoi.ce
         if hitA
@@ -3808,8 +3874,20 @@ if barstate.isconfirmed
             ceShadowNone += 1
         if not na(drShadowPoi) and drShadowCeHit
             ceShadowA += 1
+            ceA_sum   += drPeakScore
+            ceA_n     += 1
+            ceA_min   := na(ceA_min) ? drPeakScore : math.min(ceA_min, drPeakScore)
+            ceA_max   := na(ceA_max) ? drPeakScore : math.max(ceA_max, drPeakScore)
+            if drCeTp1Hit
+                ceA_tp1 += 1
+            if not na(drCeStopPts) and drCeStopPts >= stopMinPts and drCeStopPts <= stopMaxPts
+                ceA_inBand += 1
         if not na(drShadowPoi) and not drShadowCeHit
             ceShadowB += 1
+            ceB_sum   += drPeakScore
+            ceB_n     += 1
+            ceB_min   := na(ceB_min) ? drPeakScore : math.min(ceB_min, drPeakScore)
+            ceB_max   := na(ceB_max) ? drPeakScore : math.max(ceB_max, drPeakScore)
         if na(drArmedPoi)
             ceArmedNone += 1
         if not na(drArmedPoi) and drArmedCeHit
@@ -4105,6 +4183,17 @@ if barstate.islast and showDebugTable
         // level it had just swept?
         // Only a break INSIDE the entry window could have cost a trade.
         // A = would have been a loss. B = never filled, nothing lost.
+        // THE deciding row. Overlapping ranges mean the score is not selecting
+        // on the thing that determines the outcome.
+        table.cell(dbg, 0, 28, "Peak score A | B", bgcolor = kHdr, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 28, "A " + f_meanStr(ceA_sum, ceA_n) + " " + f_rangeStr(ceA_min, ceA_max) + " n" + str.tostring(ceA_n) +
+                 "  |  B " + f_meanStr(ceB_sum, ceB_n) + " " + f_rangeStr(ceB_min, ceB_max) + " n" + str.tostring(ceB_n), bgcolor = kHdr, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 29, "A outcome", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 29, "tp1-first " + str.tostring(ceA_tp1) +
+                 " | stop in band " + str.tostring(ceA_inBand) +
+                 "  of " + str.tostring(ceA_n), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 26, "CE-first shadow", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 26, "A " + str.tostring(ceShadowA) +
                  " | B " + str.tostring(ceShadowB) +
