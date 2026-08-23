@@ -1665,6 +1665,19 @@ var array<POI>  poiBook = array.new<POI>()
 // kind. Surfaced in the debug table -- see the notes on collinearity above.
 var int fvgObCoincidenceCount = 0
 
+// ---- TEMPORARY: zone-height selection-bias forensics ------------------------
+// f_zoneInOte tests OVERLAP, not containment, so a taller zone spans more price
+// and therefore almost always overlaps the OTE band. inOte is worth 2 in cRank
+// and pays +0.25 quality, so bestPOI may be selecting the LARGEST zone and then
+// paying it a bonus for being large. If the mean height of SELECTED zones sits
+// far above the mean height of zones in the book, that is the bias measured
+// directly rather than inferred.
+var float zoneBookHtSum = 0.0   // summed over POI-bars, not distinct zones
+var int   zoneBookHtN   = 0
+var int   poiObsInOte   = 0     // POI-bars where inOte was true
+var float zoneSelHtSum  = 0.0   // summed over SETUPS, one sample per snapshot
+var int   zoneSelHtN    = 0
+
 // CUMULATIVE creation counters. The table shows these beside the ACTIVE counts,
 // because "0 active FVGs" is ambiguous on its own: it could mean a quiet moment
 // or it could mean FVGs essentially never form. Only the pair distinguishes
@@ -2342,6 +2355,32 @@ if barstate.isconfirmed
                          bullish = bkBull, kind = "BREAKER",
                          quality = f_poiQuality(oteB, mssB, coiB), sourceBar = o.anchorBar,
                          inOte = oteB, fromMssLeg = mssB))
+
+// ---- TEMPORARY: sample the book's height distribution and inOte rate --------
+// One sample per POI per confirmed bar, so long-lived zones weigh more. That is
+// the correct weighting for the question being asked: what does bestPOI have in
+// front of it on a typical bar?
+if barstate.isconfirmed and array.size(poiBook) > 0
+    for i = 0 to array.size(poiBook) - 1
+        POI c = array.get(poiBook, i)
+        zoneBookHtSum += c.top - c.bottom
+        zoneBookHtN   += 1
+        if c.inOte
+            poiObsInOte += 1
+
+// Median height of the book AS IT STANDS NOW. A snapshot rather than a running
+// median, because a true running median over history would mean retaining every
+// sample. Read alongside the running mean above.
+f_bookMedianHeight() =>
+    array<float> hs = array.new<float>()
+    if array.size(poiBook) > 0
+        for i = 0 to array.size(poiBook) - 1
+            POI c = array.get(poiBook, i)
+            array.push(hs, c.top - c.bottom)
+    float m = na
+    if array.size(hs) > 0
+        m := array.median(hs)
+    m
 
 // --- PUBLIC: the single query stage 5 makes ----------------------------------
 // Ranking is strictly lexicographic, matching the stated order:
@@ -3227,14 +3266,25 @@ if barstate.isconfirmed
         armedPoiL   := na
         armedPoiSwL := na
     if passL and not na(swPoiL) and (na(armedPoiSwL) or armedPoiSwL != swPoiL.confirmBarIdx or na(armedPoiL))
-        armedPoiL   := bestPOI(true, close)
+        bool freshL = na(armedPoiSwL) or armedPoiSwL != swPoiL.confirmBarIdx
+        POI  newL   = bestPOI(true, close)
+        // One sample per SETUP, taken the first time that setup resolves a POI.
+        if not na(newL) and (freshL or na(armedPoiL))
+            zoneSelHtSum += newL.top - newL.bottom
+            zoneSelHtN   += 1
+        armedPoiL   := newL
         armedPoiSwL := swPoiL.confirmBarIdx
 
     if na(swPoiS)
         armedPoiS   := na
         armedPoiSwS := na
     if passS and not na(swPoiS) and (na(armedPoiSwS) or armedPoiSwS != swPoiS.confirmBarIdx or na(armedPoiS))
-        armedPoiS   := bestPOI(false, close)
+        bool freshS = na(armedPoiSwS) or armedPoiSwS != swPoiS.confirmBarIdx
+        POI  newS   = bestPOI(false, close)
+        if not na(newS) and (freshS or na(armedPoiS))
+            zoneSelHtSum += newS.top - newS.bottom
+            zoneSelHtN   += 1
+        armedPoiS   := newS
         armedPoiSwS := swPoiS.confirmBarIdx
 
     int wantDir = 0
@@ -3804,6 +3854,17 @@ if barstate.islast and showDebugTable
 
         // TEMPORARY: does range extension contribute anything? Two nearly equal
         // means say no, and freezing at the MSS bar is the simpler answer.
+        // TEMPORARY: the selection-bias measurement. sel >> book confirms it.
+        table.cell(dbg, 0, 15, "Zone ht book | sel", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 15, "mean " + f_meanStr(zoneBookHtSum, zoneBookHtN) +
+                 " med " + f_num(f_bookMedianHeight()) +
+                 "  |  sel " + f_meanStr(zoneSelHtSum, zoneSelHtN) +
+                 " (n " + str.tostring(zoneSelHtN) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 16, "inOte rate", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 16, str.tostring(poiObsInOte) + " / " + str.tostring(zoneBookHtN) +
+                 f_pctStr(poiObsInOte, zoneBookHtN) + "  POI-bars", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 14, "DR width mss -> end", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 14, f_meanStr(drWidthMssSum, drWidthN) + " -> " + f_meanStr(drWidthEndSum, drWidthN) +
                  "pt  | capped " + str.tostring(drCapRanges) + "/" + str.tostring(drWidthN), bgcolor = kBg, text_color = kTx, text_size = size.small)
