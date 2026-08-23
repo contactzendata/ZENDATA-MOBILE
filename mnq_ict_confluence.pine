@@ -2099,10 +2099,24 @@ var float retraceWickSum  = 0.0
 var float retraceCloseSum = 0.0
 var int   retraceN        = 0
 
+// Death cause. A range that dies by a close BEYOND THE SWEPT EXTREME is a
+// premise failure: price swept a level, broke structure, then went back
+// through the level it had swept. A range that dies by AGE is one where the
+// premise held long enough for a retracement to be a real observation, so the
+// age-died subset is the only population the depth distribution can be read
+// from honestly.
+var int drDeathAge   = 0
+var int drDeathBreak = 0
+
+var array<int> retraceBucketsAge = array.new<int>(5, 0)
+var float retraceWickSumAge  = 0.0
+var float retraceCloseSumAge = 0.0
+var int   retraceNAge        = 0
+
 // Buckets: <0.20 | 0.20-0.40 | 0.40-0.62 | 0.62-0.79 | >=0.79
-f_retraceBucket(float v) =>
+f_retraceBucketInto(array<int> arr, float v) =>
     int idx = v < 0.20 ? 0 : v < 0.40 ? 1 : v < 0.62 ? 2 : v < 0.79 ? 3 : 4
-    array.set(retraceBuckets, idx, array.get(retraceBuckets, idx) + 1)
+    array.set(arr, idx, array.get(arr, idx) + 1)
 
 // Running leg extreme since each side's most recent sweep. This is how we name
 // the leg terminus WITHOUT a variable-length ta.highest(), which would have to
@@ -2172,15 +2186,21 @@ if barstate.isconfirmed
     // range only dies when its PREMISE dies -- a close back beyond the swept
     // extreme -- or when it simply gets too old to mean anything.
     if not na(drLow) and not na(drHigh) and not na(drBar)
-        bool drDead = bar_index - drBar > drMaxAgeBars
-        if drIsLong and close < drLow
-            drDead := true
-        if not drIsLong and close > drHigh
-            drDead := true
+        // Death cause, split. The swept extreme never moves -- only the far side
+        // of a range extends -- so both break tests read the ORIGINAL swept
+        // level, not an extended edge.
+        bool deadAge   = bar_index - drBar > drMaxAgeBars
+        bool deadBreak = (drIsLong and close < drLow) or (not drIsLong and close > drHigh)
+        bool drDead    = deadAge or deadBreak
+
         // Deepest retracement so far, measured against the range as it stood on
         // THIS bar rather than against the final width. Runs before the
         // extension for the same reason.
-        if drHigh > drLow
+        // GATED ON not drDead: a long range dies when close < drLow, which
+        // forces (drHigh - low) / width > 1.0 by construction. Counting the
+        // death bar put every premise failure in the top bucket and made the
+        // whole distribution measure deaths rather than retracements.
+        if not drDead and drHigh > drLow
             float wR = drHigh - drLow
             float fWick  = drIsLong ? (drHigh - low)   / wR : (high  - drLow) / wR
             float fClose = drIsLong ? (drHigh - close) / wR : (close - drLow) / wR
@@ -2211,10 +2231,20 @@ if barstate.isconfirmed
                 drWidthN      += 1
                 if drCapBoundThis
                     drCapRanges += 1
-                f_retraceBucket(drMaxRetraceWick)
+                f_retraceBucketInto(retraceBuckets, drMaxRetraceWick)
                 retraceWickSum  += drMaxRetraceWick
                 retraceCloseSum += drMaxRetraceClose
                 retraceN        += 1
+                // Break takes precedence when both fire on the same bar: it is
+                // the informative cause.
+                if deadBreak
+                    drDeathBreak += 1
+                if deadAge and not deadBreak
+                    drDeathAge += 1
+                    f_retraceBucketInto(retraceBucketsAge, drMaxRetraceWick)
+                    retraceWickSumAge  += drMaxRetraceWick
+                    retraceCloseSumAge += drMaxRetraceClose
+                    retraceNAge        += 1
             drLow          := na
             drHigh         := na
             drBar          := na
@@ -3940,6 +3970,26 @@ if barstate.islast and showDebugTable
         // TEMPORARY: settles the dPoi contradiction. Compare ht/2 + buf against
         // the "poi" figure on the Stop last row -- they must be equal.
         // TEMPORARY: the retracement-depth question. Shape matters more than N.
+        // THE question: did the premise hold, or did price go back through the
+        // level it had just swept?
+        table.cell(dbg, 0, 22, "DR death cause", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 22, "age " + str.tostring(drDeathAge) +
+                 "  |  break " + str.tostring(drDeathBreak) +
+                 f_pctStr(drDeathBreak, drDeathAge + drDeathBreak) + " break", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // The only population the depth distribution can be read from honestly.
+        table.cell(dbg, 0, 23, "Retrace AGE-died", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 23, "u.20 " + str.tostring(array.get(retraceBucketsAge, 0)) +
+                 " | .2-.4 " + str.tostring(array.get(retraceBucketsAge, 1)) +
+                 " | .4-.62 " + str.tostring(array.get(retraceBucketsAge, 2)) +
+                 " | .62-.79 " + str.tostring(array.get(retraceBucketsAge, 3)) +
+                 " | o.79 " + str.tostring(array.get(retraceBucketsAge, 4)) +
+                 "  (n " + str.tostring(retraceNAge) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 24, "Retrace age w | c", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 24, "wick " + f_meanStr(retraceWickSumAge, retraceNAge) +
+                 "  |  close " + f_meanStr(retraceCloseSumAge, retraceNAge), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 20, "Retrace depth (wick)", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 20, "u.20 " + str.tostring(array.get(retraceBuckets, 0)) +
                  " | .2-.4 " + str.tostring(array.get(retraceBuckets, 1)) +
