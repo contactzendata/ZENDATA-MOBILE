@@ -2108,6 +2108,21 @@ var int   retraceN        = 0
 var int drDeathAge   = 0
 var int drDeathBreak = 0
 
+// Break deaths bucketed by how long the range survived. drMaxAgeBars is 120
+// while the entry window is only mssMaxBarsAfterSweep + entryValidBars, so a
+// range that outlived its whole tradeable life and broke four hours later was
+// being counted identically to one that broke on bar 6. Only a break inside the
+// entry window is a premise failure that could have cost a trade.
+var int drBreakLifeEntry = 0   // lifetime <= the entry window, measured from drBar
+var int drBreakLifeMid   = 0   // to 60 bars
+var int drBreakLifeLate  = 0   // beyond 60 bars
+// The exact version: the break happened while the entry window was genuinely
+// still open, measured from the SWEEP rather than from the MSS bar. Bucketing
+// from drBar is generous, because the MSS consumes part of the window before
+// the range even exists.
+var int drBreakInWindow  = 0
+var int drSweepBar       = na
+
 var array<int> retraceBucketsAge = array.new<int>(5, 0)
 var float retraceWickSumAge  = 0.0
 var float retraceCloseSumAge = 0.0
@@ -2167,6 +2182,7 @@ if barstate.isconfirmed
             drCapBoundThis := false
             drMaxRetraceWick  := 0.0
             drMaxRetraceClose := 0.0
+            drSweepBar        := swSell.confirmBarIdx
 
     // SHORT setup: mirror.
     if mssNow and lastStructDir < 0 and not na(swBuy) and swBuy.mssConfirmed and not na(legLowSinceBuySweep)
@@ -2179,6 +2195,7 @@ if barstate.isconfirmed
             drCapBoundThis := false
             drMaxRetraceWick  := 0.0
             drMaxRetraceClose := 0.0
+            drSweepBar        := swBuy.confirmBarIdx
 
     // ---- Maintain / kill the range ------------------------------------------
     // A live leg EXTENDS its range: if price keeps making highs on a long
@@ -2239,6 +2256,16 @@ if barstate.isconfirmed
                 // the informative cause.
                 if deadBreak
                     drDeathBreak += 1
+                    int drLife = bar_index - drBar
+                    int entWin = mssMaxBarsAfterSweep + entryValidBars
+                    if drLife <= entWin
+                        drBreakLifeEntry += 1
+                    if drLife > entWin and drLife <= 60
+                        drBreakLifeMid += 1
+                    if drLife > 60
+                        drBreakLifeLate += 1
+                    if not na(drSweepBar) and (bar_index - drSweepBar) <= entWin
+                        drBreakInWindow += 1
                 if deadAge and not deadBreak
                     drDeathAge += 1
                     f_retraceBucketInto(retraceBucketsAge, drMaxRetraceWick)
@@ -2302,6 +2329,23 @@ inOTE(bool isLong) =>
             r := r and close > drEq
     r
 
+// Does the BAR'S RANGE reach into the OTE band, as opposed to its close sitting
+// there? inOTE tests close, but the retest trigger tests low <= p.ce, a wick.
+// Interval intersection of [low, high] with the band, which also covers a bar
+// that spans the band entirely. oteRequireCorrectSide is applied identically to
+// inOTE so the two counts are directly comparable on the same denominator.
+f_wickInOTE(bool isLong) =>
+    bool r = false
+    if not na(drRange)
+        float lo = isLong ? oteLongLo : oteShortLo
+        float hi = isLong ? oteLongHi : oteShortHi
+        r := low <= hi and high >= lo
+        if oteRequireCorrectSide and isLong
+            r := r and close < drEq
+        if oteRequireCorrectSide and not isLong
+            r := r and close > drEq
+    r
+
 // ---- TEMPORARY: how often is PRICE ITSELF inside the OTE band? --------------
 // Distinct from the zone-overlap rate. If this is also near 6%, OTE is close to
 // structurally dead on overnight MNQ and the 1.5-point location component plus
@@ -2309,10 +2353,13 @@ inOTE(bool isLong) =>
 // the scoring model, not about the geometry.
 var int drBarsN          = 0
 var int drBarsPriceInOte = 0
+var int drBarsWickInOte  = 0
 if barstate.isconfirmed and hasDealingRange()
     drBarsN += 1
     if inOTE(drIsLong)
         drBarsPriceInOte += 1
+    if f_wickInOTE(drIsLong)
+        drBarsWickInOte += 1
 
 // =============================================================================
 // SECTION O (STAGE 3): THE UNIFIED POI API
@@ -3972,6 +4019,13 @@ if barstate.islast and showDebugTable
         // TEMPORARY: the retracement-depth question. Shape matters more than N.
         // THE question: did the premise hold, or did price go back through the
         // level it had just swept?
+        // Only a break INSIDE the entry window could have cost a trade.
+        table.cell(dbg, 0, 25, "Break life", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 25, "entWin " + str.tostring(drBreakLifeEntry) +
+                 " | 26-60 " + str.tostring(drBreakLifeMid) +
+                 " | o60 " + str.tostring(drBreakLifeLate) +
+                 "   exact-in-window " + str.tostring(drBreakInWindow), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 22, "DR death cause", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 22, "age " + str.tostring(drDeathAge) +
                  "  |  break " + str.tostring(drDeathBreak) +
@@ -4013,9 +4067,12 @@ if barstate.islast and showDebugTable
                  " ht " + f_num(lastTrigTop - lastTrigBot) +
                  " buf " + f_num(lastTrigBuf), bgcolor = kBg, text_color = kTx, text_size = size.small)
 
-        table.cell(dbg, 0, 19, "Price in OTE", bgcolor = kBg, text_color = kTx, text_size = size.small)
-        table.cell(dbg, 1, 19, str.tostring(drBarsPriceInOte) + " / " + str.tostring(drBarsN) +
-                 f_pctStr(drBarsPriceInOte, drBarsN) + "  DR-bars", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        // Same denominator, same side test. If wick is several times close, the
+        // location component is reading the wrong price series.
+        table.cell(dbg, 0, 19, "OTE close | wick", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 19, "c " + str.tostring(drBarsPriceInOte) + f_pctStr(drBarsPriceInOte, drBarsN) +
+                 "  |  w " + str.tostring(drBarsWickInOte) + f_pctStr(drBarsWickInOte, drBarsN) +
+                 "  of " + str.tostring(drBarsN), bgcolor = kBg, text_color = kTx, text_size = size.small)
 
         table.cell(dbg, 0, 14, "DR width mss -> end", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 14, f_meanStr(drWidthMssSum, drWidthN) + " -> " + f_meanStr(drWidthEndSum, drWidthN) +
