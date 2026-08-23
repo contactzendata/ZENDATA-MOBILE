@@ -2123,6 +2123,12 @@ var int drBreakLifeLate  = 0   // beyond 60 bars
 var int drBreakInWindow  = 0
 var int drSweepBar       = na
 
+// Per-bar flags, not var, so they reset every bar. They exist because the CE
+// ordering test needs bestPOI and the armed snapshot, both declared in later
+// sections, while range definition and death are detected here.
+bool drDefinedNow        = false
+bool drDiedBreakInWinNow = false
+
 var array<int> retraceBucketsAge = array.new<int>(5, 0)
 var float retraceWickSumAge  = 0.0
 var float retraceCloseSumAge = 0.0
@@ -2183,6 +2189,7 @@ if barstate.isconfirmed
             drMaxRetraceWick  := 0.0
             drMaxRetraceClose := 0.0
             drSweepBar        := swSell.confirmBarIdx
+            drDefinedNow      := true
 
     // SHORT setup: mirror.
     if mssNow and lastStructDir < 0 and not na(swBuy) and swBuy.mssConfirmed and not na(legLowSinceBuySweep)
@@ -2196,6 +2203,7 @@ if barstate.isconfirmed
             drMaxRetraceWick  := 0.0
             drMaxRetraceClose := 0.0
             drSweepBar        := swBuy.confirmBarIdx
+            drDefinedNow      := true
 
     // ---- Maintain / kill the range ------------------------------------------
     // A live leg EXTENDS its range: if price keeps making highs on a long
@@ -2265,7 +2273,8 @@ if barstate.isconfirmed
                     if drLife > 60
                         drBreakLifeLate += 1
                     if not na(drSweepBar) and (bar_index - drSweepBar) <= entWin
-                        drBreakInWindow += 1
+                        drBreakInWindow      += 1
+                        drDiedBreakInWinNow  := true
                 if deadAge and not deadBreak
                     drDeathAge += 1
                     f_retraceBucketInto(retraceBucketsAge, drMaxRetraceWick)
@@ -3736,6 +3745,81 @@ plotshape(showSignals ? entryMarkShort : na, title = "Short entry",
      color = color.new(colBuySide, 0), size = size.small)
 
 // =============================================================================
+// TEMPORARY: THE CE-ORDERING MEASUREMENT
+//
+// A break death is roughly price reaching the stop level. That only costs money
+// if the entry had already filled, and the retest fills at the POI's CE, which
+// sits INSIDE the range. So for every range that dies by a break while the
+// entry window is still open:
+//   world A  CE was touched first -> that setup would have been a loss
+//   world B  CE was never touched -> no fill, nothing lost
+//
+// Measured TWICE, because the exact version is under-powered. The armed
+// snapshot is only assigned when scorePasses is true, and only about ten of
+// sixty-four setups ever passed, so the armed split lands on a handful of
+// samples. The SHADOW version captures bestPOI for every range regardless of
+// score -- the counterfactual "if a trade had been available here, would CE
+// have filled before the break?" -- which is the question the 48% actually
+// raises, on a usable denominator.
+//
+// Placed after section S because it needs bestPOI (section O) AND the armed
+// snapshot (section S). Range definition and death are flagged in section N.
+// The CE-touch update cannot run on the death bar, because section N clears the
+// range before this block sees it -- which is exactly the "before the death
+// bar" semantics required.
+// =============================================================================
+
+var POI  drShadowPoi   = na
+var bool drShadowCeHit = false
+var int  ceShadowA     = 0
+var int  ceShadowB     = 0
+var int  ceShadowNone  = 0
+
+var POI  drArmedPoi    = na
+var bool drArmedCeHit  = false
+var int  ceArmedA      = 0
+var int  ceArmedB      = 0
+var int  ceArmedNone   = 0
+
+if barstate.isconfirmed
+    if drDefinedNow
+        drShadowPoi   := bestPOI(drIsLong, close)
+        drShadowCeHit := false
+        drArmedPoi    := drIsLong ? armedPoiL : armedPoiS
+        drArmedCeHit  := false
+
+    // The armed snapshot often does not exist until the score first passes,
+    // which can be several bars after the range is defined. Adopt it whenever
+    // it first appears during this range's life.
+    if hasDealingRange() and na(drArmedPoi)
+        drArmedPoi := drIsLong ? armedPoiL : armedPoiS
+
+    if hasDealingRange() and not na(drShadowPoi)
+        bool hitS = drIsLong ? low <= drShadowPoi.ce : high >= drShadowPoi.ce
+        if hitS
+            drShadowCeHit := true
+    if hasDealingRange() and not na(drArmedPoi)
+        bool hitA = drIsLong ? low <= drArmedPoi.ce : high >= drArmedPoi.ce
+        if hitA
+            drArmedCeHit := true
+
+    if drDiedBreakInWinNow
+        if na(drShadowPoi)
+            ceShadowNone += 1
+        if not na(drShadowPoi) and drShadowCeHit
+            ceShadowA += 1
+        if not na(drShadowPoi) and not drShadowCeHit
+            ceShadowB += 1
+        if na(drArmedPoi)
+            ceArmedNone += 1
+        if not na(drArmedPoi) and drArmedCeHit
+            ceArmedA += 1
+        if not na(drArmedPoi) and not drArmedCeHit
+            ceArmedB += 1
+        drShadowPoi := na
+        drArmedPoi  := na
+
+// =============================================================================
 // SECTION E: DEBUG TABLE
 // The stage-1 verification surface. Everything here is read from confirmed
 // state, so if a number looks wrong the state is wrong, not the display.
@@ -4020,6 +4104,18 @@ if barstate.islast and showDebugTable
         // THE question: did the premise hold, or did price go back through the
         // level it had just swept?
         // Only a break INSIDE the entry window could have cost a trade.
+        // A = would have been a loss. B = never filled, nothing lost.
+        table.cell(dbg, 0, 26, "CE-first shadow", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 26, "A " + str.tostring(ceShadowA) +
+                 " | B " + str.tostring(ceShadowB) +
+                 " | noPOI " + str.tostring(ceShadowNone) +
+                 f_pctStr(ceShadowA, ceShadowA + ceShadowB) + " A", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 27, "CE-first armed", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 27, "A " + str.tostring(ceArmedA) +
+                 " | B " + str.tostring(ceArmedB) +
+                 " | noPOI " + str.tostring(ceArmedNone), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
         table.cell(dbg, 0, 25, "Break life", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 25, "entWin " + str.tostring(drBreakLifeEntry) +
                  " | 26-60 " + str.tostring(drBreakLifeMid) +
