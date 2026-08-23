@@ -207,6 +207,8 @@ grpOte = "OTE"
 oteLow  = input.float(0.62, "OTE band start (retracement)", minval = 0.0, maxval = 1.0, step = 0.01, group = grpOte)
 oteHigh = input.float(0.79, "OTE band end (retracement)",   minval = 0.0, maxval = 1.0, step = 0.01, group = grpOte)
 oteRequireCorrectSide = input.bool(true, "Longs only in discount, shorts only in premium", group = grpOte)
+drMaxExtensionMult = input.float(1.5, "Max range extension (x width at MSS)", minval = 1.0, maxval = 10.0, step = 0.1, group = grpOte,
+     tooltip = "The range was previously unbounded: drHigh extended on every new high while drLow stayed pinned at the swept extreme, so a trending leg grew the range without limit. Measured at 129-237 points against a median London range of 60-85 -- the range was running 1.5-3x the whole session. Capped at this multiple of the width the range had at the MSS bar. Legs do genuinely run a few bars past the MSS, so freezing at the MSS bar would under-measure them and drag the OTE band too low.")
 drMaxAgeBars = input.int(120, "Dealing range max age (bars)", minval = 1, maxval = 2000, group = grpOte,
      tooltip = "A dealing range with no lifetime would keep an OTE band alive forever. 120 bars is about 10 hours on a 5m chart.")
 
@@ -1101,6 +1103,10 @@ f_pushS2Label(label lb) =>
 //                 than "side" to match Pool.buySide from stage 1.
 // sweepExtreme  : furthest high (or low) reached while the pool was penetrated
 // expiresAtBarIdx : after this bar the sweep is stale and is pruned
+// sessCode      : which session instance produced this sweep. 1 Asia, 2 London,
+//                 0 neither. Paired with sessDay it identifies one session
+//                 uniquely, and stage 6 requires the entry to occur in that
+//                 same one -- a setup belongs to the session that produced it.
 // mssConfirmed  : set by section I when an opposite MSS lands in time
 // spent         : STAGE 6 PRIMARY DEBOUNCE. Set once this sweep has produced an
 //                 entry trigger, after which it can never produce another. We
@@ -1116,10 +1122,20 @@ type Sweep
     float  sweepExtreme
     int    confirmBarIdx
     int    expiresAtBarIdx
+    int    sessCode
+    int    sessDay
     bool   mssConfirmed
     bool   spent
 
 var array<Sweep> sweeps = array.new<Sweep>()
+
+// Which session instance a bar belongs to. Uses the RAW flags: a sweep that
+// happens in the muted 00:00-02:00 Asia tail did genuinely happen in Asia, even
+// though inAsiaSignal suppresses signals there. The two tests are separate and
+// both apply.
+f_sessCode() =>
+    int c = inAsiaRaw ? 1 : inLondonRaw ? 2 : 0
+    c
 
 // Resolve the significance filter to a maxTier the stage-1 pool API understands.
 int sweepMaxTier = switch sweepMinTier
@@ -1342,6 +1358,7 @@ if barstate.isconfirmed
                      poolTier = pendUpPool.tier, poolPrice = pendUpPool.price,
                      sweepExtreme = pendUpExtreme, confirmBarIdx = bar_index,
                      expiresAtBarIdx = bar_index + math.max(sweepValidBars, mssMaxBarsAfterSweep + entryValidBars),
+                     sessCode = f_sessCode(), sessDay = tradingDay,
                      mssConfirmed = false, spent = false))
             sweepUpMarkPx := pendUpExtreme
             if showSweepMarkers
@@ -1401,6 +1418,7 @@ if barstate.isconfirmed
                      poolTier = pendDnPool.tier, poolPrice = pendDnPool.price,
                      sweepExtreme = pendDnExtreme, confirmBarIdx = bar_index,
                      expiresAtBarIdx = bar_index + math.max(sweepValidBars, mssMaxBarsAfterSweep + entryValidBars),
+                     sessCode = f_sessCode(), sessDay = tradingDay,
                      mssConfirmed = false, spent = false))
             sweepDnMarkPx := pendDnExtreme
             if showSweepMarkers
@@ -2039,6 +2057,18 @@ var float drHigh   = na
 var bool  drIsLong = false
 var int   drBar    = na
 
+// Width the range had at the MSS bar. The extension cap is a multiple of this.
+var float drWidthAtMss = na
+
+// TEMPORARY: does extension contribute anything? If the two means come back
+// nearly equal, the cap is doing nothing and freezing at the MSS bar (option a)
+// is the simpler correct answer.
+var int   drCapRanges    = 0     // ranges where the cap actually bound
+var bool  drCapBoundThis = false
+var float drWidthMssSum  = 0.0
+var float drWidthEndSum  = 0.0
+var int   drWidthN       = 0
+
 // Running leg extreme since each side's most recent sweep. This is how we name
 // the leg terminus WITHOUT a variable-length ta.highest(), which would have to
 // be called unconditionally on every bar to keep its history correct and would
@@ -2084,6 +2114,8 @@ if barstate.isconfirmed
             drHigh   := legHighSinceSellSweep
             drIsLong := true
             drBar    := bar_index
+            drWidthAtMss   := legHighSinceSellSweep - swSell.sweepExtreme
+            drCapBoundThis := false
 
     // SHORT setup: mirror.
     if mssNow and lastStructDir < 0 and not na(swBuy) and swBuy.mssConfirmed and not na(legLowSinceBuySweep)
@@ -2092,6 +2124,8 @@ if barstate.isconfirmed
             drLow    := legLowSinceBuySweep
             drIsLong := false
             drBar    := bar_index
+            drWidthAtMss   := swBuy.sweepExtreme - legLowSinceBuySweep
+            drCapBoundThis := false
 
     // ---- Maintain / kill the range ------------------------------------------
     // A live leg EXTENDS its range: if price keeps making highs on a long
@@ -2104,14 +2138,35 @@ if barstate.isconfirmed
             drDead := true
         if not drIsLong and close > drHigh
             drDead := true
-        if not drDead and drIsLong
-            drHigh := math.max(drHigh, high)
-        if not drDead and not drIsLong
-            drLow := math.min(drLow, low)
+        // EXTENSION, NOW CAPPED. The swept extreme never moves -- it is a real
+        // price where real liquidity was taken, and a stop anchored to a
+        // drifting level is not a stop. Only the far side extends, and only to
+        // drMaxExtensionMult times the width the range had at the MSS bar.
+        if not drDead and drIsLong and not na(drWidthAtMss)
+            float capHi = drLow + drWidthAtMss * drMaxExtensionMult
+            float wantHi = math.max(drHigh, high)
+            if wantHi > capHi
+                drCapBoundThis := true
+            drHigh := math.min(wantHi, capHi)
+        if not drDead and not drIsLong and not na(drWidthAtMss)
+            float capLo = drHigh - drWidthAtMss * drMaxExtensionMult
+            float wantLo = math.min(drLow, low)
+            if wantLo < capLo
+                drCapBoundThis := true
+            drLow := math.max(wantLo, capLo)
         if drDead
-            drLow  := na
-            drHigh := na
-            drBar  := na
+            // Bank the width diagnostics before the range is cleared.
+            if not na(drWidthAtMss) and not na(drHigh) and not na(drLow)
+                drWidthMssSum += drWidthAtMss
+                drWidthEndSum += drHigh - drLow
+                drWidthN      += 1
+                if drCapBoundThis
+                    drCapRanges += 1
+            drLow          := na
+            drHigh         := na
+            drBar          := na
+            drWidthAtMss   := na
+            drCapBoundThis := false
 
 // ---- Derived levels, recomputed every bar from confirmed state --------------
 // These sit OUTSIDE the confirmed block on purpose: they are pure functions of
@@ -3011,6 +3066,7 @@ var int sigLdnShort  = 0
 var int supSpent     = 0   // sweep already produced a trigger (primary debounce)
 var int supInPos     = 0   // a virtual position is already open
 var int supOutSess   = 0   // outside the signal-eligible session windows
+var int supWrongSess = 0   // in a DIFFERENT session than the one that armed it
 var int supCutoff    = 0   // past the session no-new-entries cutoff
 var int supExhaust   = 0   // session has already travelled too far
 var int supMaxSess   = 0   // per-session, per-direction cap reached
@@ -3275,6 +3331,13 @@ if barstate.isconfirmed
             // inAsiaSignal is stage 1's signal-eligible Asia: it drops the
             // 00:00-02:00 tail when asiaExcludeLate is on.
             supOutSess += 1
+            lastSessSupEt := str.format_time(time, "HH:mm", TZ)
+            ok := false
+        if ok and (f_sessCode() != sw.sessCode or tradingDay != sw.sessDay)
+            // The setup belongs to the session that produced it. A sweep at
+            // 04:50 London must not fire an entry at 06:05, which is what the
+            // 25-bar window allowed.
+            supWrongSess += 1
             lastSessSupEt := str.format_time(time, "HH:mm", TZ)
             ok := false
         if ok and pastCutoff
@@ -3703,6 +3766,7 @@ if barstate.islast and showDebugTable
 
         table.cell(dbg, 0, 5, "Sup: context", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 5, "sess " + str.tostring(supOutSess) +
+                 " | xsess " + str.tostring(supWrongSess) +
                  " | cut " + str.tostring(supCutoff) +
                  " | exh " + str.tostring(supExhaust) +
                  " | stop " + str.tostring(supStopBand) +
@@ -3737,6 +3801,12 @@ if barstate.islast and showDebugTable
 
         table.cell(dbg, 0, 13, "Last sess-sup at", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 13, lastSessSupEt + " ET", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // TEMPORARY: does range extension contribute anything? Two nearly equal
+        // means say no, and freezing at the MSS bar is the simpler answer.
+        table.cell(dbg, 0, 14, "DR width mss -> end", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 14, f_meanStr(drWidthMssSum, drWidthN) + " -> " + f_meanStr(drWidthEndSum, drWidthN) +
+                 "pt  | capped " + str.tostring(drCapRanges) + "/" + str.tostring(drWidthN), bgcolor = kBg, text_color = kTx, text_size = size.small)
 
         // Temporary, for the SMT pool-gate investigation.
         table.cell(dbg, 0, 8, "SMT cand|pass, dist", bgcolor = kBg, text_color = kTx, text_size = size.small)
@@ -4032,6 +4102,7 @@ if barstate.islast and showDebugTable
 
         table.cell(dbg, 0, 53, "Sup: context", bgcolor = cellBg, text_color = txt, text_size = size.small)
         table.cell(dbg, 1, 53, "sess " + str.tostring(supOutSess) +
+                 " | xsess " + str.tostring(supWrongSess) +
                  " | cut " + str.tostring(supCutoff) +
                  " | exh " + str.tostring(supExhaust) +
                  " | stop " + str.tostring(supStopBand) +
