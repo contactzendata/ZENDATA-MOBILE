@@ -2232,6 +2232,18 @@ inOTE(bool isLong) =>
             r := r and close > drEq
     r
 
+// ---- TEMPORARY: how often is PRICE ITSELF inside the OTE band? --------------
+// Distinct from the zone-overlap rate. If this is also near 6%, OTE is close to
+// structurally dead on overnight MNQ and the 1.5-point location component plus
+// the 0.25 quality bonus are largely decorative -- which is a statement about
+// the scoring model, not about the geometry.
+var int drBarsN          = 0
+var int drBarsPriceInOte = 0
+if barstate.isconfirmed and hasDealingRange()
+    drBarsN += 1
+    if inOTE(drIsLong)
+        drBarsPriceInOte += 1
+
 // =============================================================================
 // SECTION O (STAGE 3): THE UNIFIED POI API
 //
@@ -3135,6 +3147,17 @@ var float  lastStopSwept  = na
 var float  lastStopPoi    = na
 var float  lastStopUsed   = na
 var string lastStopWhich  = "-"
+// The dPoi identity, read at the exact point dPoi is computed, from the exact
+// object it is computed from. dPoi should equal (top-bottom)/2 + buf when
+// entryPx == p.ce. If it does not, one of those three assumptions is false and
+// this row says which.
+var float  stopZoneHtSum  = 0.0   // zone height over the STOP population only
+var float  lastTrigCe     = na
+var float  lastTrigTop    = na
+var float  lastTrigBot    = na
+var float  lastTrigEnt    = na
+var float  lastTrigBuf    = na
+var string lastTrigKind   = "-"
 // Wall-clock of the last session-suppressed trigger, to show whether the longer
 // entry window is pushing triggers past a session boundary.
 var string lastSessSupEt  = "-"
@@ -3450,6 +3473,15 @@ if barstate.isconfirmed
             lastStopSwept := dSwept
             lastStopPoi   := dPoi
             lastStopUsed  := stopPts
+            // Same population as dPoi, same object, same bar.
+            if not na(p)
+                stopZoneHtSum += p.top - p.bottom
+                lastTrigCe    := p.ce
+                lastTrigTop   := p.top
+                lastTrigBot   := p.bottom
+            lastTrigEnt  := entryPx
+            lastTrigBuf  := buf
+            lastTrigKind := trigStr
             // "Wider of the two" takes the LARGER distance, so comparing the
             // two distances names the winner without float-equality games.
             if na(dPoi)
@@ -3864,6 +3896,23 @@ if barstate.islast and showDebugTable
         table.cell(dbg, 0, 16, "inOte rate", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 16, str.tostring(poiObsInOte) + " / " + str.tostring(zoneBookHtN) +
                  f_pctStr(poiObsInOte, zoneBookHtN) + "  POI-bars", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        // TEMPORARY: settles the dPoi contradiction. Compare ht/2 + buf against
+        // the "poi" figure on the Stop last row -- they must be equal.
+        table.cell(dbg, 0, 17, "Stop-pop zone ht", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 17, "mean " + f_meanStr(stopZoneHtSum, stopDiagN) +
+                 "  (n " + str.tostring(stopDiagN) + ")", bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 18, "Trig identity", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 18, lastTrigKind +
+                 "  e " + f_num(lastTrigEnt) +
+                 " ce " + f_num(lastTrigCe) +
+                 " ht " + f_num(lastTrigTop - lastTrigBot) +
+                 " buf " + f_num(lastTrigBuf), bgcolor = kBg, text_color = kTx, text_size = size.small)
+
+        table.cell(dbg, 0, 19, "Price in OTE", bgcolor = kBg, text_color = kTx, text_size = size.small)
+        table.cell(dbg, 1, 19, str.tostring(drBarsPriceInOte) + " / " + str.tostring(drBarsN) +
+                 f_pctStr(drBarsPriceInOte, drBarsN) + "  DR-bars", bgcolor = kBg, text_color = kTx, text_size = size.small)
 
         table.cell(dbg, 0, 14, "DR width mss -> end", bgcolor = kBg, text_color = kTx, text_size = size.small)
         table.cell(dbg, 1, 14, f_meanStr(drWidthMssSum, drWidthN) + " -> " + f_meanStr(drWidthEndSum, drWidthN) +
