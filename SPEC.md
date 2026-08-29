@@ -2,261 +2,516 @@
 
 **Target:** TradingView Pine Script v6, single indicator, `overlay = true`
 **Instruments:** NQ (E-mini Nasdaq-100, CME) · GC (Gold, COMEX) — micros MNQ/MGC as aliases
-**Chart timeframes:** 1m, 5m, 15m (all supported without retuning)
-**Status:** Scaffold complete. No module logic implemented.
+**Chart timeframes:** 1m, 5m, 15m
+**Status:** Scaffold complete, spec complete. No module logic implemented.
 
-> **AWAITING RESEARCH NOTES.** Sections marked `⟨PENDING⟩` are structural
-> placeholders. The trading logic, thresholds, and empirical claims belong in
-> those sections and have deliberately **not** been invented here — a spec that
-> guesses at its own hypotheses is worse than an incomplete one. Paste the notes
-> and they get folded into the numbered subsections below without restructuring.
+> Educational/research only. Counter-trend trading has a structurally low win rate
+> and asymmetric blow-up risk. Every threshold below is an untested hypothesis.
 
 ---
 
-## 1. Purpose and scope
+## 1. What this engine is
 
-A reversal-context engine, not an entry system. It answers one question per bar:
-*how much independent evidence currently supports a reversal here, and how good is
-that evidence?* Output is a three-tier grade (A/B/C), or nothing.
+The source research converges on one framework: **a statistically extended
+location that coincides with order-flow evidence of a failed auction.** Location
+tells you *where*; order flow tells you *when*; neither works alone. Operationally
+it becomes a five-category checklist requiring **≥3 aligned categories**:
 
-**Explicitly out of scope** (record here if that changes): position sizing, stop
-and target placement, dollar risk, trade management, and any form of order
-execution or strategy backtesting. This is an `indicator`, not a `strategy`.
+| | Category | Evidence |
+|---|---|---|
+| **L** | Location | VWAP ±2σ, VAH/VAL, naked POC, PDH/PDL/ONH/ONL, GEX wall, expected-move boundary |
+| **E** | Extension | ADR/ATR exhausted, ≥2σ from VWAP, z-score/Bollinger extreme |
+| **F** | Order-flow failure | Absorption, exhaustion, stacked imbalance, unfinished auction, CVD divergence |
+| **Q** | Liquidity event | Stop-run/sweep of the level that immediately reverses (trapped traders) |
+| **C** | Context | Internals (NQ) or macro (GC); COT/GEX regime |
 
-**Non-goals that are easy to drift into:** predicting direction independently of
-context; producing a signal on every bar; being tunable per-session.
+### 1.1 The load-bearing constraint
+
+**Pine can build L, E, Q and C. It cannot build F.** There is no Level 2, no DOM,
+no bid/ask trade classification, no market-by-order — so absorption, stacked
+imbalance, unfinished auctions and trapped-trader reads are all out of reach at
+any effort level. The only F-category input available is M4's **tick-rule
+approximation** of delta, which the source research independently flags as a
+frequent *"real divergence, no reversal"* trap.
+
+This is not a gap to engineer around. It is the shape of the tool:
+
+> **This engine is a screener, not a trigger.** It marks zones where Location,
+> Extension, Liquidity and Context align, and hands off order-flow confirmation to
+> a footprint/DOM platform. A grade published here is the *first four* checklist
+> categories, not all five.
+
+That framing matches the source recommendation directly — a two-layer setup with
+profile/VWAP/levels on one layer and footprint/DOM confirmation on another. This
+engine is layer one. Treating a grade as an entry signal skips the category the
+research calls load-bearing (D-012).
+
+**Out of scope** (record here if it changes): position sizing, stops, targets,
+dollar risk, trade management, execution. This is an `indicator`, not a `strategy`.
 
 ---
 
 ## 2. Architecture
 
-Single script, seven modules, one composite. The pipeline per confirmed bar:
-
 ```
-                       ┌─────────────────────────────────────┐
-  instrument detect →  │  M1 VWAP extension                  │
-  timeframe normalize  │  M2 Structural levels               │
-  session resolve      │  M3 Volume profile                  │ each → {score 0..1,
-                       │  M4 Delta / CVD  (APPROXIMATION)    │         active bool}
-                       │  M5 Exhaustion & RVOL               │
-                       │  M6 Sweep & reclaim                 │
-                       │  M7 Context filters                 │
-                       └──────────────┬──────────────────────┘
-                                      │
-                    weighted composite (D-002 contract)
-                                      │
-                     confluence floor (minActive, D-003)
-                                      │
+  instrument detect ──┐
+  timeframe normalize ├─→  M1 VWAP extension        [E]
+  session resolve ────┘    M2 Structural levels     [L]   each module →
+                           M3 Volume/Market profile [L]   { score 0..1,
+                           M4 Delta / CVD (APPROX)  [F]     active bool,
+                           M5 Exhaustion & RVOL     [E]     dir ±1/0 }
+                           M6 Sweep & reclaim       [Q]
+                           M7 Context & regime      [C]
+                                    │
+                    evaluate LONG side and SHORT side separately
+                                    │
+                  category floor: ≥3 DISTINCT categories per side
+                                    │
+                    both sides qualify → CONFLICT → suppress
+                                    │
                         A / B / C threshold mapping
-                                      │
-                  context grade cap (D-004, hostile → max B)
-                                      │
-                              published grade
+                                    │
+                  hostile context caps the grade (default B)
+                                    │
+                            published grade + side
 ```
 
 ### 2.1 Module contract
 
-Every module is a function returning a `ModuleOut`:
-
 | Field | Type | Meaning |
 |---|---|---|
-| `score` | float | Normalized **0..1**. Only meaningful when `active` is true. |
+| `score` | float | Normalized **0..1**. Meaningful only when `active`. |
 | `active` | bool | This module has something to say about *this* bar. |
+| `dir` | int | `+1` supports a **long** reversal (fading a low) · `-1` supports a **short** reversal (fading a high) · `0` non-directional |
 | `note` | string | Human-readable reason, for the eventual detail pane. |
 
-Three rules, all load-bearing:
+Four rules, all load-bearing:
 
-1. **Normalize honestly.** 0..1 must mean the same thing across modules —
-   0 = no support, 1 = the strongest form of this evidence the module can express.
-   Saturation points are inputs, not magic numbers.
-2. **`active = false` when data is missing.** Never return a neutral 0.5 as a
-   stand-in. The composite cannot distinguish a real 0.5 from a fabricated one
-   (D-011).
-3. **No drawing inside a module.** Modules compute; the RENDER section draws
-   (D-010).
+1. **Normalize honestly.** 0 = no support, 1 = the strongest form of this evidence
+   the module can express. Saturation points are inputs, not magic numbers.
+2. **Missing data → `active = false`.** Never a neutral 0.5. The composite cannot
+   distinguish a real 0.5 from a fabricated one (D-011).
+3. **`dir` must be honest.** `dir = 0` contributes to *both* sides and is how a
+   module double-counts unnoticed. Most reversal evidence has a side.
+4. **Modules compute; RENDER draws.** No exceptions (D-010).
 
 ### 2.2 Composite
 
-Per D-002:
-
 ```
-module OFF      → excluded from numerator and denominator   ("not measured")
-module ON, idle → contributes 0.0, weight stays in denominator ("nothing there")
+module OFF                      → excluded from numerator and denominator
+module ON, idle                 → contributes 0.0, weight stays in denominator
+module ON, active, WRONG side   → contributes 0.0, weight stays in denominator
 
-composite = Σ(scoreᵢ × weightᵢ) / Σ(weightᵢ)   over enabled modules
+composite(side) = Σ(scoreᵢ × weightᵢ) / Σ(weightᵢ)   over enabled modules,
+                                                      counting only modules whose
+                                                      dir agrees with `side` or is 0
 ```
 
-Then:
-- `activeCount < minActive` → suppressed to no-grade (D-003).
-- Threshold map → A ≥ 0.75, B ≥ 0.60, C ≥ 0.45, below → nothing. All inputs.
-- Hostile context caps the grade at the configured ceiling, default B (D-004).
+Evidence for a low is not neutral when grading a high, so an opposing module costs
+score rather than being excluded (D-015).
+
+### 2.3 Confluence floor: categories, not modules
+
+The floor counts **distinct categories**, default ≥3. M2 and M3 are both Location:
+firing together they are *one* category, not two independent confirmations. This is
+the structural answer to the collinearity problem — a sweep of a level (Q),
+proximity to that level (L), and a POC at that level (L) are largely one
+observation (D-014).
+
+`requireOF` optionally demands an F-category hit. **Off by default**: in Pine that
+would gate every setup on the weakest module in the engine. The honest fix is
+confirming order flow on a footprint platform, not forcing the proxy to carry it.
+
+### 2.4 Grading
+
+A ≥ 0.75 · B ≥ 0.60 · C ≥ 0.45 · below → nothing. All inputs, all placeholders
+with no evidence behind them yet. The raw composite is hidden behind a
+development-only toggle: 0.71 and 0.69 are not different numbers when they come
+from seven approximated sub-scores (D-009).
+
+Hostile context caps the grade at B by default rather than vetoing, so the gate
+stays auditable (D-004).
 
 **Grades are comparable across bars for a fixed configuration, and not comparable
 between configurations.** Any performance record must capture the toggle state.
 
-### 2.3 Instrument profiles
+### 2.5 Instrument profiles
 
-| | NQ / MNQ | GC / MGC |
-|---|---|---|
-| Exchange | CME | COMEX |
-| Tick | 0.25 | 0.10 |
-| RTH | 09:30–16:00 ET | 08:20–13:30 ET (pit-equivalent, D-007) |
-| Overnight | 18:00–09:30 ET | 18:00–08:20 ET |
-| Context symbols | `USI:TICK`, `USI:ADD`, `CBOE:VIX` | `TVC:DXY`, `TVC:US10Y`, `TVC:US02Y` |
+| | NQ | MNQ | GC | MGC |
+|---|---|---|---|---|
+| Exchange | CME | CME | COMEX | COMEX |
+| Multiplier | $20 × index | $2 × index | 100 oz | 10 oz |
+| Tick | 0.25 = $5.00 | 0.25 = $0.50 | 0.10 = $10.00 | 0.10 = $1.00 |
+| RTH | 09:30–16:00 ET | same | 08:20–13:30 ET (pit-equiv.) | same |
+| Overnight | 18:00–09:30 ET | same | 18:00–08:20 ET | same |
+| Settlement | cash | cash | physical | physical |
+| Expiry | quarterly, 3rd Fri Mar/Jun/Sep/Dec | same | Feb/Apr/Jun/Aug/Oct/Dec | same |
+| Roll | ~8 trading days pre-expiry | same | ~5–7 business days pre-FND | same |
+| Context data | TICK / ADD / VOLD / TRIN / VIX / GEX | same | DXY / real yields / GVZ / COT | same |
 
-Detection is substring matching on `syminfo.root`, micros first for display naming
-only. Micros share the full-size profile exactly (D-006). Tick size is read from
-`syminfo.mintick`, never hardcoded.
+Detection is substring matching on `syminfo.root`, micro tested first for display
+naming only ("MNQ" contains "NQ"). Micros share the full-size profile exactly:
+same price, same tick, same matching engine — only the multiplier differs, and
+this indicator does not price risk in dollars (D-006). Tick size is read from
+`syminfo.mintick`, never hardcoded, so a wrong family detection degrades session
+times rather than tick arithmetic.
 
-### 2.4 Timeframe normalization
+**Reversal-prone windows** (soft prior, never a trigger). NQ: open drive and its
+failure 09:30–10:00, ~10:00, European close ~11:00–11:30, lunch 12:00–13:00,
+14:00–15:00 into the close. GC: London open ~03:00, COMEX open 08:20, the
+London–NY overlap ~08:00–11:00, and the London fixes.
+
+**Continuous contracts.** Back-adjusted continuous series shift every historical
+price at each roll, so absolute horizontal levels drawn on them are unreliable.
+The engine detects a continuous ticker and flags it in the status table; levels
+should be read on the live front month (D-017).
+
+### 2.6 Timeframe normalization
 
 No input is expressed in bars. Every duration is in **minutes**, converted by
-`f_bars(minutes)` at runtime. Every price-distance threshold is in **ticks**.
-Together these make the engine portable across 1m/5m/15m and across NQ/GC without
-a per-combination lookup table (D-005).
+`f_bars()`. Every price distance is in **ticks**. Together these make the engine
+portable across 1m/5m/15m and across NQ/GC without a per-combination table (D-005).
 
-### 2.5 No-repaint guarantee
+Two things do not survive the conversion: M4's intrabar TF must be strictly lower
+than the chart TF (so it self-disables on 1m charts), and the ~100k intrabar cap
+forces M3's hybrid sourcing.
+
+### 2.7 No-repaint guarantee
 
 - All external data flows through `f_sec()` / `f_secLTF()` (D-008). `f_sec()`
-  hardcodes `lookahead = barmerge.lookahead_off`; `request.security_lower_tf()`
-  takes no `lookahead` argument and cannot look ahead by construction, so its
-  wrapper centralizes auditing and the `f_ltfValid()` strictly-lower-TF guard.
-- Grade publication is gated on `barstate.isconfirmed`.
+  hardcodes `lookahead = barmerge.lookahead_off`. `request.security_lower_tf()`
+  takes no `lookahead` argument and cannot look ahead by construction; its wrapper
+  centralizes auditing and the `f_ltfValid()` guard.
+- Publication is gated on `barstate.isconfirmed`.
 - Developing-bar values (session range, live VWAP sigma, developing POC) update
-  within the bar by design; modules that use them must say so.
-- `request.*` budget: ~9 of ~40 planned. See the header table in
-  `src/reversal_engine.pine`; every addition needs a DECISIONS entry.
+  within the bar by design; modules using them must say so.
+- Budget: ~15 of ~40 `request.*` calls worst case. Every addition needs a
+  DECISIONS entry.
 
 ---
 
 ## 3. Modules
 
-Each subsection has the same shape: **Inputs** (scaffolded, in the code today) ·
-**Method** ⟨PENDING⟩ · **Score mapping** ⟨PENDING⟩ · **Active condition** ⟨PENDING⟩
-· **Known weaknesses**.
+### M1 — VWAP extension  ·  category **E**
+**Inputs:** anchor (RTH open default), RTH-only bands, σ extension start (2.0), σ
+saturation (3.0), warm-up (30m), **band-walk suppression (20m)**, plot toggle.
 
-### M1 — VWAP extension with sigma bands
-**Inputs:** anchor (Session / RTH open / Week / Overnight open), inner sigma (2.0),
-outer sigma (3.0), warm-up minutes (30), plot toggle.
-**Method:** ⟨PENDING⟩
-**Score mapping:** ⟨PENDING⟩ — intent is interpolation between inner and outer
-sigma, saturating at the outer.
-**Active condition:** ⟨PENDING⟩ — must be false during the warm-up window, since a
-fresh anchor has sigma near zero and produces meaningless extension readings.
-**Known weaknesses:** sigma is regime-dependent; 2σ in a compressed overnight is
-not 2σ in a trend day. Whether the bands need volatility normalization is an open
-question for the notes.
+**Method.** Session VWAP with running standard-deviation bands, RTH-anchored.
+±1σ contains ~68% of session action, ±2σ ~95%, so a 2σ tag is a genuinely extended
+location. Anchored VWAP from a major high/low or roll date gives a slower reference.
 
-### M2 — Structural levels
-**Inputs:** per-level toggles (PDH/PDL, PDC, ONH/ONL, IB, opening range, RTH open),
-IB length (60m), opening-range length (15m), proximity (8 ticks), draw toggle.
-**Method:** ⟨PENDING⟩
-**Score mapping:** ⟨PENDING⟩ — intent is proximity plus level-class confluence
-(two levels stacked at one price is stronger than one).
-**Active condition:** ⟨PENDING⟩
-**Known weaknesses:** level *stacking* and level *importance* are different things
-and the scoring must not double-count them. GC's pit-session framing (D-007) is a
-convention choice, not a fact.
+**Score mapping.** Linear interpolation of |extension in σ| from `vwapSigmaLo` to
+`vwapSigmaHi`, saturating at 1.0. `dir = -1` above VWAP, `+1` below.
 
-### M3 — Volume profile
+**Active condition.** False during warm-up (a fresh anchor has σ≈0, making the
+reading meaningless) **and** false during a band-walk.
+
+**Known weaknesses.** *Band-walking is the primary failure mode of this entire
+style.* Mechanically fading a band in a trending session is, per the source
+research, a leading cause of blow-ups. The band-walk guard — sustained closes
+beyond the band flipping M1 from "extended" to "trending" — is the single most
+important piece of logic in the module, not an optional refinement. Bands must be
+RTH-anchored; overnight volume is too thin for reliable σ. σ is also
+regime-dependent: 2σ in a compressed overnight is not 2σ on a trend day.
+
+**Evidence class:** practitioner-supported, thinly peer-reviewed.
+
+---
+
+### M2 — Structural levels  ·  category **L**
+**Inputs:** per-level toggles (PDH/PDL, PDC, ONH/ONL, IB, opening range, RTH open,
+round numbers), IB length (60m), OR length (15m), proximity (8 ticks), draw
+toggle; **manual GEX levels** (NQ only, off by default).
+
+**Method.** Collect enabled levels, find the nearest within `structProx` ticks,
+score by proximity **and** by how many *distinct level classes* stack at that price.
+
+**Score mapping.** Proximity term × stacking term, both normalized. `dir = -1` at
+resistance, `+1` at support.
+
+**Known weaknesses.** Level *stacking* and level *importance* are different things;
+scoring must not double-count them. For NQ the RTH open and the first-hour IB
+dominate, and PDH/PDL sweeps are prime triggers — but that is M6's category (Q),
+not M2's, and the two must not both claim credit for one event.
+
+**GEX is manual and will go stale.** Pine has no options chain, no OI, no IV
+surface, and no way to fetch any (PINE_LIMITS §4). GEX is also *modeled*, not
+observed; OI updates end-of-day; and it is computed on NDX/QQQ then applied to
+NQ/MNQ. Regime context, never a trigger. 0DTE concentrates enormous gamma into
+the session — per Cboe's 2025 full-year report, SPX 0DTE hit a record 2.3M
+contracts ADV, 59% of total SPX volume.
+
+---
+
+### M3 — Volume & Market profile  ·  category **L**
 **Inputs:** rows (48), value area (70%), intrabar TF (1m), historical sessions
-(10), naked POC toggle, HVN/LVN toggle, draw toggle.
-**Method:** hybrid sourcing per D-001 — current and prior session from intrabars,
-older sessions from chart bars. Remaining derivation ⟨PENDING⟩.
-**Score mapping:** ⟨PENDING⟩
-**Active condition:** ⟨PENDING⟩
-**Known weaknesses:** **resolution asymmetry is structural.** Chart-bar-derived
-POCs from older sessions are less precise than the intrabar-derived current POC
-and must not score as tightly (D-001). Also the largest consumer of the 500-box
-budget — 48 rows × 2 sessions is 96 boxes before anything else draws.
+(10), naked POCs, HVN/LVN, TPO structures with 30m brackets, single prints, poor
+highs/lows, 80% rule, draw toggle.
 
-### M4 — Approximated delta / CVD  ⚠ NOT ORDER FLOW
-**Inputs:** intrabar TF (1m), CVD reset (Session / RTH open / Day / Never),
-divergence lookback (50m).
-**Method:** tick rule on intrabar candles — intrabar close > open counts volume as
-buying, close < open as selling, equal contributes zero. Remaining ⟨PENDING⟩.
-**Score mapping:** ⟨PENDING⟩
-**Active condition:** ⟨PENDING⟩ — **must** be false when the intrabar timeframe is
-not strictly lower than the chart timeframe (the 1m-chart case).
-**Known weaknesses:** this is an approximation with a known error rate that rises
-in fast, thin, one-tick-range conditions — exactly reversal conditions. Weighted
-0.5 by default and structurally barred from carrying a grade alone. See
-`docs/PINE_LIMITS.md` §2. If the plan tier ever provides real footprint data, this
-module gets **re-specified**, not re-tuned.
+**Method.** Hybrid sourcing (D-001): current + prior session from intrabars, older
+sessions from chart bars. Derive POC, VAH/VAL, HVN/LVN, naked POCs, and TPO
+structures from 30-minute brackets.
 
-### M5 — Range exhaustion and time-of-day RVOL
-**Inputs:** ADR days (20), exhaustion ratio (0.85), RVOL baseline sessions (20),
-RVOL threshold (1.5), time-of-day bucket (30m).
-**Method:** ⟨PENDING⟩ — RVOL normalizes against the same clock bucket on prior
-sessions, not a flat average, so an 09:35 volume spike is judged against other
-09:35s.
-**Score mapping:** ⟨PENDING⟩
-**Active condition:** ⟨PENDING⟩
-**Known weaknesses:** exhaustion and RVOL are two distinct claims sharing one
-module; whether they should be separate modules with separate weights is an open
-question. Holiday and half-day sessions distort both baselines.
+**Reversal setups.** (a) Value-area edge fade — price extends beyond VAH/VAL, fails
+to find acceptance, rotates back toward POC. (b) Naked/virgin POC as magnet and
+reaction point. (c) HVN as reversal wall vs LVN as continuation zone. (d) The 80%
+rule — open outside prior value, re-enter, hold two consecutive 30-min brackets
+inside → ~80% tendency to traverse the full value area.
 
-### M6 — Sweep and reclaim
-**Inputs:** minimum penetration (4 ticks), maximum penetration (40 ticks), reclaim
-window (10m), mark toggle.
-**Method:** ⟨PENDING⟩ — penetration beyond a tracked level within the min/max
-band, followed by a close back inside within the reclaim window.
-**Score mapping:** ⟨PENDING⟩
-**Active condition:** ⟨PENDING⟩
-**Known weaknesses:** **confirmation is inherently late** — the reclaim window
-cannot be evaluated until it elapses, so this module is structurally N bars behind
-the extreme. Depends on M2/M3 for the levels it watches, which is the engine's one
-real inter-module dependency and a collinearity risk: a sweep of a level and
-proximity to that same level are not independent evidence.
+**TPO structures.** Single prints/excess tails mark genuine rejection and act as
+magnets. Profile shapes: **D** = balance (fade extremes toward POC); **P** =
+short-covering that often tops out; **b** = long-liquidation bottoming;
+**double-distribution** = trend day, with the LVN between distributions as the
+reversal pivot.
 
-### M7 — Context filters (gate)
-**Inputs:** hostile-context cap (A/B/C/None, default B), three symbols per
-instrument family, context TF (5m).
-**Method:** ⟨PENDING⟩ — resolves both an ordinary sub-score **and**, independently,
-a hostile flag. The two channels must not be derived from one threshold (D-004).
-**Score mapping:** ⟨PENDING⟩
-**Active condition:** ⟨PENDING⟩
-**Known weaknesses:** noisiest data in the system; held at ≥5m for that reason. A
-gate that flickers is worse than no gate. `USI:TICK` and `USI:ADD` availability is
-plan- and feed-dependent — `ignore_invalid_symbol` is on, so the module must treat
-a missing feed as `active = false` rather than as neutral context.
+**Known weaknesses — three, all structural.**
+
+1. **Poor highs/lows invert the signal.** A flat extreme across 2+ brackets with no
+   excess tail is an *unfinished auction* that typically gets revisited **and
+   exceeded**. It is a warning **against** fading, so M3 must score it *negatively*
+   for the fade side. Getting this backwards turns the module into a
+   trade-the-worst-setups generator (D-016).
+2. **Resolution asymmetry.** Chart-bar-derived POCs from older sessions are less
+   precise than the intrabar-derived current POC and must not score as tightly.
+3. **Budget.** The largest consumer of the 500-box limit: 48 rows × 2 sessions =
+   96 boxes before anything else draws.
+
+Sessions matter more here than anywhere else. Gold's 23-hour Globex profile smears
+Asia, London and NY into one uninformative distribution; the pit window and the
+London–NY overlap carry the information. For NQ the cash session is the meaningful
+profile.
+
+**Evidence class:** practitioner-supported, thinly peer-reviewed.
 
 ---
 
-## 4. Open questions for the research notes
+### M4 — Delta / CVD  ·  category **F**  ·  ⚠ **APPROXIMATION**
+**Inputs:** intrabar TF (1m), CVD reset (RTH open default), divergence lookback
+(50m), **"only score divergence at a marked level"** (on by default).
 
-Listed so the notes can answer them directly rather than being reverse-engineered:
+**Method.** Tick rule on intrabar candles: intrabar close > open counts volume as
+buying, close < open as selling, equal contributes zero. Cumulative sum = CVD.
+Reversal read: price makes a new high while CVD makes a lower high (bearish), or a
+new low while CVD makes a higher low (bullish).
 
-1. **Directionality.** Do modules score a reversal *magnitude* only, with direction
-   resolved elsewhere, or does each module carry a signed bias? The current
-   contract is unsigned 0..1, which means direction is currently undefined.
-2. **Collinearity budget.** M2 proximity, M3 POC proximity, and M6 sweep all key
-   off levels. Which pairs are permitted to score simultaneously?
-3. **Grade thresholds.** 0.75/0.60/0.45 are placeholders with no evidence behind
-   them.
-4. **`minActive` = 3** is a guess (D-003) and should come from the observed
-   distribution of active counts.
-5. **Weights.** Currently 1.0 across the board except delta and context at 0.5.
-   No empirical basis.
-6. **Session handling for NQ vs GC** where the two disagree — is the engine one
-   set of rules with different sessions, or two behavioral models?
-7. **What counts as hostile context**, per instrument, concretely.
+**Active condition.** False unless `f_ltfValid(deltaTF)` — the intrabar TF must be
+strictly lower than the chart TF. On a 1m chart that requires seconds data, which
+is unreliable below the top plan tiers, and the module **self-disables rather than
+reporting zeros**.
+
+**Known weaknesses — this module is the weakest link by design.**
+- It is not order flow. Real delta requires bid/ask trade classification, which
+  Pine does not have (PINE_LIMITS §2). The tick rule's error rate rises sharply in
+  fast, thin, one-tick-range conditions — exactly reversal conditions.
+- The source research flags CVD divergence as a frequent **"real divergence, no
+  reversal" trap**: liquidity at the high may simply have been consumed over
+  repeated tests, and price breaks through anyway. Hence `deltaReqLvl` defaults on
+  — divergence away from a pre-marked level is not evidence.
+- Weighted 0.5 by default, and the category floor stops it carrying a grade alone.
+- If a plan tier ever provides real footprint data, this module is
+  **re-specified**, not re-tuned. The approximation and the real measurement are
+  different things.
+
+**Evidence class:** the underlying feature (order-flow imbalance) is the strongest
+simple microstructure signal in the literature — Cont/Kukanov/Stoikov show a linear
+OFI↔price relationship; Gould & Bonart find it predicts roughly the next two
+mid-price changes then decays to near zero. But it is sub-transaction-cost for
+round-trip speculation, spoofable, and *this module measures a proxy of it*.
 
 ---
 
-## 5. File map
+### M5 — Exhaustion & RVOL  ·  category **E**
+**Inputs:** ADR days (20), ADR exhaustion ratio (1.0), RVOL baseline (20 sessions),
+RVOL threshold (1.5), time-of-day bucket (30m), climax multiple (2.0), expected
+move with per-family IV symbol and rule-of-16 divisor (15.87).
+
+**Method.**
+- **ADR exhaustion:** session range ÷ average daily range. Continuation
+  probability falls off around 1.0× the typical daily range.
+- **RVOL:** current volume ÷ average volume *for the same time-of-day* over 10–20
+  sessions. Time-of-day normalization is mandatory — futures volume is strongly
+  U-shaped (heavy at the RTH open and close, thin midday), so a flat average
+  makes every open look like a spike.
+- **Climax volume:** ≥2× the 20-period average *at a level*.
+- **Expected move:** daily EM ≈ Price × (IV/100) ÷ √252. VIX for NQ, GVZ for GC.
+  A tag of the ±1 EM boundary is a statistically extended zone.
+
+**Known weaknesses.**
+- **A volume spike is ambiguous.** It marks exhaustion *or* breakout initiation.
+  It becomes reversal evidence only when price **fails to follow through** — the
+  failure, not the spike, is the signal.
+- Exhaustion and RVOL are two distinct claims sharing one module and one weight.
+  Whether they should be split is open (§5).
+- GVZ is quoted on GLD options — a proxy for COMEX gold vol, not a measure of it.
+- Holiday and half-day sessions distort both baselines.
+
+---
+
+### M6 — Sweep & reclaim  ·  category **Q**
+**Inputs:** min penetration (4 ticks), max penetration (40 ticks), reclaim window
+(10m), mark toggle.
+
+**Method.** Price penetrates a tracked level by between `sweepMinTicks` and
+`sweepMaxTicks` — beyond the max it is a breakout, not a sweep — then closes back
+inside within `reclaimMin`. This is the stop-run-into-reversal pattern: clustered
+stops at an obvious level (PDH/PDL, round number, prior swing) are triggered, and
+the trapped traders' forced exits fuel the counter-move.
+
+**Known weaknesses.**
+- **Confirmation is structurally late.** The reclaim window cannot be evaluated
+  until it elapses, so the module fires *after* the extreme, never at it. This is
+  inherent to bar-by-bar execution with no lookahead, not a tuning problem.
+- **Inter-module coupling.** M6 depends on M2/M3 for the levels it watches — the
+  engine's one real dependency, and a collinearity risk the category floor exists
+  to contain.
+- Pine sees the *price behavior*, not the resting orders. M6 detects a failed
+  penetration; it cannot know stops were there. Describe its output as "failed
+  penetration", never "liquidity taken" (PINE_LIMITS §1).
+
+---
+
+### M7 — Context & regime  ·  category **C** + **grade cap**
+**Inputs:** hostile cap (B), context TF (5m), NQ internals (TICK/ADD/VOLD/TRIN)
+with ±1000 TICK extreme, GC macro (DXY/US10Y/US02Y), **manual gamma regime**,
+regime method (ADX / range-vs-ADR / both) with ADX length 14 and threshold 25,
+overnight-reversal prior, optional COT.
+
+**Method.** Resolves an ordinary sub-score **and**, through an independent path, a
+hostile flag (D-004). Deriving the cap from a sub-score threshold would collapse
+them into one signal wearing two hats.
+
+**NQ context.** NYSE TICK — normal range ±600, extremes beyond ±1000 mark breadth
+exhaustion. *Context-dependent:* in range-bound sessions TICK extremes mark
+reversal points; in trends they confirm momentum. ADD/VOLD divergence from price
+(index new high, ADD fails to confirm) is a classic non-confirmation. TRIN >2.0 in
+a decline = capitulation; <0.5 = frenzied buying that can fade.
+
+**GC context.** Strong inverse correlation to DXY and 10-year *real* (TIPS)
+yields — PIMCO's 2004–2025 regression puts gold's "real duration" at ~18 years
+(100bp rise in 10y real yields ↔ ~18% decline in inflation-adjusted gold). **Post-2022
+this anchor weakened**: record central-bank buying decoupled gold's level from real
+yields, which held above 2% while gold rose. Real yields still transmit intraday
+but no longer anchor the level — so this is a *filter*, not a model.
+
+**Regime gate.** Fading in a trend is the dominant failure mode of the entire
+style. ADX ≥25, or session range vs ADR, marks the session as trending and the
+fade as hostile.
+
+**Overnight → intraday reversal prior.** Close-to-open predicts open-to-close
+negatively — documented across four asset classes including index futures (Della
+Corte & Kosowski; Bondarenko & Muravyev; NY Fed), and strongest in the morning
+session. Directional prior only.
+
+**COT.** CFTC weekly, Tuesday data released Friday. For gold the signal is never
+"commercials are net short" — they structurally are, as hedgers — it is how
+stretched **managed money** is versus its own multi-year percentile. Top few
+percent = crowded trade vulnerable to violent unwind. For Nasdaq the equity-index
+COT is muddied by hedging and basis trades and is a weaker tool. Weekly horizon,
+never intraday timing. **Off by default: symbol availability in Pine is unverified**
+(D-018).
+
+**Known weaknesses.** Noisiest data in the engine, held at ≥5m because a
+flickering gate is worse than no gate. Internals feeds are availability-dependent;
+`ignore_invalid_symbol` is on, so a missing feed must resolve to `active = false`,
+never to neutral context. Gamma regime is manual and "Unknown" must not be treated
+as favorable. **Never apply internals to gold** — TICK/ADD/VOLD/TRIN are
+meaningless there.
+
+---
+
+## 4. Evidence ledger
+
+Recorded so weights and future changes can be argued from evidence rather than
+enthusiasm. The engine's weakest-evidenced components should never be its
+highest-weighted.
+
+| Claim | Standing |
+|---|---|
+| Order-flow imbalance predicts short-horizon price change | **Genuinely evidenced** — but decays within ~2 mid-price changes, generally sub-cost, spoofable |
+| Overnight → intraday reversal | **Genuinely evidenced** — across four asset classes incl. index futures |
+| VPIN as a toxicity/volatility gauge | **Genuinely evidenced** — not directional |
+| VWAP-band reversion | Practitioner-supported, thin peer review |
+| Volume-profile value-area reversion, market-profile day types | Practitioner-supported, thin peer review |
+| RSI / Bollinger divergence standalone | **Largely folklore** — deliberately absent from this engine |
+| Single footprint patterns in isolation | **Largely folklore** — and unavailable in Pine anyway |
+| Day-of-week / time-of-day seasonality | Documented but regime-dependent and decaying |
+
+**Methodological note carried over from the research:** regress imbalance out
+before testing any "new" signal, or you will rediscover it under a new name. The
+same applies inside this engine — M4's contribution should be residualized against
+M1/M5 before its weight is raised.
+
+---
+
+## 5. Open questions
+
+Resolved by the research notes: directionality (§2.1 — modules carry `dir`),
+collinearity (§2.3 — category floor), NQ-vs-GC (one rule set, instrument-specific
+context and sessions), hostile context (§3, M7), GC RTH (§2.5, pit window
+confirmed).
+
+Still open:
+
+1. **Grade thresholds** (0.75/0.60/0.45) and **weights** — placeholders, no
+   empirical basis.
+2. **`minCats` = 3** matches the checklist, but whether *which* three matters more
+   than *how many* is untested. Location + Extension without Liquidity is a
+   materially different setup from Location + Liquidity without Extension.
+3. **Should M5 split** into separate Exhaustion and RVOL modules with separate
+   weights?
+4. **Should the overnight-reversal prior be its own module?** It is the
+   best-evidenced item in the entire research document and currently sits as one
+   component inside the noisiest module.
+5. **Volume sourcing** (D-013) — full-size vs chart symbol, currently defaulted off.
+6. **Naked POC decay** — how long does an unfilled POC stay relevant?
+
+---
+
+## 6. Benchmarks and kill criteria
+
+From the source research, recorded here so the engine can be falsified rather than
+endlessly tuned:
+
+- **POC/level reaction rate below ~55%** → the location layer is not working;
+  switch to trading with trend (band-walking, LVN breakouts) until balance returns.
+- **Reversal win rate collapsing on trend days** → the regime gate (M7) is failing,
+  not the modules.
+- Track **ADX** or the **ratio of trend to range days** as the regime switch.
+- Record the **toggle configuration** with every graded setup — grades are not
+  comparable across configurations (§2.4).
+
+---
+
+## 7. Two-layer workflow
+
+The engine is layer one of the setup the research recommends:
+
+| Layer | Tool | Role |
+|---|---|---|
+| 1 · Screening | **This engine**, on GC / NQ (or ES) | Marks L + E + Q + C confluence zones. Pre-mark PDH/PDL/ONH/ONL, naked POCs, VWAP σ bands, and (manually) GEX walls. |
+| 2 · Confirmation | Footprint / DOM platform | Supplies category **F** — absorption, exhaustion, stacked imbalance, unfinished auction, trapped traders. Requires Level 2 (~$15–16/mo per exchange). |
+| 3 · Execution | MGC / MNQ | Risk-sized execution at the same price through the same matching engine. |
+
+Reading microstructure on the full-size contract is the research's explicit
+recommendation, but note the reason: **depth**, which Pine cannot access at all.
+For *bar volume* the argument does not obviously transfer — MNQ's 2025 ADV
+(~1.6M contracts) exceeds NQ's (~500k). Hence D-013 defaults volume sourcing to the
+chart symbol, with a toggle and a stated test.
+
+---
+
+## 8. File map
 
 | Path | Role |
 |---|---|
 | `SPEC.md` | This document. |
-| `src/reversal_engine.pine` | The indicator. Scaffold + inputs + composite pipeline. |
-| `docs/PINE_LIMITS.md` | Platform constraints that shape the design. Read before proposing a module. |
-| `docs/DECISIONS.md` | Running log of tradeoffs, D-001 onward. |
+| `src/reversal_engine.pine` | The indicator. Scaffold, inputs, directional composite, grading. |
+| `docs/PINE_LIMITS.md` | Platform constraints. Read before proposing a module. |
+| `docs/DECISIONS.md` | Running log, D-001 onward. |
 
----
+## 9. Disclaimer
 
-## 6. Disclaimer
-
-Not financial advice. A research and education tool. Every threshold in it is an
-untested hypothesis until validated against your own data. Nothing here is
-backtested or guaranteed.
+Not financial advice. A research and education tool. Counter-trend trading has a
+structurally low win rate and asymmetric blow-up risk. Nothing here is backtested
+or guaranteed. Contract specs, fees and volumes change — verify against CME Group
+before acting.

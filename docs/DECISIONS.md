@@ -64,7 +64,7 @@ Watch this during first implementation; the `minActive` floor is the tell.
 ---
 
 ## D-003 — Confluence floor: minimum active modules
-**Status:** Provisional · 2026-08-29
+**Status:** Superseded by D-014 · 2026-08-29
 
 Default 3. Below this count the composite is suppressed to no-grade regardless of
 its value.
@@ -221,3 +221,179 @@ honestly 0.0 and no setup can grade.
 **Standing rule for implementation:** a module that cannot source its data returns
 `active = false`. It must never return a neutral score, because the composite
 cannot distinguish a real 0.5 from a fabricated one.
+
+---
+
+## D-012 — The engine is a screener, not a trigger
+**Status:** Accepted · 2026-08-29
+
+The published grade covers four of the source framework's five evidence
+categories: Location, Extension, Liquidity event, Context. **Category F
+(order-flow failure) is handed off to a footprint/DOM platform.** This is stated
+in the file header, in `SPEC.md` §1.1, and should appear in any UI the engine
+ever renders.
+
+**Why this is a decision and not just a limitation:** the research is explicit
+that location without order-flow confirmation is half a framework. Pine cannot
+supply absorption, stacked imbalance, unfinished auctions, or trapped-trader
+reads — no Level 2, no DOM, no bid/ask classification, no MBO. The only F input
+available is M4's tick-rule proxy, which the same research flags as a frequent
+"real divergence, no reversal" trap.
+
+**Over:** (a) pretending M4 satisfies category F and shipping a "complete"
+checklist — this is the tempting option and it is dishonest, because it would let
+an A grade publish with no order-flow evidence at all; (b) dropping category F
+from the framework — which quietly redefines the strategy into something the
+research does not support.
+
+**Consequence:** `requireOF` exists but defaults **off**, because turning it on
+gates every setup on the weakest module in the engine. The correct workflow is
+`SPEC.md` §7: screen here, confirm on a footprint platform, execute on the micro.
+
+**Wrong if:** the plan tier gains real footprint access (`request.footprint()` or
+equivalent). At that point M4 is **re-specified**, not re-tuned, and this decision
+is revisited — an approximation and the real measurement are different things, not
+the same thing at different quality.
+
+---
+
+## D-013 — Volume sourced from the chart symbol, not the full-size contract
+**Status:** Provisional · 2026-08-29
+
+`useFullSizeVol` defaults **off**. Volume-derived modules (M3, M4, M5) read the
+chart symbol.
+
+**Against the research's own recommendation,** which says to read microstructure
+on the full-size contract (GC/NQ) and execute the micro. That recommendation is
+sound — but its stated reason is **book depth**: micros carry a fraction of the
+resting liquidity and their standalone DOM/tape is too thin to read.
+
+**Pine cannot access book depth at all** (PINE_LIMITS §1). What it reads is bar
+volume, and there the argument does not transfer:
+
+- MNQ 2025 ADV ≈ 1.6M contracts vs NQ ≈ 500k. The micro carries *more* contract
+  volume, not less.
+- MGC 2025 record ADV ≈ 300,757 contracts vs GC ≈ 270,000. Comparable by contract
+  count; GC dominates *notional and depth*, which is not what a bar-volume profile
+  measures.
+
+**Consequence:** the toggle exists and costs up to 2 `request.*` calls when on.
+
+**The test that settles this:** build the session profile both ways on the same
+day and compare POC and VAH/VAL placement. If they agree within a tick or two, the
+default stands and the toggle can be removed. If they diverge materially, the
+full-size series is the correct source and the default flips.
+
+**Wrong if:** micro volume turns out to be dominated by a different participant
+mix (retail/algo splitting into micros) such that the distributions genuinely
+differ in shape rather than scale.
+
+---
+
+## D-014 — Confluence floor counts CATEGORIES, not modules
+**Status:** Accepted · 2026-08-29 · supersedes D-003
+
+The floor requires ≥3 **distinct evidence categories** (Location / Extension /
+Order-flow / Liquidity / Context), default 3, matching the source checklist.
+
+**Over:** D-003's minimum-active-module count, which was a guess and, worse, was
+the wrong unit. M2 (structural levels) and M3 (volume profile) are both Location.
+Under a module count they read as two independent confirmations; they are one.
+The same is true of M1 and M5, both Extension.
+
+**Rationale:** this is the structural answer to the collinearity problem raised in
+the original spec's open questions. A sweep of a level (Q), proximity to that
+level (L), and a POC sitting at that level (L) are largely *one observation*
+scored three times. Counting categories caps how much a single observation can
+pay out.
+
+**Consequence:** the category assignment is now load-bearing and must be reviewed
+whenever a module is added. Getting a category wrong is worse than getting a
+weight wrong — a weight is a dial, a category is a structural claim about
+independence.
+
+**Wrong if:** the categories turn out not to be independent either. Location and
+Extension co-occur by construction (an extended price is usually extended
+*relative to a level*). If the observed category-hit correlation is high, the
+floor needs to name *which* three, not just count them (`SPEC.md` §5 Q2).
+
+---
+
+## D-015 — An opposing module contributes 0.0 and keeps its weight
+**Status:** Accepted · 2026-08-29
+
+When evaluating the long side, a module with `dir = -1` contributes 0.0 to the
+numerator but its weight stays in the denominator.
+
+**Over:** (a) excluding opposing modules from the denominator, which would let a
+setup score well *because* half the evidence pointed the other way; (b) letting
+them contribute negatively, which puts the composite outside 0..1 and breaks the
+grade thresholds.
+
+**Rationale:** evidence for a low is not neutral when you are grading a high.
+
+**Consequence:** both sides are evaluated every bar, and both qualifying is
+treated as **CONFLICT → suppress**, not as "pick the bigger number". Incoherent
+evidence is a reason to stand down.
+
+---
+
+## D-016 — Poor highs / poor lows score AGAINST the fade
+**Status:** Accepted · 2026-08-29
+
+A flat extreme across two or more TPO brackets with no excess tail is an
+*unfinished auction*. Such extremes typically get revisited **and exceeded**, so
+M3 must **reduce** the score for fading them.
+
+**Recorded as a decision because the intuitive implementation is backwards.** A
+naive reading treats any prominent extreme as a reversal candidate; a poor high is
+prominent *and* is evidence the auction is not finished there. Getting the sign
+wrong here does not merely weaken the engine — it biases it toward the setups most
+likely to fail, while looking like it is working.
+
+Corollary: excess tails and single prints are the *opposite* structure — genuine
+rejection — and score positively.
+
+---
+
+## D-017 — Detect and flag back-adjusted continuous contracts
+**Status:** Accepted · 2026-08-29
+
+A ticker containing `1!` / `2!` is flagged in the status table.
+
+**Rationale:** back-adjusted continuous series shift every historical price at each
+roll, so absolute horizontal levels drawn on them are unreliable — which is
+precisely what M2 and M3 produce. Continuous series are fine for trend context and
+wrong for level work.
+
+**Not enforced, only flagged:** forcing the front month would break the ability to
+view history at all. Roll timing for reference — NQ/MNQ roll ~8 trading days before
+the third-Friday expiry; GC/MGC roll ~5–7 business days before First Notice Day,
+with December carrying the highest open interest.
+
+---
+
+## D-018 — GEX, gamma regime, and catalyst stand-down are manual; COT is off
+**Status:** Accepted · 2026-08-29
+
+Three inputs the research treats as first-class have no automatic path in Pine and
+are exposed as manual controls, defaulting off/unknown:
+
+- **GEX walls and gamma flip** — Pine has no options chain, OI, or IV surface, and
+  no way to fetch any. Three `input.float` fields, 0.0 = unused.
+- **Gamma regime** — a three-way manual selector. **"Unknown" must not be treated
+  as favorable**, because the research's rule is asymmetric: fade only in positive
+  gamma, never in negative. An unknown regime is not a permissive one.
+- **Catalyst stand-down (FOMC/CPI/NFP/PPI)** — Pine has no economic event
+  calendar. A manual toggle plus a blackout window is the whole mechanism.
+
+**COT** is scaffolded but defaults **off**: TradingView exposes CFTC series, but
+whether the specific series resolve through `request.security` in this context is
+**unverified**, and an unverified data source that silently returns `na` is worse
+than an absent one. The module must self-disable if the series does not resolve.
+
+**Consequence:** all four are honest holes rather than approximations. Where an
+approximation was possible (delta) it was built and labeled; where it is not
+(gamma), no proxy is invented. Inventing a "gamma proxy" from price behavior would
+be the same error as D-016 — a plausible-looking number with no measurement behind
+it.

@@ -66,10 +66,33 @@ zero-gamma levels cannot be computed inside Pine, and cannot be fetched from an
 external API — Pine has no HTTP client, no file I/O, and no way to reach any
 network resource.
 
-**Consequence:** if gamma-derived levels are wanted, they must be entered as
-manual inputs (a handful of `input.price` / `input.float` fields updated by hand),
-or the idea is dropped. There is no third option. Nothing in the current spec
-depends on it.
+**Consequence:** the source research ranks GEX a *first-class* reversal tool for
+NQ — positive-gamma regimes produce pinning and mean-reversion near call/put walls;
+negative-gamma regimes amplify moves and must not be faded. None of it is
+computable here. So M2 exposes three manual `input.float` level fields (gamma
+flip, call wall, put wall) and M7 exposes a manual three-way regime selector.
+There is no third option, and **no proxy is invented** — a "gamma-like" number
+derived from price behavior would be a plausible-looking value with no measurement
+behind it (see DECISIONS D-018).
+
+Two asymmetries worth stating explicitly:
+- **"Unknown" regime is not "favorable" regime.** The research's rule is
+  one-sided — fade only in positive gamma, never in negative — so an unset
+  selector must not unlock fades.
+- Even where GEX *is* available externally it is **modeled, not observed**: OI
+  updates end-of-day, dealer positioning is assumed, and for NQ it is computed on
+  NDX/QQQ and applied to the futures. Regime context, never a trigger.
+
+**No economic event calendar.** Pine has `request.economic()` for certain economic
+*data series*, but no calendar of scheduled event times. The research says to stand
+down into FOMC, CPI, NFP and PPI; there is no automatic way to know when those are.
+A manual stand-down toggle plus a blackout window is the entire mechanism.
+
+**COT data is uncertain, not impossible.** TradingView carries CFTC series, so a
+`request.security` against one may work — but whether the specific series resolve
+in this context is unverified, and a data source that silently returns `na` is
+worse than an absent one. Scaffolded, defaulted off, and required to self-disable
+rather than report neutral.
 
 Related and equally hard: Pine cannot read an external file, call a webhook
 inbound, or share state with another script. Alerts go out; nothing comes in.
@@ -185,3 +208,13 @@ Rules this project holds to:
   structurally N bars late. M6's reclaim window is the clearest example.
 - **String/label rendering is the only text output.** There is no logging, no
   console, no debugger. Development instrumentation costs drawing-object budget.
+- **Back-adjusted continuous contracts are not level-safe.** A `1!` series shifts
+  every historical price at each roll, so absolute horizontal levels — exactly what
+  M2 and M3 produce — are unreliable on them. Pine cannot un-adjust the series;
+  the engine detects and flags the case (DECISIONS D-017) and the levels should be
+  read on the live front month.
+- **Volume is contract count, not notional.** This matters for the "read full-size,
+  execute micro" recommendation: that advice is about *book depth*, which Pine
+  cannot see. By contract count MNQ actually trades more than NQ, so switching the
+  volume source to the full-size contract is not automatically an upgrade
+  (DECISIONS D-013).
