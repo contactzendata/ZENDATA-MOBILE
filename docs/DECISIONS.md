@@ -577,9 +577,21 @@ displayed and **warns below 2 bars**: at 1 bar the reclaim must land on the very
 next bar, which is a materially different and much rarer event than the
 input's wording implies. It warns rather than self-disabling, as specified.
 
-**Wrong if:** the tick readouts show one reference producing absurd numbers across
-the 1m/5m/15m set, in which case the other becomes the default rather than the
-option.
+**Chart TF confirmed as the default** (2026-08-29), and the earlier framing of the
+tension was wrong. D-005's invariance governs **lookback semantics** — how far back
+"50 minutes" reaches — not **event magnitude**. Those are different things, and
+this entry originally conflated them.
+
+A sweep is a *scale-dependent event*: it is an excursion at the resolution being
+watched. A 15m chart correctly should not fire on an excursion only visible at 1m,
+and Daily ATR would make the same absolute distance count as a sweep on a 1m chart
+where it is noise. Chart-TF ATR is not a compromise against D-005 — it is the
+correct measure for a magnitude that is *supposed* to scale with resolution. The
+Daily option stays for cross-instrument comparison and diagnostics.
+
+**Wrong if:** the tick readouts show chart-TF producing absurd numbers somewhere
+in the 1m/5m/15m set — but note that "absurd" now means absurd *relative to what a
+sweep means on that timeframe*, not absurd relative to the 5m numbers.
 
 ---
 
@@ -635,3 +647,39 @@ happened, and a flat hold would misrepresent that.
 sweep keeps paying out across many bars and inflates the fire-to-grade ratio.
 Watch for grades clustering immediately after a single sweep. The fix would be a
 one-grade-per-sweep debounce, not a shorter hold.
+
+---
+
+## D-026 — M6 contribution age is logged at grade onset
+**Status:** Accepted · 2026-08-29
+
+Every grade records the age, in bars, of the M6 sweep contributing to it. Surfaced
+on the grade label, in a status-table freshness histogram (fresh / mid / stale
+against the hold window), and in the Data Window.
+
+**Why.** The hold window (D-025) is the parameter most likely to **manufacture
+confluence**. Keep M6 warm for long enough and it will eventually overlap with
+something, the categories fill, and a grade appears — not because a setup formed
+but because a timer had not expired. The hold is defensible on its own terms and
+still capable of producing exactly this artefact.
+
+The failure is invisible without instrumentation: a grade carried by a 12-minute-old
+sweep and a grade carried by a 1-bar-old sweep look identical in the output. If
+A-grades cluster in the stale bucket, the window is too generous and the engine is
+grading its own memory.
+
+**Counted at grade ONSET only.** A grade persisting across bars is one setup, not N
+of them; per-bar counting would make every long-lived grade look like a cluster.
+
+**Buckets** are thirds of `holdBars`, so they rescale automatically with the hold
+window and the chart timeframe rather than encoding a bar count.
+
+**`gradesNoM6`** counts grades where M6 did not contribute to the graded side at
+all. While `requireOF` is off and M4 is a stub, this should be **zero** — M6 carries
+gate rule 2 alone (D-019). A non-zero count means either M4 went live or something
+is filling category Q unexpectedly, and it is worth investigating rather than
+assuming.
+
+**Wrong if:** onset-only counting hides a real pattern — e.g. grades that upgrade
+C→A several bars in, where the interesting age is the age at *upgrade*, not at
+onset. If that shows up, count transitions rather than onsets.

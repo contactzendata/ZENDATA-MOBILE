@@ -251,6 +251,7 @@ gradeCmin = input.float(0.45, "Grade C threshold", minval = 0.0, maxval = 1.0, s
 //   Location mandatory + at least one of {Liquidity, Order-flow} + a third category.
 minCats   = input.int(3, "Minimum distinct categories", minval = 2, maxval = 5, group = grpScore, tooltip = "Count only. Composition is enforced regardless: LOCATION is mandatory, and at least one of {LIQUIDITY, ORDER-FLOW} is required. Extended-and-near-a-level with no event is a watch, not a setup.")
 requireOF = input.bool(false, "Require the ORDER-FLOW category specifically", group = grpScore, tooltip = "Narrows rule 2 from {Liquidity OR Order-flow} to Order-flow only. In Pine the sole order-flow input is M4's tick-rule approximation, so this gates every setup on the weakest module in the engine. OFF by default; confirm order flow on a footprint platform instead.")
+showGradeLbl = input.bool(true, "Draw grade label (with M6 age)", group = grpScore, tooltip = "Labels the bar a grade first appears, carrying the age in bars of the M6 sweep contributing to it. The hold window is the parameter most likely to manufacture confluence; this is how you see whether grades cluster at fresh reclaims or stale ones.")
 showRaw   = input.bool(false, "Show raw composite (development only)", group = grpScore, tooltip = "The engine publishes A/B/C, not a number. 0.71 and 0.69 are not different when they come from seven approximated sub-scores.")
 
 // =============================================================================
@@ -902,6 +903,39 @@ gradeStr = finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C"
 sideStr  = side == 1 ? "LONG" : side == -1 ? "SHORT" : conflict ? "CONFLICT" : "-"
 hasSetup = finalGrade > 0 and barstate.isconfirmed and instOK and tfSupported and not inBlackout
 
+// ---- M6 age-at-grade telemetry (D-026) ---------------------------------------
+// The hold window (D-025) is the parameter most likely to MANUFACTURE confluence:
+// keep M6 warm long enough and it will eventually overlap with something and the
+// categories fill. This measures whether grades are carried by fresh reclaims or
+// stale ones. Counted at grade ONSET only -- a grade persisting across bars is
+// one setup, not N of them.
+m6ContribAge = (m6Active and m6Dir == side and side != 0) ? (side == -1 ? m6HiAge : m6LoAge) : na
+
+gradeOnset = finalGrade > 0 and nz(finalGrade[1], 0) == 0
+
+var int lastGradeAge  = na
+var int lastGradeLvl  = na
+var int gradesTotal   = 0
+var int gradesFresh   = 0
+var int gradesMid     = 0
+var int gradesStale   = 0
+var int gradesNoM6    = 0
+
+if confirmed and gradeOnset
+    gradesTotal := gradesTotal + 1
+    lastGradeLvl := finalGrade
+    if na(m6ContribAge)
+        gradesNoM6 := gradesNoM6 + 1
+        lastGradeAge := na
+    else
+        lastGradeAge := m6ContribAge
+        if m6ContribAge <= holdBars * 0.34
+            gradesFresh := gradesFresh + 1
+        else if m6ContribAge <= holdBars * 0.67
+            gradesMid := gradesMid + 1
+        else
+            gradesStale := gradesStale + 1
+
 // =============================================================================
 // RENDER
 // =============================================================================
@@ -916,10 +950,15 @@ if sweepShow and confirmed and not na(fireHiBar) and fireHiBar == bar_index
 if sweepShow and confirmed and not na(fireLoBar) and fireLoBar == bar_index
     label.new(bar_index, low, "S " + fireLoNm, style = label.style_label_up, color = color.new(color.green, 65), textcolor = color.white, size = size.tiny)
 
+// Grade label, carrying the M6 contribution age (D-026).
+if showGradeLbl and confirmed and gradeOnset and side != 0
+    lblTxt = gradeStr + " " + (side == 1 ? "LONG" : "SHORT") + (na(m6ContribAge) ? "  m6:-" : "  m6:" + str.tostring(m6ContribAge) + "b")
+    label.new(bar_index, side == 1 ? low : high, lblTxt, style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(side == 1 ? color.green : color.red, 25), textcolor = color.white, size = size.small)
+
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 21, border_width = 1)
+        st := table.new(position.top_right, 2, 23, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -963,6 +1002,10 @@ if showStatus and barstate.islast
         table.cell(st, 1, 19, str.tostring(m6PenSeen) + " / " + str.tostring(m6InBand) + " -> " + str.tostring(m6TotFires) + " fired", text_size = size.tiny)
         table.cell(st, 0, 20, "FIRE RATE", text_size = size.tiny)
         table.cell(st, 1, 20, str.tostring(m6TotFires / math.max(1, m6Sessions), "#.##") + " / session  (" + str.tostring(m6Sessions) + " sess, " + str.tostring(m6SessFires) + " today)", text_size = size.tiny)
+        table.cell(st, 0, 21, "Grade age f/m/s", text_size = size.tiny)
+        table.cell(st, 1, 21, str.tostring(gradesFresh) + " / " + str.tostring(gradesMid) + " / " + str.tostring(gradesStale) + "  (noM6 " + str.tostring(gradesNoM6) + " of " + str.tostring(gradesTotal) + ")", text_size = size.tiny)
+        table.cell(st, 0, 22, "Last grade", text_size = size.tiny)
+        table.cell(st, 1, 22, (na(lastGradeLvl) ? "-" : (lastGradeLvl == 3 ? "A" : lastGradeLvl == 2 ? "B" : "C")) + " at m6 age " + (na(lastGradeAge) ? "-" : str.tostring(lastGradeAge) + "b of " + str.tostring(holdBars)), text_size = size.tiny)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
@@ -972,3 +1015,4 @@ plot(showRaw ? composite : na, "Composite (raw)", display = display.data_window)
 plot(onRevAdj,   "M8 bias", display = display.data_window)
 plot(m6Score,    "M6 score", display = display.data_window)
 plot(m6Dir,      "M6 dir",   display = display.data_window)
+plot(m6ContribAge, "M6 age at grade (bars)", display = display.data_window)
