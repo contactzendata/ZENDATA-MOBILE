@@ -683,3 +683,125 @@ assuming.
 **Wrong if:** onset-only counting hides a real pattern — e.g. grades that upgrade
 C→A several bars in, where the interesting age is the age at *upgrade*, not at
 onset. If that shows up, count transitions rather than onsets.
+
+---
+
+## D-027 — M2/M6 cross-category collinearity: damp proximity, not stacking
+**Status:** Accepted · 2026-08-29
+
+When M6 has an active sweep on the level M2 is scoring, **M2's proximity term is
+damped by `structSweptDamp` (default 0.3). Its stacking term is untouched.**
+Mediated by a `lvlSwept` array in the shared registry: M6 writes it, M2 reads it,
+neither touches the other's variables.
+
+**The diagnosis.** The dependency is asymmetric and mechanical, not a vague
+overlap: a reclaim *is* a close back through the level, so
+
+> P(M2 proximity-active | M6 fired on level L) ≈ 1
+
+at the fire bar. The converse does not hold — M2 active without M6 is informative
+(price approaching an untested level). Conditional on M6 firing, M2's proximity
+adds approximately nothing.
+
+**But only proximity is redundant.** M2's score has two terms answering different
+questions:
+
+| Term | Given M6 fired on L | |
+|---|---|---|
+| Proximity — is price at a level *now* | Forced at the fire bar | **redundant** |
+| Stacking — how many distinct classes agree at that price | M6's score is speed × depth and knows nothing about level quality | **independent** |
+
+So stacking takes full credit always, and the two terms are scored, logged and
+displayed separately for exactly this reason.
+
+**Why suppression was rejected** (both originally-proposed options — M2 skips swept
+levels, or the sweep consumes the level):
+
+1. **M2 is the antidote to a stale M6.** Proximity is forced at the fire bar but
+   *not* at bar 10 of the hold window. By then price may have left the level, and
+   M2 going quiet is the **only** signal in the engine that a warm M6 is stale.
+   Suppressing M2 on the swept level would delete the one check on D-025's hold —
+   the very failure mode D-026 exists to measure.
+2. **It would empty a mandatory category.** Location is required by D-019. On a
+   lone-level sweep — sweep of PDH with nothing else nearby, the most common
+   reversal setup there is — suppression leaves Location empty and the setup could
+   never grade.
+
+**The active gate does the antidote work structurally**, not the weight: outside
+the proximity window M2 is `active = false` regardless of stacking. So price
+leaving the level collapses M2 no matter how the blend is set.
+
+**Consequence.** Under D-002 the semantics land correctly: on a lone swept level M2
+is *active with a low score* — "measured, nothing further there." Location fills,
+the gate passes, the composite is not inflated. A sweep of PDH+ONH+POC stacked
+still outscores a sweep of a lone PDH, which is the intended ordering.
+
+**Cost:** M2's score is now conditionally defined and cannot be read in isolation;
+one input; one registry array; and a fixed cross-category special case that needs
+revisiting if a second category-Q module ever exists.
+
+**Open: fixed vs age-dependent damping.** Age-dependent is more principled —
+redundancy is highest at age 0 and gone by hold expiry. But with comparable
+weights it *flattens the composite across age* (M6 high + M2 damped ≈ M6 decayed +
+M2 full), which would destroy the engine's ability to distinguish fresh sweeps
+from stale ones. Fixed damping ships; the D-026 age histogram decides.
+
+---
+
+## D-028 — OPEN: M1/M6 collinearity and the within-E split
+**Status:** Open · 2026-08-29 · **do not implement without data**
+
+**The problem.** The collinearity does not stop at M2/M6. Sweeps happen at session
+extremes; session extremes are where VWAP extension is largest. So M1 (category E)
+is also correlated with M6, and a sweep of PDH at 2σ fills **L + Q + E from
+arguably one event** — which satisfies D-019's gate completely.
+
+### Candidate 1 — restrict the third category to {F, C} · **held, likely wrong**
+
+Tighten D-019 so the third category must come from Order-flow or Context, the two
+plausibly independent of the level interaction.
+
+**Objection (raised in review, and it holds):** this routes the requirement into
+*the module Pine cannot build* (F is M4's tick-rule approximation, D-012) and *the
+one that is a gate rather than evidence* (C is M7, which already caps grades under
+D-004). That is a redirection into weakness, not a tightening — it would make the
+engine's third leg depend on its least trustworthy input while appearing more
+rigorous.
+
+### Candidate 2 — split within E, mirroring D-027 · **preferred**
+
+M1's VWAP distance is level-correlated at a swept extreme. **M5's ADR exhaustion
+is not:** whether the session has run 1.3× its average range is a property of the
+whole session, independent of which level just got swept. If that holds, damp the
+correlated term rather than restricting the category — exactly the D-027 pattern
+one level up.
+
+**Caveat to test, not assume.** M5 is not perfectly independent either. A sweep
+that prints a new session extreme *extends the session range*, and sweeps of
+extreme-type levels (PDH/ONH/IBH) plausibly cluster in already-extended sessions.
+That is a selection correlation rather than a mechanical one, and much weaker than
+M1's — but "much weaker" is a claim requiring measurement.
+
+**A structural difference from D-027 worth noting:** M1's redundancy is not with
+the *level identity* but with *being at a session extreme*. So the `lvlSwept` flag
+that mediates D-027 does not directly serve this; the registry would need to expose
+level **class** (extreme-type vs interior-type), and M1 would damp when an active
+sweep sits on an extreme-type level.
+
+### What data settles it
+
+1. **Implement M1 and M5 with per-term sub-score logging**, as M2 now has.
+2. **Conditional distribution test.** Compare each module's sub-score distribution
+   when M6 is active on an extreme-type level against when M6 is idle. If M1's
+   distribution shifts materially and M5's does not, Candidate 2 is correct and the
+   damping goes on M1 alone.
+3. **Grade attribution.** Of graded setups whose third category is E, record which
+   module supplied it. If E is nearly always M1 *and* nearly always coincident with
+   M6, the collinearity is confirmed and load-bearing.
+4. **Correlate M1's score against `m2ProxRaw`** (already logged). A high
+   correlation independent of M6 would mean the problem is broader than the sweep
+   case and belongs in the composite rather than in a module.
+
+Until 1–4 exist there is no basis for choosing, and either change made blind would
+double-count or destroy the most common reversal setup in the framework — the same
+risk D-027 was written to avoid.

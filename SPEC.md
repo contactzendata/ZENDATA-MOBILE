@@ -3,7 +3,7 @@
 **Target:** TradingView Pine Script v6, single indicator, `overlay = true`
 **Instruments:** NQ (E-mini Nasdaq-100, CME) · GC (Gold, COMEX) — micros MNQ/MGC as aliases
 **Chart timeframes:** 1m, 5m, 15m
-**Status:** M6 implemented. Level registry (L0) implemented. M1–M5, M7, M8 are stubs.
+**Status:** L0 registry, M2 and M6 implemented. M1, M3, M4, M5, M7, M8 are stubs.
 
 > Educational/research only. Counter-trend trading has a structurally low win rate
 > and asymmetric blow-up risk. Every threshold below is an untested hypothesis.
@@ -256,30 +256,49 @@ regime-dependent: 2σ in a compressed overnight is not 2σ on a trend day.
 
 ---
 
-### M2 — Structural levels  ·  category **L** (primary)
-**Inputs:** per-level toggles (PDH/PDL, PDC, ONH/ONL, IB, opening range, RTH open,
-round numbers), IB length (60m), OR length (15m), proximity (8 ticks), draw
-toggle; **manual GEX levels** (NQ only, off by default).
+### M2 — Structural levels  ·  category **L** (primary)  ·  **IMPLEMENTED**
+**Inputs:** proximity window (8 ticks), score blend proximity-vs-stacking (0.5),
+distinct classes for full stacking credit (3), **swept-level proximity damping
+(0.3)**, draw toggle, diagnostics toggle.
 
-**Method.** Collect enabled levels, find the nearest within `structProx` ticks,
-score by proximity **and** by how many *distinct level classes* stack at that price.
+**Method.** Two **separately scored and separately logged** terms:
 
-**Score mapping.** Proximity term × stacking term, both normalized. `dir = -1` at
-resistance, `+1` at support.
+| Term | Question | Redundant with M6? |
+|---|---|---|
+| **Proximity** | Is price at a level *right now*? Measured from **close**, not the bar range. | **Yes**, at the fire bar |
+| **Stacking** | How many distinct level classes agree at that price? | **No** — M6's score is speed × depth and knows nothing about level quality |
 
-**Known weaknesses.** Level *stacking* and level *importance* are different things;
-scoring must not double-count them. For NQ the RTH open and the first-hour IB
-dominate, and PDH/PDL sweeps are prime triggers — but that is M6's category (Q),
-not M2's, and the two must not both claim credit for one event.
+Proximity = `1 − dist/window`, saturating at the level. Stacking = classes within
+the window, 1 class → 0, `structStackFull` → 1.0. Blended by `structProxW`.
+`dir = −1` when price is below the level (resistance → short reversal), `+1`
+above — which agrees with M6 by construction on a reclaimed sweep.
 
-**GEX is manual and will go stale.** Pine has no options chain, no OI, no IV
-surface, and no way to fetch any (PINE_LIMITS §4). GEX is also *modeled*, not
-observed; OI updates end-of-day; and it is computed on NDX/QQQ then applied to
-NQ/MNQ. Regime context, never a trigger. 0DTE concentrates enormous gamma into
-the session — per Cboe's 2025 full-year report, SPX 0DTE hit a record 2.3M
-contracts ADV, 59% of total SPX volume.
+**Measured from close, deliberately.** A bar that wicks a level but closes far away
+has not held it. Using the bar range would score full proximity there and destroy
+M2's role as the staleness check on an aging M6 hold.
 
----
+**Cross-category damping (D-027).** When M6 has an active sweep on the nearest
+level, **only the proximity term is damped**. The dependency is asymmetric and
+mechanical: a reclaim *is* a close back through the level, so
+`P(M2 proximity-active | M6 fired on L) ≈ 1`. Stacking is untouched.
+
+Suppressing M2 on swept levels was rejected for two reasons: it would delete the
+one signal that can invalidate a stale M6 hold, and it would empty the *mandatory*
+Location category on a lone-level sweep — so the most common reversal setup in the
+framework could never grade.
+
+**Levels come from the shared registry (D-022)**; the `lvlSwept` flag is written by
+M6 and read by M2, so neither module reads the other's variables.
+
+**Known weaknesses.**
+- Score is **conditionally defined** — M2 cannot be read in isolation any more.
+- Level *stacking* and level *importance* remain different things. Stacking counts
+  classes; it does not yet weight PDH above ORH.
+- Round numbers are auto-generated at every price and would inflate stacking, which
+  is why they default off.
+- **GEX is manual and will go stale.** Pine has no options chain, OI, or IV surface
+  (PINE_LIMITS §4). GEX is modeled, not observed; OI updates end-of-day; and it is
+  computed on NDX/QQQ then applied to NQ/MNQ. Regime context, never a trigger.
 
 ### M3 — Volume & Market profile  ·  category **L** (secondary, damped)
 **Inputs:** rows (48), value area (70%), intrabar TF (1m), historical sessions

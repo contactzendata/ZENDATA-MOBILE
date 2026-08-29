@@ -294,8 +294,12 @@ roundStep   = input.float(0.0, "  Round-number step (0 = auto)", minval = 0.0, g
 // ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
 grpM2 = "M2 - Structural levels (L)"
 useStruct   = input.bool(true, "Enable structural levels", group = grpM2)
-structProx  = input.int(8, "Proximity to level (ticks)", minval = 1, group = grpM2, tooltip = "In TICKS so it carries across NQ (0.25) and GC (0.10) without retuning.")
+structProx  = input.int(8, "Proximity window (ticks)", minval = 1, group = grpM2, tooltip = "In TICKS so it carries across NQ (0.25) and GC (0.10) without retuning. Outside this window M2 is INACTIVE regardless of stacking -- which is what preserves its role as the staleness check on an aging M6 hold (D-027).")
+structProxW = input.float(0.5, "Score blend: proximity vs stacking", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM2, tooltip = "Proximity and stacking are scored and logged SEPARATELY and blended here. Proximity = how close price is now. Stacking = how many distinct level classes agree at that price. They answer different questions and only one of them is redundant with M6.")
+structStackFull = input.int(3, "Distinct classes for full stacking credit", minval = 2, maxval = 8, group = grpM2, tooltip = "1 class scores 0, this many scores 1.0, linear between. A lone PDH is not confluence; PDH + ONH + naked POC at one price is.")
+structSweptDamp = input.float(0.3, "Swept-level proximity damping", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM2, tooltip = "CROSS-CATEGORY damping (D-027). When M6 has an active sweep on the nearest level, that level's PROXIMITY term is damped by this factor -- a reclaim IS a close back through the level, so proximity is mechanically forced and adds nothing given M6. Stacking is untouched: M6's score knows nothing about how many level classes sit at that price. 1.0 disables.")
 structShow  = input.bool(true, "Draw levels", group = grpM2)
+structDebug = input.bool(true, "Show M2 diagnostics in status table", group = grpM2)
 
 // GEX levels (NQ family only). Pine has NO options data. MANUAL entries, 0 = unused.
 gexEnable   = input.bool(false, "GEX walls (NQ only, MANUAL entry)", group = grpM2, tooltip = "Pine cannot compute or fetch gamma exposure. Type the levels in yourself; they are modeled, OI updates end-of-day, and they are computed on NDX/QQQ then applied to NQ.")
@@ -582,9 +586,11 @@ var string pLoNm  = ""
 var int    fireHiBar   = na
 var float  fireHiScore = 0.0
 var string fireHiNm    = ""
+var float  fireHiPrice = na
 var int    fireLoBar   = na
 var float  fireLoScore = 0.0
 var string fireLoNm    = ""
+var float  fireLoPrice = na
 
 // instrumentation (D-024): the penetration funnel and the raw fire rate
 var int m6Sessions  = 0
@@ -664,6 +670,7 @@ if confirmed and m6Ready
         fireHiScore := math.min(1.0, sweepSpeedW * spdH + (1.0 - sweepSpeedW) * depH)
         fireHiBar   := bar_index
         fireHiNm    := pHiNm
+        fireHiPrice := pHiLvl
         pHiLvl      := na
         pHiBar      := na
         m6SessFires := m6SessFires + 1
@@ -676,6 +683,7 @@ if confirmed and m6Ready
         fireLoScore := math.min(1.0, sweepSpeedW * spdL + (1.0 - sweepSpeedW) * depL)
         fireLoBar   := bar_index
         fireLoNm    := pLoNm
+        fireLoPrice := pLoLvl
         pLoLvl      := na
         pLoBar      := na
         m6SessFires := m6SessFires + 1
@@ -702,7 +710,77 @@ minPenTicks = na(minPen) ? na : minPen / tick
 maxPenTicks = na(maxPen) ? na : maxPen / tick
 
 // =============================================================================
-// MODULE IMPLEMENTATIONS  --  M6 LIVE, REST ARE STUBS
+// REGISTRY: swept-level flags  (completes the L0 registry, post-M6)
+// =============================================================================
+// A third parallel array alongside lvlP / lvlN. M6 writes it, M2 reads it.
+// Neither module touches the other's variables -- both read shared registry
+// state, the same pattern as the level arrays themselves (D-027).
+
+m6SweptPrice = (m6Active and m6Dir == -1) ? fireHiPrice : (m6Active and m6Dir == 1) ? fireLoPrice : na
+
+lvlSwept = array.new<bool>(array.size(lvlP), false)
+if m6Active and not na(m6SweptPrice) and array.size(lvlP) > 0
+    for i = 0 to array.size(lvlP) - 1
+        if math.abs(array.get(lvlP, i) - m6SweptPrice) <= tick
+            array.set(lvlSwept, i, true)
+
+// =============================================================================
+// M2 ENGINE  --  structural levels (category L)
+// =============================================================================
+// Two SEPARATE terms, scored and logged apart because only one of them is
+// redundant with M6:
+//
+//   PROXIMITY  how close price is to the nearest level RIGHT NOW. Measured from
+//              CLOSE, not from the bar range: a bar that wicks a level but closes
+//              far away has not held it, and using the range would destroy M2's
+//              role as the staleness check on an aging M6 hold.
+//   STACKING   how many DISTINCT level classes agree at that price. M6's score is
+//              speed x depth and knows nothing about level quality, so this term
+//              is independent of M6 and takes full credit always.
+//
+// Only PROXIMITY is damped on a swept level (D-027).
+
+proxDistPx = structProx * tick
+
+m2NearIdx    = -1
+m2NearDistPx = 0.0
+m2StackN     = 0
+
+if useStruct and array.size(lvlP) > 0
+    bestD = 1.0e12
+    for i = 0 to array.size(lvlP) - 1
+        d = math.abs(close - array.get(lvlP, i))
+        if d < bestD
+            bestD := d
+            m2NearIdx := i
+        if d <= proxDistPx
+            m2StackN := m2StackN + 1
+    m2NearDistPx := bestD
+
+m2InWindow  = m2NearIdx >= 0 and m2NearDistPx <= proxDistPx
+m2NearLvl   = m2NearIdx >= 0 ? array.get(lvlP, m2NearIdx) : na
+m2NearNm    = m2NearIdx >= 0 ? array.get(lvlN, m2NearIdx) : ""
+m2NearSwept = m2NearIdx >= 0 ? array.get(lvlSwept, m2NearIdx) : false
+
+// term 1: proximity, raw and damped
+m2ProxRaw = m2InWindow ? math.max(0.0, 1.0 - m2NearDistPx / proxDistPx) : 0.0
+m2Prox    = m2NearSwept ? m2ProxRaw * structSweptDamp : m2ProxRaw
+
+// term 2: stacking. 1 class -> 0, structStackFull classes -> 1.0
+m2Stack = m2InWindow ? math.min(1.0, math.max(0.0, (m2StackN - 1) / math.max(1.0, structStackFull - 1.0))) : 0.0
+
+m2Score = math.min(1.0, structProxW * m2Prox + (1.0 - structProxW) * m2Stack)
+
+// Direction: price below the level means the level is resistance, and a reversal
+// there is a SHORT. This agrees with M6 by construction on a reclaimed sweep --
+// a swept high that reclaimed leaves close below the level, so both read -1.
+m2Ref  = m2InWindow ? (close != m2NearLvl ? close : nz(close[1], close)) : na
+m2Dir  = not m2InWindow ? 0 : m2Ref < m2NearLvl ? -1 : m2Ref > m2NearLvl ? 1 : 0
+m2Active = useStruct and m2InWindow and m2Dir != 0
+m2Note = m2NearNm + (m2NearSwept ? " (swept: prox damped)" : "") + " x" + str.tostring(m2StackN)
+
+// =============================================================================
+// MODULE IMPLEMENTATIONS  --  M2 + M6 LIVE, REST ARE STUBS
 // =============================================================================
 // Contract reminders that will quietly corrupt the composite if broken:
 //   - score must be 0..1 and must mean the same thing across modules.
@@ -718,12 +796,10 @@ maxPenTicks = na(maxPen) ? na : maxPen / tick
 f_mVwap() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
-// ---- M2 [L] ------------------------------------------------------------------
-// TODO: gather enabled levels, find nearest within structProx ticks, score by
-//       proximity and by how many DISTINCT level classes stack at that price.
-//       dir = -1 at resistance, +1 at support.
+// ---- M2 [L] -- IMPLEMENTED ---------------------------------------------------
+// Packages the M2 ENGINE results. Pure accessor, as with M6.
 f_mStruct() =>
-    ModuleOut.new(0.0, false, 0, "stub")
+    ModuleOut.new(m2Score, m2Active, m2Dir, m2Note)
 
 // ---- M3 [L] ------------------------------------------------------------------
 // TODO: hybrid profile (D-001). POC/VAH/VAL, HVN/LVN, naked POCs, TPO brackets,
@@ -944,6 +1020,30 @@ if confirmed and gradeOnset
 f_gateStr(array<bool> ch, int n) =>
     (array.get(ch, CAT_L) ? "L" : "-") + (array.get(ch, CAT_E) ? "E" : "-") + (array.get(ch, CAT_F) ? "F" : "-") + (array.get(ch, CAT_Q) ? "Q" : "-") + (array.get(ch, CAT_C) ? "C" : "-") + " " + str.tostring(n)
 
+// Level registry rendering. Objects are deleted and rebuilt on the last bar only,
+// so the 500-line/500-label budget is bounded by the level count, not by history.
+var array<line>  lvlLines  = array.new<line>()
+var array<label> lvlLabels = array.new<label>()
+if structShow and barstate.islast
+    if array.size(lvlLines) > 0
+        for i = 0 to array.size(lvlLines) - 1
+            line.delete(array.get(lvlLines, i))
+        array.clear(lvlLines)
+    if array.size(lvlLabels) > 0
+        for i = 0 to array.size(lvlLabels) - 1
+            label.delete(array.get(lvlLabels, i))
+        array.clear(lvlLabels)
+    if array.size(lvlP) > 0
+        for i = 0 to array.size(lvlP) - 1
+            lp = array.get(lvlP, i)
+            sw = array.get(lvlSwept, i)
+            nr = i == m2NearIdx and m2InWindow
+            col = sw ? color.orange : nr ? color.aqua : color.new(color.gray, 40)
+            ln = line.new(bar_index - f_bars(240), lp, bar_index + 3, lp, color = col, width = nr ? 2 : 1, style = sw ? line.style_solid : line.style_dotted)
+            array.push(lvlLines, ln)
+            lb = label.new(bar_index + 3, lp, array.get(lvlN, i) + (sw ? "*" : ""), style = label.style_label_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny)
+            array.push(lvlLabels, lb)
+
 // M6 sweep markers. Drawn here, never inside the engine (D-010).
 if sweepShow and confirmed and not na(fireHiBar) and fireHiBar == bar_index
     label.new(bar_index, high, "S " + fireHiNm, style = label.style_label_down, color = color.new(color.red, 65), textcolor = color.white, size = size.tiny)
@@ -958,7 +1058,7 @@ if showGradeLbl and confirmed and gradeOnset and side != 0
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 23, border_width = 1)
+        st := table.new(position.top_right, 2, 28, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -1006,6 +1106,17 @@ if showStatus and barstate.islast
         table.cell(st, 1, 21, str.tostring(gradesFresh) + " / " + str.tostring(gradesMid) + " / " + str.tostring(gradesStale) + "  (noM6 " + str.tostring(gradesNoM6) + " of " + str.tostring(gradesTotal) + ")", text_size = size.tiny)
         table.cell(st, 0, 22, "Last grade", text_size = size.tiny)
         table.cell(st, 1, 22, (na(lastGradeLvl) ? "-" : (lastGradeLvl == 3 ? "A" : lastGradeLvl == 2 ? "B" : "C")) + " at m6 age " + (na(lastGradeAge) ? "-" : str.tostring(lastGradeAge) + "b of " + str.tostring(holdBars)), text_size = size.tiny)
+    if structDebug
+        table.cell(st, 0, 23, "-- M2 --", text_size = size.tiny)
+        table.cell(st, 1, 23, m2Active ? ("active dir " + str.tostring(m2Dir)) : (m2InWindow ? "in window, dir 0" : "out of window"), text_size = size.tiny)
+        table.cell(st, 0, 24, "Nearest lvl", text_size = size.tiny)
+        table.cell(st, 1, 24, (m2NearNm == "" ? "-" : m2NearNm) + "  " + str.tostring(m2NearDistPx / tick, "#.#") + " tk of " + str.tostring(structProx), text_size = size.tiny)
+        table.cell(st, 0, 25, "Prox raw/damp", text_size = size.tiny)
+        table.cell(st, 1, 25, str.tostring(m2ProxRaw, "0.00") + " -> " + str.tostring(m2Prox, "0.00") + (m2NearSwept ? "  SWEPT" : ""), text_size = size.tiny)
+        table.cell(st, 0, 26, "Stack", text_size = size.tiny)
+        table.cell(st, 1, 26, str.tostring(m2StackN) + " lvls -> " + str.tostring(m2Stack, "0.00") + "  (full at " + str.tostring(structStackFull) + ")", text_size = size.tiny)
+        table.cell(st, 0, 27, "M2 score", text_size = size.tiny)
+        table.cell(st, 1, 27, str.tostring(m2Score, "0.000") + "  = " + str.tostring(structProxW, "0.0") + "*prox + " + str.tostring(1.0 - structProxW, "0.0") + "*stack", text_size = size.tiny)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
@@ -1016,3 +1127,7 @@ plot(onRevAdj,   "M8 bias", display = display.data_window)
 plot(m6Score,    "M6 score", display = display.data_window)
 plot(m6Dir,      "M6 dir",   display = display.data_window)
 plot(m6ContribAge, "M6 age at grade (bars)", display = display.data_window)
+plot(m2ProxRaw,  "M2 proximity (raw)",     display = display.data_window)
+plot(m2Prox,     "M2 proximity (damped)",  display = display.data_window)
+plot(m2Stack,    "M2 stacking",            display = display.data_window)
+plot(m2Score,    "M2 score",               display = display.data_window)
