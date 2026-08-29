@@ -1,0 +1,420 @@
+//@version=6
+// =============================================================================
+// REVERSAL ENGINE  --  NQ / GC futures reversal framework
+// -----------------------------------------------------------------------------
+// STATUS: SCAFFOLD ONLY. Every analytical module below is a stub that returns
+// score = 0.0 and active = false. No module logic is implemented yet. The file
+// is intentionally compilable so the input tree, the composite math, and the
+// grading pipeline can be inspected on a live chart before any signal exists.
+//
+// DISCLAIMER: Not financial advice. This is a research tool. Every threshold in
+// it is an UNTESTED HYPOTHESIS until it is validated on your own data.
+//
+// INSTRUMENTS
+//   NQ  E-mini Nasdaq-100 (CME)    tick 0.25   alias MNQ (identical settings)
+//   GC  Gold (COMEX)               tick 0.10   alias MGC (identical settings)
+//   Micros trade at the same price and the same tick size as the full-size
+//   contract. Only the dollar multiplier differs, and this indicator does not
+//   price risk in dollars, so micros and full-size share one settings profile.
+//
+// TIMEFRAME
+//   Designed to run correctly on 1m, 5m and 15m. NO input is expressed in bars.
+//   Every lookback is expressed in MINUTES and converted to a bar count at
+//   runtime via f_bars(). See "TIMEFRAME NORMALIZATION".
+//
+// REPAINTING
+//   Every request.*() call in this file must go through f_sec() / f_secLTF().
+//   f_sec() hardcodes lookahead = barmerge.lookahead_off. request.security_lower_tf()
+//   has no lookahead parameter -- it returns intrabars of the CURRENT bar only and
+//   cannot look ahead by construction -- so f_secLTF() exists for auditability and
+//   for the strictly-lower-timeframe guard, not to set lookahead. Any new request.*
+//   call must be added to the budget table below AND documented in docs/DECISIONS.md.
+//   Signal evaluation is gated on barstate.isconfirmed so historical bars and
+//   the closed portion of realtime bars agree.
+//
+// request.*() BUDGET (hard platform cap is ~40 calls per script)
+//   Structural levels ... up to  3   (daily HTF, prior session, overnight)
+//   Volume profile ...... up to  2   (intrabar for current + prior session)
+//   Delta / CVD ......... up to  1   (intrabar tick-rule approximation)
+//   Context filters ..... up to  3   (NQ: TICK/ADD/VIX  |  GC: DXY/US10Y/US02Y)
+//   ------------------------------------------------------------------------
+//   Planned total ....... up to  9   of ~40. Headroom is deliberate.
+//
+// ORDER FLOW HONESTY
+//   Pine has no Level 2, no DOM, no market-by-order, and no bid/ask trade
+//   classification. The delta module is a TICK-RULE APPROXIMATION built from
+//   intrabar candles. It is not order flow. See docs/PINE_LIMITS.md.
+// =============================================================================
+
+indicator("Reversal Engine (NQ/GC)", shorttitle="REV", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+// TYPES
+// =============================================================================
+
+// Every analytical module returns exactly this shape. `score` is normalized to
+// 0..1 and is only meaningful when `active` is true. A module that is enabled
+// but has nothing to say returns active = false, which the composite reads as a
+// 0.0 contribution WITHOUT removing the module's weight from the denominator.
+type ModuleOut
+    float score  = 0.0
+    bool  active = false
+    string note  = ""
+
+// =============================================================================
+// INSTRUMENT DETECTION
+// =============================================================================
+// syminfo.root is "NQ" / "MNQ" / "GC" / "MGC" on CME/COMEX futures and continuous
+// contracts. It is empty on some symbol types, so fall back to the ticker.
+// Micros are matched as aliases and resolve to the SAME family with the SAME
+// settings; the alias only changes the label shown in the status table.
+
+grpInst = "1 · Instrument"
+
+instOverride = input.string("Auto", "Instrument profile", options = ["Auto", "NQ", "GC"], group = grpInst, tooltip = "Auto detects from syminfo.root. Override only if you are on a symbol whose root does not resolve (a spread, a custom continuous contract, or a CFD proxy).")
+showStatus   = input.bool(true, "Show status table", group = grpInst, tooltip = "Scaffold verification: shows the detected instrument, chart timeframe, and which modules are enabled. Turn off once the engine is live.")
+
+rootRaw  = str.length(syminfo.root) > 0 ? syminfo.root : syminfo.ticker
+rootUp   = str.upper(rootRaw)
+
+// Order matters for the DISPLAY name only: "MNQ" contains "NQ" as a substring,
+// and "MGC" contains "GC", so test the micro first when naming the contract.
+isMNQ = str.contains(rootUp, "MNQ")
+isMGC = str.contains(rootUp, "MGC")
+isNQfam = str.contains(rootUp, "NQ")
+isGCfam = str.contains(rootUp, "GC")
+
+detected = isNQfam ? "NQ" : isGCfam ? "GC" : "UNKNOWN"
+family   = instOverride == "Auto" ? detected : instOverride
+aliasName = isMNQ ? "MNQ" : isMGC ? "MGC" : family
+
+isNQ = family == "NQ"
+isGC = family == "GC"
+instOK = isNQ or isGC
+
+// Tick size is read from the symbol rather than hardcoded: it is identical
+// across full-size and micro, so no per-alias branch is needed.
+tick = syminfo.mintick
+
+// =============================================================================
+// TIMEFRAME NORMALIZATION
+// =============================================================================
+// The chart may be 1m, 5m or 15m. Converting minutes -> bars here is what keeps
+// every module's lookback meaning the same wall-clock duration on all three.
+
+tfSec = timeframe.in_seconds()
+tfMin = tfSec / 60.0
+
+f_bars(float minutes) =>
+    math.max(1, math.round(minutes * 60.0 / tfSec))
+
+tfSupported = tfSec > 0 and tfSec <= 900 and timeframe.isminutes
+
+// =============================================================================
+// NO-REPAINT REQUEST WRAPPERS
+// =============================================================================
+// Do not call request.security / request.security_lower_tf directly anywhere in
+// this file. These wrappers exist so lookahead_off cannot be forgotten, and so
+// every external data dependency is greppable in one place.
+
+// HTF / cross-symbol. lookahead_off is not optional and is not exposed.
+f_sec(string sym, string tf, float expr) =>
+    request.security(sym, tf, expr, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+// Intrabar. NOTE: request.security_lower_tf() takes no lookahead argument -- it
+// returns intrabars belonging to the current chart bar and cannot look ahead by
+// construction. This wrapper is here for call-site auditability and to centralize
+// the "lower TF must be strictly lower than the chart TF" guard that M3/M4 need.
+f_ltfValid(string tf) =>
+    timeframe.in_seconds(tf) < tfSec
+
+f_secLTF(string tf, float expr) =>
+    request.security_lower_tf(syminfo.tickerid, tf, expr)
+
+// =============================================================================
+// SESSIONS
+// =============================================================================
+// Defaults differ per instrument, and Pine inputs cannot have conditional
+// defaults, so both profiles are exposed and one is selected at runtime.
+
+grpSess = "2 · Sessions"
+
+tz          = input.string("America/New_York", "Session timezone", options = ["America/New_York", "America/Chicago", "UTC"], group = grpSess)
+nqRthSess   = input.session("0930-1600", "NQ  RTH", group = grpSess, tooltip = "Equity regular trading hours, ET.")
+nqOnSess    = input.session("1800-0930", "NQ  Overnight", group = grpSess, tooltip = "Globex reopen through the RTH open. Sources ONH / ONL.")
+gcRthSess   = input.session("0820-1330", "GC  RTH", group = grpSess, tooltip = "COMEX pit-equivalent session, ET. This is the window most gold structural levels are quoted against, NOT the 23-hour Globex session.")
+gcOnSess    = input.session("1800-0820", "GC  Overnight", group = grpSess)
+
+rthSess = isGC ? gcRthSess : nqRthSess
+onSess  = isGC ? gcOnSess  : nqOnSess
+
+inRTH = not na(time(timeframe.period, rthSess, tz))
+inON  = not na(time(timeframe.period, onSess,  tz))
+
+// =============================================================================
+// COMPOSITE SCORING AND GRADING
+// =============================================================================
+
+grpScore = "3 · Composite & grading"
+
+// WEIGHTING CONTRACT (see docs/DECISIONS.md D-002):
+//   module OFF      -> excluded from numerator AND denominator ("not measured")
+//   module ON, idle  -> contributes 0.0, weight STAYS in the denominator
+//                       ("measured, nothing there")
+// This makes an idle module cost you score, while disabling a module you cannot
+// source data for does not silently punish every setup.
+
+wVwap    = input.float(1.0, "Weight · VWAP extension",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wStruct  = input.float(1.0, "Weight · Structural levels",  minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wProfile = input.float(1.0, "Weight · Volume profile",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wDelta   = input.float(0.5, "Weight · Delta / CVD (approx)", minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Deliberately down-weighted. This module is a tick-rule approximation, not order flow, and should not be able to carry a grade on its own.")
+wExhaust = input.float(1.0, "Weight · Range exhaustion / RVOL", minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wSweep   = input.float(1.0, "Weight · Sweep & reclaim",    minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wContext = input.float(0.5, "Weight · Context filters",    minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Context also acts as a GRADE CAP independent of this weight. The weight is its ordinary scoring contribution; the cap is its veto power.")
+
+gradeAmin = input.float(0.75, "Grade A threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore)
+gradeBmin = input.float(0.60, "Grade B threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore)
+gradeCmin = input.float(0.45, "Grade C threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore, tooltip = "Below this, no setup is published at all.")
+minActive = input.int(3, "Minimum active modules", minval = 1, maxval = 7, group = grpScore, tooltip = "A setup carried by one or two modules is not confluence. Below this count the composite is suppressed regardless of its value.")
+showRaw   = input.bool(false, "Show raw composite (development only)", group = grpScore, tooltip = "The engine publishes A/B/C, not a number. This exposes the underlying 0..1 value for tuning and should stay off in normal use.")
+
+// =============================================================================
+// MODULE INPUTS
+// =============================================================================
+
+// ---- Module 1: VWAP extension with sigma bands ------------------------------
+grpM1 = "M1 · VWAP extension"
+useVwap      = input.bool(true, "Enable VWAP extension", group = grpM1)
+vwapAnchor   = input.string("Session", "VWAP anchor", options = ["Session", "RTH open", "Week", "Overnight open"], group = grpM1)
+vwapSigmaLo  = input.float(2.0, "Sigma band · inner", minval = 0.5, step = 0.1, group = grpM1, tooltip = "Extension begins to score here.")
+vwapSigmaHi  = input.float(3.0, "Sigma band · outer", minval = 0.5, step = 0.1, group = grpM1, tooltip = "Score saturates at 1.0 here. Between inner and outer the sub-score interpolates.")
+vwapShow     = input.bool(true, "Plot VWAP and bands", group = grpM1)
+vwapWarmMin  = input.int(30, "Anchor warm-up (minutes)", minval = 1, group = grpM1, tooltip = "A freshly anchored VWAP sits on price with sigma near zero, which makes the extension reading meaningless. Suppress the module until the anchor has this much data.")
+
+// ---- Module 2: Structural levels ---------------------------------------------
+grpM2 = "M2 · Structural levels"
+useStruct    = input.bool(true, "Enable structural levels", group = grpM2)
+sPDH         = input.bool(true, "Prior day high / low", group = grpM2)
+sPDC         = input.bool(true, "Prior day close", group = grpM2)
+sONHL        = input.bool(true, "Overnight high / low", group = grpM2)
+sIB          = input.bool(true, "Initial balance", group = grpM2)
+ibMinutes    = input.int(60, "Initial balance length (minutes)", minval = 5, group = grpM2, tooltip = "Measured from the RTH open. 60 is the convention; 30 is common on gold.")
+sOR          = input.bool(true, "Opening range", group = grpM2)
+orMinutes    = input.int(15, "Opening range length (minutes)", minval = 1, group = grpM2)
+sRTHopen     = input.bool(true, "RTH open price", group = grpM2)
+structProxTicks = input.int(8, "Proximity to level (ticks)", minval = 1, group = grpM2, tooltip = "How close price must come to a level for the module to call itself active. In ticks, so it carries across NQ (0.25) and GC (0.10) without retuning.")
+structShow   = input.bool(true, "Draw levels", group = grpM2)
+
+// ---- Module 3: Volume profile -------------------------------------------------
+grpM3 = "M3 · Volume profile"
+useProfile   = input.bool(true, "Enable volume profile", group = grpM3)
+vpRows       = input.int(48, "Profile rows", minval = 8, maxval = 200, group = grpM3, tooltip = "Row count is capped by the 500-box budget shared with every other drawing in this script.")
+vpValueArea  = input.float(70.0, "Value area (%)", minval = 50.0, maxval = 95.0, step = 1.0, group = grpM3)
+vpIntrabarTF = input.timeframe("1", "Intrabar timeframe (current / prior session)", group = grpM3, tooltip = "HYBRID SOURCING: the current and prior session profiles are built from this intrabar resolution; older sessions fall back to chart bars. See docs/DECISIONS.md D-001.")
+vpHistSess   = input.int(10, "Historical sessions (chart-bar sourced)", minval = 0, maxval = 40, group = grpM3, tooltip = "Sessions older than the prior one, profiled from chart bars only. These feed naked-POC discovery.")
+vpNaked      = input.bool(true, "Track naked POCs", group = grpM3)
+vpHVNLVN     = input.bool(true, "Mark HVN / LVN", group = grpM3)
+vpShow       = input.bool(true, "Draw profile", group = grpM3)
+
+// ---- Module 4: Approximated delta / CVD ---------------------------------------
+grpM4 = "M4 · Delta / CVD (APPROXIMATION)"
+useDelta     = input.bool(true, "Enable approximated delta", group = grpM4, tooltip = "THIS IS NOT ORDER FLOW. Pine cannot classify trades against bid/ask. Delta here is inferred from intrabar candle direction (the tick rule). Treat it as a participation proxy.")
+deltaTF      = input.timeframe("1", "Intrabar timeframe", group = grpM4, tooltip = "Must be lower than the chart timeframe. On a 1m chart this needs a seconds timeframe, which is unreliable below a Premium plan -- the module self-disables rather than reporting garbage.")
+cvdResetOn   = input.string("Session", "CVD reset", options = ["Session", "RTH open", "Day", "Never"], group = grpM4)
+deltaDivMin  = input.int(50, "Divergence lookback (minutes)", minval = 5, group = grpM4)
+
+// ---- Module 5: Range exhaustion and time-of-day RVOL ---------------------------
+grpM5 = "M5 · Exhaustion & RVOL"
+useExhaust   = input.bool(true, "Enable exhaustion / RVOL", group = grpM5)
+adrDays      = input.int(20, "ADR lookback (days)", minval = 2, group = grpM5)
+exhaustRatio = input.float(0.85, "Range exhaustion ratio", minval = 0.1, step = 0.05, group = grpM5, tooltip = "Session range divided by average daily range. At or above this, the day has spent its expected distance and continuation is statistically more expensive.")
+rvolBaseN    = input.int(20, "RVOL baseline period (sessions)", minval = 2, group = grpM5)
+rvolMin      = input.float(1.5, "RVOL threshold", minval = 0.0, step = 0.1, group = grpM5)
+rvolTodBucketMin = input.int(30, "Time-of-day bucket (minutes)", minval = 1, group = grpM5, tooltip = "RVOL is normalized against the same clock window on prior sessions, not against a flat average. Bucket width is in minutes so it survives a chart timeframe change.")
+
+// ---- Module 6: Sweep and reclaim ----------------------------------------------
+grpM6 = "M6 · Sweep & reclaim"
+useSweep     = input.bool(true, "Enable sweep & reclaim", group = grpM6)
+sweepMinTicks = input.int(4, "Minimum sweep penetration (ticks)", minval = 1, group = grpM6)
+sweepMaxTicks = input.int(40, "Maximum sweep penetration (ticks)", minval = 2, group = grpM6, tooltip = "Beyond this the move is a breakout, not a liquidity sweep.")
+reclaimMin   = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window for the sweep to count as a failed break.")
+sweepShow    = input.bool(true, "Mark sweeps", group = grpM6)
+
+// ---- Module 7: Context filters (acts as a GRADE CAP) ---------------------------
+grpM7 = "M7 · Context filters"
+useContext   = input.bool(true, "Enable context filters", group = grpM7)
+ctxCapGrade  = input.string("B", "Hostile-context grade cap", options = ["A", "B", "C", "None"], group = grpM7, tooltip = "GRADE CAP, not a veto. A setup fighting its context is still published, capped at this grade, so you can see what the gate rejected and judge whether it was right. 'None' suppresses the setup entirely.")
+ctxNQ1       = input.symbol("USI:TICK",  "NQ context · breadth", group = grpM7)
+ctxNQ2       = input.symbol("USI:ADD",   "NQ context · advance-decline", group = grpM7)
+ctxNQ3       = input.symbol("CBOE:VIX",  "NQ context · volatility", group = grpM7)
+ctxGC1       = input.symbol("TVC:DXY",   "GC context · dollar", group = grpM7)
+ctxGC2       = input.symbol("TVC:US10Y", "GC context · 10y yield", group = grpM7)
+ctxGC3       = input.symbol("TVC:US02Y", "GC context · 2y yield", group = grpM7)
+ctxTF        = input.timeframe("5", "Context timeframe", group = grpM7, tooltip = "Held at or above 5m on purpose: internals are noisy at 1m and a context gate that flickers is worse than no gate.")
+
+// =============================================================================
+// MODULE IMPLEMENTATIONS  --  ALL STUBS
+// =============================================================================
+// Each function must return a ModuleOut with score normalized to 0..1 and an
+// honest `active` flag. Returning active = true with a meaningless score is the
+// one thing that will quietly corrupt the composite, so a module that cannot
+// source its data must return active = false, NOT score = 0.5.
+
+// ---- M1 ----------------------------------------------------------------------
+// TODO: anchored VWAP, running sigma, extension expressed in sigma, mapped
+//       vwapSigmaLo..vwapSigmaHi -> 0..1. Suppress until vwapWarmMin elapsed.
+f_mVwap() =>
+    ModuleOut.new(0.0, false, "stub")
+
+// ---- M2 ----------------------------------------------------------------------
+// TODO: collect enabled levels into an array, find nearest, score by proximity
+//       in ticks (structProxTicks) and by level class confluence.
+f_mStruct() =>
+    ModuleOut.new(0.0, false, "stub")
+
+// ---- M3 ----------------------------------------------------------------------
+// TODO: hybrid profile. Current + prior session from vpIntrabarTF via f_secLTF;
+//       vpHistSess older sessions from chart bars. Derive POC / VAH / VAL,
+//       HVN / LVN, and untouched (naked) POCs.
+f_mProfile() =>
+    ModuleOut.new(0.0, false, "stub")
+
+// ---- M4 ----------------------------------------------------------------------
+// TODO: tick-rule delta from intrabars, cumulative CVD with cvdResetOn, then
+//       price/CVD divergence over deltaDivMin. Self-disable when deltaTF is not
+//       strictly lower than the chart timeframe.
+f_mDelta() =>
+    ModuleOut.new(0.0, false, "stub: approximation, not order flow")
+
+// ---- M5 ----------------------------------------------------------------------
+// TODO: session range vs ADR(adrDays) for exhaustion; RVOL against the same
+//       clock bucket (rvolTodBucketMin) over rvolBaseN prior sessions.
+f_mExhaust() =>
+    ModuleOut.new(0.0, false, "stub")
+
+// ---- M6 ----------------------------------------------------------------------
+// TODO: penetration beyond a tracked level between sweepMinTicks and
+//       sweepMaxTicks, followed by a close back inside within reclaimMin.
+f_mSweep() =>
+    ModuleOut.new(0.0, false, "stub")
+
+// ---- M7 ----------------------------------------------------------------------
+// TODO: pull the family-appropriate context symbols through f_sec at ctxTF and
+//       resolve alignment / hostility. Returns BOTH a sub-score and, separately,
+//       the hostile flag that drives the grade cap.
+f_mContext() =>
+    ModuleOut.new(0.0, false, "stub")
+
+ctxHostile = false  // TODO: set by M7 once implemented.
+
+// =============================================================================
+// EVALUATION
+// =============================================================================
+
+mVwap    = f_mVwap()
+mStruct  = f_mStruct()
+mProfile = f_mProfile()
+mDelta   = f_mDelta()
+mExhaust = f_mExhaust()
+mSweep   = f_mSweep()
+mContext = f_mContext()
+
+scores  = array.new<float>()
+weights = array.new<float>()
+activeCount = 0
+
+// OFF -> excluded entirely. ON -> weight always counted, score 0.0 when idle.
+if useVwap
+    array.push(scores, mVwap.active ? mVwap.score : 0.0)
+    array.push(weights, wVwap)
+    activeCount += mVwap.active ? 1 : 0
+
+if useStruct
+    array.push(scores, mStruct.active ? mStruct.score : 0.0)
+    array.push(weights, wStruct)
+    activeCount += mStruct.active ? 1 : 0
+
+if useProfile
+    array.push(scores, mProfile.active ? mProfile.score : 0.0)
+    array.push(weights, wProfile)
+    activeCount += mProfile.active ? 1 : 0
+
+if useDelta
+    array.push(scores, mDelta.active ? mDelta.score : 0.0)
+    array.push(weights, wDelta)
+    activeCount += mDelta.active ? 1 : 0
+
+if useExhaust
+    array.push(scores, mExhaust.active ? mExhaust.score : 0.0)
+    array.push(weights, wExhaust)
+    activeCount += mExhaust.active ? 1 : 0
+
+if useSweep
+    array.push(scores, mSweep.active ? mSweep.score : 0.0)
+    array.push(weights, wSweep)
+    activeCount += mSweep.active ? 1 : 0
+
+if useContext
+    array.push(scores, mContext.active ? mContext.score : 0.0)
+    array.push(weights, wContext)
+    activeCount += mContext.active ? 1 : 0
+
+wSum = array.size(weights) > 0 ? array.sum(weights) : 0.0
+num  = 0.0
+if array.size(scores) > 0
+    for i = 0 to array.size(scores) - 1
+        num := num + array.get(scores, i) * array.get(weights, i)
+
+composite = wSum > 0.0 ? num / wSum : 0.0
+
+// ---- Grading -----------------------------------------------------------------
+// Internal grade is an int so the context cap is a plain min(): 3=A 2=B 1=C 0=none.
+rawGrade = composite >= gradeAmin ? 3 : composite >= gradeBmin ? 2 : composite >= gradeCmin ? 1 : 0
+
+// Confluence floor: too few active modules is not a graded setup at any score.
+floored = activeCount >= minActive ? rawGrade : 0
+
+// Context grade cap. Hostile context lowers the ceiling, it does not delete the
+// observation -- except when the cap is set to "None".
+capLevel = ctxCapGrade == "A" ? 3 : ctxCapGrade == "B" ? 2 : ctxCapGrade == "C" ? 1 : 0
+finalGrade = (useContext and ctxHostile) ? math.min(floored, capLevel) : floored
+
+gradeStr = finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C" : ""
+hasSetup = finalGrade > 0 and barstate.isconfirmed and instOK and tfSupported
+
+// =============================================================================
+// RENDER
+// =============================================================================
+// Kept strictly separate from evaluation. Everything above computes; nothing
+// above draws. Moving the heavy internals to a companion pane later means
+// lifting this section out and republishing the same values from a second
+// script -- no evaluation code has to move with it.
+
+var table st = na
+if showStatus and barstate.islast
+    if na(st)
+        st := table.new(position.top_right, 2, 9, border_width = 1)
+    table.cell(st, 0, 0, "REVERSAL ENGINE", text_size = size.small)
+    table.cell(st, 1, 0, "SCAFFOLD", text_size = size.small)
+    table.cell(st, 0, 1, "Instrument", text_size = size.tiny)
+    table.cell(st, 1, 1, aliasName + (instOK ? "" : " (unsupported)"), text_size = size.tiny)
+    table.cell(st, 0, 2, "Root", text_size = size.tiny)
+    table.cell(st, 1, 2, rootUp, text_size = size.tiny)
+    table.cell(st, 0, 3, "Chart TF", text_size = size.tiny)
+    table.cell(st, 1, 3, str.tostring(tfMin, "#.##") + "m" + (tfSupported ? "" : " (out of design range)"), text_size = size.tiny)
+    table.cell(st, 0, 4, "Tick", text_size = size.tiny)
+    table.cell(st, 1, 4, str.tostring(tick), text_size = size.tiny)
+    table.cell(st, 0, 5, "Session", text_size = size.tiny)
+    table.cell(st, 1, 5, inRTH ? "RTH" : inON ? "ON" : "closed", text_size = size.tiny)
+    table.cell(st, 0, 6, "Modules on", text_size = size.tiny)
+    table.cell(st, 1, 6, str.tostring(array.size(weights)) + " / 7", text_size = size.tiny)
+    table.cell(st, 0, 7, "Active now", text_size = size.tiny)
+    table.cell(st, 1, 7, str.tostring(activeCount), text_size = size.tiny)
+    table.cell(st, 0, 8, showRaw ? "Composite" : "Grade", text_size = size.tiny)
+    table.cell(st, 1, 8, showRaw ? str.tostring(composite, "#.###") : (gradeStr == "" ? "-" : gradeStr), text_size = size.tiny)
+
+// No signal plotting yet: every module is a stub, so hasSetup is always false.
+// The plot exists so the grade series is chartable and alertable the moment the
+// first module goes live.
+plot(finalGrade, "Grade (3=A 2=B 1=C)", display = display.data_window)
+plot(showRaw ? composite : na, "Composite (raw)", display = display.data_window)
