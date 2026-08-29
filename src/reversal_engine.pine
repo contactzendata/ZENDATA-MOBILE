@@ -486,11 +486,14 @@ phRaw = ta.pivothigh(high, pivBars, pivBars)
 plRaw = ta.pivotlow(low,  pivBars, pivBars)
 var float lastPH = na
 var float lastPL = na
+var int pivCountPre = 0
 if confirmed
     if not na(phRaw)
         lastPH := phRaw
+        pivCountPre := pivCountPre + 1
     if not na(plRaw)
         lastPL := plRaw
+        pivCountPre := pivCountPre + 1
 
 // Round numbers: 25 index points for NQ, $10/oz for GC unless overridden.
 rStep = roundStep > 0.0 ? roundStep : (isGC ? 10.0 : 25.0)
@@ -499,53 +502,68 @@ rDn = math.floor(close / rStep) * rStep
 
 lvlP = array.new<float>()
 lvlN = array.new<string>()
+lvlC = array.new<int>()      // class id, parallel to lvlP/lvlN (diagnostics)
 
 if sPDHL
     if not na(pdH)
         array.push(lvlP, pdH)
         array.push(lvlN, "PDH")
+        array.push(lvlC, 0)
     if not na(pdL)
         array.push(lvlP, pdL)
         array.push(lvlN, "PDL")
+        array.push(lvlC, 1)
 if sPDC and not na(pdC)
     array.push(lvlP, pdC)
     array.push(lvlN, "PDC")
+    array.push(lvlC, 2)
 if sONHL
     if not na(onH)
         array.push(lvlP, onH)
         array.push(lvlN, "ONH")
+        array.push(lvlC, 3)
     if not na(onL)
         array.push(lvlP, onL)
         array.push(lvlN, "ONL")
+        array.push(lvlC, 4)
 if sIB
     if not na(ibH)
         array.push(lvlP, ibH)
         array.push(lvlN, "IBH")
+        array.push(lvlC, 5)
     if not na(ibL)
         array.push(lvlP, ibL)
         array.push(lvlN, "IBL")
+        array.push(lvlC, 6)
 if sOR
     if not na(orH)
         array.push(lvlP, orH)
         array.push(lvlN, "ORH")
+        array.push(lvlC, 7)
     if not na(orL)
         array.push(lvlP, orL)
         array.push(lvlN, "ORL")
+        array.push(lvlC, 8)
 if sRTHopen and not na(rthOpen)
     array.push(lvlP, rthOpen)
     array.push(lvlN, "RTHo")
+    array.push(lvlC, 9)
 if sSwing
     if not na(lastPH)
         array.push(lvlP, lastPH)
         array.push(lvlN, "SwH")
+        array.push(lvlC, 10)
     if not na(lastPL)
         array.push(lvlP, lastPL)
         array.push(lvlN, "SwL")
+        array.push(lvlC, 11)
 if sRound
     array.push(lvlP, rUp)
     array.push(lvlN, "Rnd+")
+    array.push(lvlC, 12)
     array.push(lvlP, rDn)
     array.push(lvlN, "Rnd-")
+    array.push(lvlC, 13)
 
 // =============================================================================
 // M6 ENGINE  --  sweep and reclaim (category Q)
@@ -577,10 +595,12 @@ var float  pHiLvl = na
 var int    pHiBar = na
 var float  pHiPen = na
 var string pHiNm  = ""
+var int    pHiCls = -1
 var float  pLoLvl = na
 var int    pLoBar = na
 var float  pLoPen = na
 var string pLoNm  = ""
+var int    pLoCls = -1
 
 // confirmed fires, held for holdBars with a decaying score
 var int    fireHiBar   = na
@@ -599,9 +619,19 @@ var int m6TotFires  = 0
 var int m6PenSeen   = 0
 var int m6InBand    = 0
 
+// ---- D-029 DIAGNOSTICS: per-class funnel, repeat fires, pivot churn ---------
+// Pure instrumentation. Nothing below changes M6's behaviour.
+var array<int>   penByClass  = array.new<int>(14, 0)
+var array<int>   fireByClass = array.new<int>(14, 0)
+var array<float> firedLvls   = array.new<float>()   // levels already fired THIS session
+var int m6PenBars    = 0    // BARS with >=1 penetration, vs m6PenSeen which is level-bars
+var int m6RepeatFire = 0    // fires on a level that already fired this session
+
+
 if confirmed and rthStart
     m6Sessions  := m6Sessions + 1
     m6SessFires := 0
+    array.clear(firedLvls)
 
 if confirmed and m6Ready
     // expire pendings that ran out of reclaim window
@@ -625,6 +655,9 @@ if confirmed and m6Ready
     bestLoPen = 0.0
     string bestHiNm = ""
     string bestLoNm = ""
+    bestHiCls = -1
+    bestLoCls = -1
+    anyPen = false
 
     for i = 0 to array.size(lvlP) - 1
         lv = array.get(lvlP, i)
@@ -632,6 +665,9 @@ if confirmed and m6Ready
         // upside sweep: level intact at the prior close, wick through it now
         if close[1] < lv and high > lv + minPen
             m6PenSeen := m6PenSeen + 1
+            anyPen := true
+            cid = array.get(lvlC, i)
+            array.set(penByClass, cid, array.get(penByClass, cid) + 1)
             penH = high - lv
             if penH <= maxPen
                 m6InBand := m6InBand + 1
@@ -639,9 +675,13 @@ if confirmed and m6Ready
                     bestHiPen := penH
                     bestHiLvl := lv
                     bestHiNm  := nm
+                    bestHiCls := cid
         // downside sweep
         if close[1] > lv and low < lv - minPen
             m6PenSeen := m6PenSeen + 1
+            anyPen := true
+            cid2 = array.get(lvlC, i)
+            array.set(penByClass, cid2, array.get(penByClass, cid2) + 1)
             penL = lv - low
             if penL <= maxPen
                 m6InBand := m6InBand + 1
@@ -649,17 +689,23 @@ if confirmed and m6Ready
                     bestLoPen := penL
                     bestLoLvl := lv
                     bestLoNm  := nm
+                    bestLoCls := cid2
+
+    if anyPen
+        m6PenBars := m6PenBars + 1
 
     if not na(bestHiLvl)
         pHiLvl := bestHiLvl
         pHiBar := bar_index
         pHiPen := bestHiPen
         pHiNm  := bestHiNm
+        pHiCls := bestHiCls
     if not na(bestLoLvl)
         pLoLvl := bestLoLvl
         pLoBar := bar_index
         pLoPen := bestLoPen
         pLoNm  := bestLoNm
+        pLoCls := bestLoCls
 
     // reclaim: close back inside the swept level. A same-bar wick-and-reject
     // (used = 0) is the fastest and strongest form of this.
@@ -671,6 +717,17 @@ if confirmed and m6Ready
         fireHiBar   := bar_index
         fireHiNm    := pHiNm
         fireHiPrice := pHiLvl
+        if pHiCls >= 0
+            array.set(fireByClass, pHiCls, array.get(fireByClass, pHiCls) + 1)
+        dupH = false
+        if array.size(firedLvls) > 0
+            for k = 0 to array.size(firedLvls) - 1
+                if math.abs(array.get(firedLvls, k) - pHiLvl) <= tick
+                    dupH := true
+        if dupH
+            m6RepeatFire := m6RepeatFire + 1
+        else
+            array.push(firedLvls, pHiLvl)
         pHiLvl      := na
         pHiBar      := na
         m6SessFires := m6SessFires + 1
@@ -684,6 +741,17 @@ if confirmed and m6Ready
         fireLoBar   := bar_index
         fireLoNm    := pLoNm
         fireLoPrice := pLoLvl
+        if pLoCls >= 0
+            array.set(fireByClass, pLoCls, array.get(fireByClass, pLoCls) + 1)
+        dupL = false
+        if array.size(firedLvls) > 0
+            for k = 0 to array.size(firedLvls) - 1
+                if math.abs(array.get(firedLvls, k) - pLoLvl) <= tick
+                    dupL := true
+        if dupL
+            m6RepeatFire := m6RepeatFire + 1
+        else
+            array.push(firedLvls, pLoLvl)
         pLoLvl      := na
         pLoBar      := na
         m6SessFires := m6SessFires + 1
@@ -1117,6 +1185,51 @@ if showStatus and barstate.islast
         table.cell(st, 1, 26, str.tostring(m2StackN) + " lvls -> " + str.tostring(m2Stack, "0.00") + "  (full at " + str.tostring(structStackFull) + ")", text_size = size.tiny)
         table.cell(st, 0, 27, "M2 score", text_size = size.tiny)
         table.cell(st, 1, 27, str.tostring(m2Score, "0.000") + "  = " + str.tostring(structProxW, "0.0") + "*prox + " + str.tostring(1.0 - structProxW, "0.0") + "*stack", text_size = size.tiny)
+
+// ---- D-029 diagnostic table: per-class funnel breakdown ----------------------
+// Answers "how much of the penetration count is which level class". Rendered as a
+// second table so it does not fight the status table for rows.
+var string[] CLS_NM = array.from("PDH","PDL","PDC","ONH","ONL","IBH","IBL","ORH","ORL","RTHo","SwH","SwL","Rnd+","Rnd-")
+
+var table dt = na
+if sweepDebug and barstate.islast
+    if na(dt)
+        dt := table.new(position.bottom_right, 4, 20, border_width = 1)
+    table.cell(dt, 0, 0, "M6 BY CLASS", text_size = size.tiny)
+    table.cell(dt, 1, 0, "pen",   text_size = size.tiny)
+    table.cell(dt, 2, 0, "fire",  text_size = size.tiny)
+    table.cell(dt, 3, 0, "f/sess", text_size = size.tiny)
+    sessN = math.max(1, m6Sessions)
+    for c = 0 to 13
+        pc = array.get(penByClass, c)
+        fc = array.get(fireByClass, c)
+        table.cell(dt, 0, c + 1, array.get(CLS_NM, c) + (pc == 0 and fc == 0 ? " (off)" : ""), text_size = size.tiny)
+        table.cell(dt, 1, c + 1, str.tostring(pc), text_size = size.tiny)
+        table.cell(dt, 2, c + 1, str.tostring(fc), text_size = size.tiny)
+        table.cell(dt, 3, c + 1, str.tostring(fc / (sessN * 1.0), "0.0"), text_size = size.tiny)
+    table.cell(dt, 0, 15, "TOTAL", text_size = size.tiny)
+    table.cell(dt, 1, 15, str.tostring(m6PenSeen), text_size = size.tiny)
+    table.cell(dt, 2, 15, str.tostring(m6TotFires), text_size = size.tiny)
+    table.cell(dt, 3, 15, str.tostring(m6TotFires / (sessN * 1.0), "0.0"), text_size = size.tiny)
+    table.cell(dt, 0, 16, "pen BARS (distinct)", text_size = size.tiny)
+    table.cell(dt, 1, 16, str.tostring(m6PenBars), text_size = size.tiny)
+    table.cell(dt, 2, 16, "lvl-bars:", text_size = size.tiny)
+    table.cell(dt, 3, 16, str.tostring(m6PenSeen), text_size = size.tiny)
+    table.cell(dt, 0, 17, "REPEAT fires", text_size = size.tiny)
+    table.cell(dt, 1, 17, str.tostring(m6RepeatFire), text_size = size.tiny)
+    table.cell(dt, 2, 17, "of", text_size = size.tiny)
+    table.cell(dt, 3, 17, str.tostring(m6TotFires) + " (" + str.tostring(m6TotFires > 0 ? 100.0 * m6RepeatFire / m6TotFires : 0.0, "0") + "%)", text_size = size.tiny)
+    table.cell(dt, 0, 18, "pivBars / pivots", text_size = size.tiny)
+    table.cell(dt, 1, 18, str.tostring(pivBars) + "b", text_size = size.tiny)
+    table.cell(dt, 2, 18, str.tostring(pivCountPre), text_size = size.tiny)
+    table.cell(dt, 3, 18, str.tostring(pivCountPre / (sessN * 1.0), "0.0") + "/sess", text_size = size.tiny)
+    lvlListStr = ""
+    if array.size(lvlN) > 0
+        for i = 0 to array.size(lvlN) - 1
+            lvlListStr := lvlListStr + array.get(lvlN, i) + " "
+    table.cell(dt, 0, 19, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
+    table.cell(dt, 1, 19, lvlListStr, text_size = size.tiny)
+    table.merge_cells(dt, 1, 19, 3, 19)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
