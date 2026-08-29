@@ -63,16 +63,17 @@
 //   strictly-lower-TF guard. Publication is gated on barstate.isconfirmed.
 //
 // request.*() BUDGET (hard platform cap ~40 per script)
-//   M2 structural ......... up to  3   daily HTF, prior session, overnight
+//   M2 structural ......... up to  0   level registry is built from chart bars
 //   M3 profile ............ up to  2   intrabar, current + prior session
 //   M4 delta .............. up to  1   intrabar tick-rule
 //   M5 expected move ...... up to  1   CBOE:VIX (NQ) or CBOE:GVZ (GC)
 //   M7 context ............ up to  4   NQ: TICK/ADD/VOLD/TRIN | GC: DXY/US10Y/US02Y
 //   M7 COT (optional) ..... up to  2   weekly CFTC series
+//   M6 sweep (daily ATR) .. up to  1   daily ATR reference for penetration bands
 //   M8 overnight prior .... up to  0   computed from chart bars only
 //   volume source override  up to  2   full-size symbol, if enabled (D-013)
 //   ------------------------------------------------------------------------
-//   Planned worst case .... up to 15 of ~40.
+//   Planned worst case .... up to 13 of ~40.  Live today: 1 (M6 daily ATR).
 // =============================================================================
 
 indicator("Reversal Engine (NQ/GC)", shorttitle="REV", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
@@ -269,19 +270,29 @@ vwapWarmMin = input.int(30, "Anchor warm-up (minutes)", minval = 1, group = grpM
 bandWalkMin = input.int(20, "Band-walk suppression (minutes)", minval = 1, group = grpM1, tooltip = "If price holds beyond the sigma band for this long, treat it as a band-walk (trend), NOT extension, and suppress M1. This is the single most important guard in the module.")
 vwapShow    = input.bool(true, "Plot VWAP and bands", group = grpM1)
 
+// ---- L0 - Level registry (SHARED infrastructure, not a module) ----------------
+// Consumed by M2 (proximity scoring), M3 (naked POC context), M4 (deltaReqLvl)
+// and M6 (what gets swept). Built entirely from chart bars using the session
+// inputs -- NOT from a "D" request -- because a daily request would return the
+// 23-hour Globex high/low for GC, not the pit-session levels D-007 specifies.
+// Zero request.* calls. See D-022.
+grpL0 = "L0 - Level registry (shared)"
+sPDHL       = input.bool(true, "Prior session high / low", group = grpL0)
+sPDC        = input.bool(true, "Prior session close", group = grpL0)
+sONHL       = input.bool(true, "Overnight high / low", group = grpL0)
+sIB         = input.bool(true, "Initial balance", group = grpL0)
+ibMinutes   = input.int(60, "  Initial balance (minutes)", minval = 5, group = grpL0, tooltip = "First hour from the RTH open (A+B periods). 30 is also used on gold.")
+sOR         = input.bool(true, "Opening range", group = grpL0)
+orMinutes   = input.int(15, "  Opening range (minutes)", minval = 1, group = grpL0)
+sRTHopen    = input.bool(true, "RTH open price", group = grpL0)
+sSwing      = input.bool(true, "Prior swing high / low", group = grpL0)
+swingPivMin = input.int(25, "  Swing pivot lookback (minutes)", minval = 5, group = grpL0, tooltip = "Converted to bars per side via f_bars(). ta.pivothigh confirms this many bars LATE by construction -- a swing level does not exist until it is confirmed.")
+sRound      = input.bool(false, "Round numbers", group = grpL0)
+roundStep   = input.float(0.0, "  Round-number step (0 = auto)", minval = 0.0, group = grpL0, tooltip = "Auto: 25 index points for NQ, $10/oz for GC.")
+
 // ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
 grpM2 = "M2 - Structural levels (L)"
 useStruct   = input.bool(true, "Enable structural levels", group = grpM2)
-sPDHL       = input.bool(true, "Prior day high / low", group = grpM2)
-sPDC        = input.bool(true, "Prior day close", group = grpM2)
-sONHL       = input.bool(true, "Overnight high / low", group = grpM2)
-sIB         = input.bool(true, "Initial balance", group = grpM2)
-ibMinutes   = input.int(60, "Initial balance (minutes)", minval = 5, group = grpM2, tooltip = "First hour from the RTH open (A+B periods). 30 is also used on gold.")
-sOR         = input.bool(true, "Opening range", group = grpM2)
-orMinutes   = input.int(15, "Opening range (minutes)", minval = 1, group = grpM2)
-sRTHopen    = input.bool(true, "RTH open price", group = grpM2)
-sRound      = input.bool(false, "Round numbers", group = grpM2)
-roundStep   = input.float(0.0, "Round-number step (0 = auto)", minval = 0.0, group = grpM2, tooltip = "Auto: 25 index points for NQ, $10/oz for GC.")
 structProx  = input.int(8, "Proximity to level (ticks)", minval = 1, group = grpM2, tooltip = "In TICKS so it carries across NQ (0.25) and GC (0.10) without retuning.")
 structShow  = input.bool(true, "Draw levels", group = grpM2)
 
@@ -330,12 +341,22 @@ emSymGC          = input.symbol("CBOE:GVZ", "  IV symbol - GC", group = grpM5, t
 emDivisor        = input.float(15.87, "  Rule-of-16 divisor", minval = 1.0, step = 0.01, group = grpM5, tooltip = "sqrt(252) = 15.87.")
 
 // ---- M6 - Sweep and reclaim  [category Q] ------------------------------------
+// Penetration bands are VOLATILITY-NORMALIZED, not fixed ticks (D-023). NQ runs
+// ~1200-1600 ticks of daily range against GC's ~300-600, so a fixed 4-40 tick
+// window described two categorically different events. Thresholds are now
+// fractions of ATR; the resolved tick equivalents are shown in the status table
+// so the fractions can be sanity-checked against the chart in front of you.
 grpM6 = "M6 - Sweep and reclaim (Q)"
-useSweep      = input.bool(true, "Enable sweep and reclaim", group = grpM6)
-sweepMinTicks = input.int(4,  "Minimum penetration (ticks)", minval = 1, group = grpM6)
-sweepMaxTicks = input.int(40, "Maximum penetration (ticks)", minval = 2, group = grpM6, tooltip = "Beyond this it is a breakout, not a sweep.")
-reclaimMin    = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window. Confirmation is therefore structurally late -- the module cannot fire at the extreme, only after it.")
-sweepShow     = input.bool(true, "Mark sweeps", group = grpM6)
+useSweep     = input.bool(true, "Enable sweep and reclaim", group = grpM6)
+sweepAtrRef  = input.string("Chart TF", "ATR reference", options = ["Chart TF", "Daily"], group = grpM6, tooltip = "Chart TF self-normalizes to the resolution you trade: a sweep on 15m is a bigger event than on 5m, and the bands scale with it. Daily is timeframe-invariant and normalizes only across instruments. Chart TF is the default; check the resolved tick equivalents in the status table and pick whichever produces sane numbers on YOUR chart.")
+sweepAtrLen  = input.int(14, "ATR length", minval = 2, group = grpM6)
+sweepMinAtr  = input.float(0.10, "Minimum penetration (x ATR)", minval = 0.01, maxval = 2.0, step = 0.01, group = grpM6, tooltip = "Below this the poke is noise. Typical range 0.05-0.15 on a chart-TF ATR.")
+sweepMaxAtr  = input.float(0.50, "Maximum penetration (x ATR)", minval = 0.02, maxval = 5.0, step = 0.01, group = grpM6, tooltip = "Beyond this it is a breakout, not a sweep. Must exceed the minimum or M6 self-disables.")
+reclaimMin   = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window. Stays MINUTES-based per D-005. The resolved bar count is shown in the status table and warns below 2 bars -- at 1 bar the reclaim must land on the very next bar, which is a materially different (and much rarer) event.")
+sweepHoldMin = input.int(15, "Signal hold (minutes)", minval = 1, group = grpM6, tooltip = "M6 stays active this long after a confirmed reclaim, with the score decaying linearly. Without a hold window M6 fires on ONE bar and the confluence gate would almost never see it align with modules that confirm at different speeds -- and M6 carries gate rule 2 alone (D-019).")
+sweepSpeedW  = input.float(0.6, "Score weight: reclaim speed vs depth", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM6, tooltip = "Speed is weighted higher by default: an immediate close back inside is the strongest evidence the break failed. Depth is the remainder -- a deeper sweep (still inside the max) took more resting liquidity.")
+sweepShow    = input.bool(true, "Mark sweeps", group = grpM6)
+sweepDebug   = input.bool(true, "Show M6 diagnostics in status table", group = grpM6, tooltip = "Resolved tick equivalents, the penetration funnel, and the raw fire rate per session. Turn off once M6 is characterized.")
 
 // ---- M7 - Context and regime  [category C, plus GRADE CAP] -------------------
 grpM7 = "M7 - Context and regime (C)"
@@ -374,7 +395,313 @@ onRevMaxInf = input.float(0.05, "Maximum influence on composite", minval = 0.0, 
 onRevShow   = input.bool(true, "Show in status table", group = grpM8)
 
 // =============================================================================
-// MODULE IMPLEMENTATIONS  --  ALL STUBS
+// LEVEL REGISTRY  (shared infrastructure, not a module -- D-022)
+// =============================================================================
+// Consumed by M6 today; M2 (proximity), M3 (naked-POC context) and M4
+// (deltaReqLvl) will consume the same arrays. Built from CHART BARS using the
+// session inputs, not from a "D" request: a daily request returns the 23-hour
+// Globex high/low for GC, which is not the pit-session level D-007 specifies.
+// Zero request.* calls.
+//
+// All state advances only on confirmed bars, so a forming realtime bar cannot
+// move a published level and then take it back.
+
+confirmed = barstate.isconfirmed
+
+rthStart = inRTH and not inRTH[1]
+rthEnd   = not inRTH and inRTH[1]
+onStart  = inON  and not inON[1]
+onEnd    = not inON and inON[1]
+
+// running (developing) session extremes
+var float rthHrun = na
+var float rthLrun = na
+var float rthCrun = na
+var float onHrun  = na
+var float onLrun  = na
+// published levels
+var float pdH = na
+var float pdL = na
+var float pdC = na
+var float onH = na
+var float onL = na
+var float rthOpen = na
+var float ibH = na
+var float ibL = na
+var float orH = na
+var float orL = na
+var int   rthOpenTime = na
+
+minsOpen = na(rthOpenTime) ? na : (time - rthOpenTime) / 60000.0
+
+// Publication timing matters: PDH/PDL/PDC are published when the RTH session
+// ENDS, not when the next one starts. Rolling at the next open would leave them
+// pointing at the session-before-last for the whole overnight -- which is
+// precisely when M6 is sweeping them.
+if confirmed
+    if rthEnd
+        pdH := rthHrun
+        pdL := rthLrun
+        pdC := rthCrun
+    if onEnd
+        onH := onHrun
+        onL := onLrun
+    if rthStart
+        rthHrun := high
+        rthLrun := low
+        rthCrun := close
+        rthOpen := open
+        rthOpenTime := time
+        ibH := high
+        ibL := low
+        orH := high
+        orL := low
+    else if inRTH
+        rthHrun := math.max(nz(rthHrun, high), high)
+        rthLrun := math.min(nz(rthLrun, low),  low)
+        rthCrun := close
+        if not na(minsOpen) and minsOpen < ibMinutes
+            ibH := math.max(nz(ibH, high), high)
+            ibL := math.min(nz(ibL, low),  low)
+        if not na(minsOpen) and minsOpen < orMinutes
+            orH := math.max(nz(orH, high), high)
+            orL := math.min(nz(orL, low),  low)
+    if onStart
+        onHrun := high
+        onLrun := low
+    else if inON
+        onHrun := math.max(nz(onHrun, high), high)
+        onLrun := math.min(nz(onLrun, low),  low)
+
+// Swing pivots. ta.pivothigh must be evaluated unconditionally (series state) and
+// confirms pivBars bars LATE by construction -- a swing level does not exist
+// until it is confirmed, which is correct and is not something to engineer away.
+pivBars = f_bars(swingPivMin)
+phRaw = ta.pivothigh(high, pivBars, pivBars)
+plRaw = ta.pivotlow(low,  pivBars, pivBars)
+var float lastPH = na
+var float lastPL = na
+if confirmed
+    if not na(phRaw)
+        lastPH := phRaw
+    if not na(plRaw)
+        lastPL := plRaw
+
+// Round numbers: 25 index points for NQ, $10/oz for GC unless overridden.
+rStep = roundStep > 0.0 ? roundStep : (isGC ? 10.0 : 25.0)
+rUp = math.ceil(close  / rStep) * rStep
+rDn = math.floor(close / rStep) * rStep
+
+lvlP = array.new<float>()
+lvlN = array.new<string>()
+
+if sPDHL
+    if not na(pdH)
+        array.push(lvlP, pdH)
+        array.push(lvlN, "PDH")
+    if not na(pdL)
+        array.push(lvlP, pdL)
+        array.push(lvlN, "PDL")
+if sPDC and not na(pdC)
+    array.push(lvlP, pdC)
+    array.push(lvlN, "PDC")
+if sONHL
+    if not na(onH)
+        array.push(lvlP, onH)
+        array.push(lvlN, "ONH")
+    if not na(onL)
+        array.push(lvlP, onL)
+        array.push(lvlN, "ONL")
+if sIB
+    if not na(ibH)
+        array.push(lvlP, ibH)
+        array.push(lvlN, "IBH")
+    if not na(ibL)
+        array.push(lvlP, ibL)
+        array.push(lvlN, "IBL")
+if sOR
+    if not na(orH)
+        array.push(lvlP, orH)
+        array.push(lvlN, "ORH")
+    if not na(orL)
+        array.push(lvlP, orL)
+        array.push(lvlN, "ORL")
+if sRTHopen and not na(rthOpen)
+    array.push(lvlP, rthOpen)
+    array.push(lvlN, "RTHo")
+if sSwing
+    if not na(lastPH)
+        array.push(lvlP, lastPH)
+        array.push(lvlN, "SwH")
+    if not na(lastPL)
+        array.push(lvlP, lastPL)
+        array.push(lvlN, "SwL")
+if sRound
+    array.push(lvlP, rUp)
+    array.push(lvlN, "Rnd+")
+    array.push(lvlP, rDn)
+    array.push(lvlN, "Rnd-")
+
+// =============================================================================
+// M6 ENGINE  --  sweep and reclaim (category Q)
+// =============================================================================
+// A sweep is: price penetrates an intact level by between minPen and maxPen,
+// then CLOSES back inside within the reclaim window. Below minPen it is noise;
+// above maxPen it is a breakout, not a sweep.
+//
+// Penetration bands are ATR fractions, not ticks (D-023). The resolved tick
+// equivalents are published in the status table -- read them before trusting the
+// fractions, because "0.10 ATR" means nothing until you see what it resolves to
+// on the chart in front of you.
+
+atrChart = ta.atr(sweepAtrLen)
+atrDaily = f_sec(syminfo.tickerid, "D", ta.atr(sweepAtrLen))
+atrRef   = sweepAtrRef == "Daily" ? atrDaily : atrChart
+
+minPen = sweepMinAtr * atrRef
+maxPen = sweepMaxAtr * atrRef
+
+reclaimBars   = f_bars(reclaimMin)
+holdBars      = f_bars(sweepHoldMin)
+reclaimBarsOK = reclaimBars >= 2
+
+m6Ready = useSweep and not na(atrRef) and atrRef > 0.0 and maxPen > minPen and array.size(lvlP) > 0
+
+// pending penetrations awaiting a reclaim
+var float  pHiLvl = na
+var int    pHiBar = na
+var float  pHiPen = na
+var string pHiNm  = ""
+var float  pLoLvl = na
+var int    pLoBar = na
+var float  pLoPen = na
+var string pLoNm  = ""
+
+// confirmed fires, held for holdBars with a decaying score
+var int    fireHiBar   = na
+var float  fireHiScore = 0.0
+var string fireHiNm    = ""
+var int    fireLoBar   = na
+var float  fireLoScore = 0.0
+var string fireLoNm    = ""
+
+// instrumentation (D-024): the penetration funnel and the raw fire rate
+var int m6Sessions  = 0
+var int m6SessFires = 0
+var int m6TotFires  = 0
+var int m6PenSeen   = 0
+var int m6InBand    = 0
+
+if confirmed and rthStart
+    m6Sessions  := m6Sessions + 1
+    m6SessFires := 0
+
+if confirmed and m6Ready
+    // expire pendings that ran out of reclaim window
+    if not na(pHiBar) and bar_index - pHiBar > reclaimBars
+        pHiLvl := na
+        pHiBar := na
+    if not na(pLoBar) and bar_index - pLoBar > reclaimBars
+        pLoLvl := na
+        pLoBar := na
+    // a pending that keeps going is a breakout, not a sweep
+    if not na(pHiLvl) and high > pHiLvl + maxPen
+        pHiLvl := na
+        pHiBar := na
+    if not na(pLoLvl) and low < pLoLvl - maxPen
+        pLoLvl := na
+        pLoBar := na
+
+    float bestHiLvl = na
+    float bestLoLvl = na
+    bestHiPen = 0.0
+    bestLoPen = 0.0
+    string bestHiNm = ""
+    string bestLoNm = ""
+
+    for i = 0 to array.size(lvlP) - 1
+        lv = array.get(lvlP, i)
+        nm = array.get(lvlN, i)
+        // upside sweep: level intact at the prior close, wick through it now
+        if close[1] < lv and high > lv + minPen
+            m6PenSeen := m6PenSeen + 1
+            penH = high - lv
+            if penH <= maxPen
+                m6InBand := m6InBand + 1
+                if penH > bestHiPen
+                    bestHiPen := penH
+                    bestHiLvl := lv
+                    bestHiNm  := nm
+        // downside sweep
+        if close[1] > lv and low < lv - minPen
+            m6PenSeen := m6PenSeen + 1
+            penL = lv - low
+            if penL <= maxPen
+                m6InBand := m6InBand + 1
+                if penL > bestLoPen
+                    bestLoPen := penL
+                    bestLoLvl := lv
+                    bestLoNm  := nm
+
+    if not na(bestHiLvl)
+        pHiLvl := bestHiLvl
+        pHiBar := bar_index
+        pHiPen := bestHiPen
+        pHiNm  := bestHiNm
+    if not na(bestLoLvl)
+        pLoLvl := bestLoLvl
+        pLoBar := bar_index
+        pLoPen := bestLoPen
+        pLoNm  := bestLoNm
+
+    // reclaim: close back inside the swept level. A same-bar wick-and-reject
+    // (used = 0) is the fastest and strongest form of this.
+    if not na(pHiLvl) and close < pHiLvl
+        usedH = bar_index - pHiBar
+        spdH  = math.max(0.0, 1.0 - usedH / (reclaimBars * 1.0))
+        depH  = math.min(1.0, math.max(0.0, (pHiPen - minPen) / (maxPen - minPen)))
+        fireHiScore := math.min(1.0, sweepSpeedW * spdH + (1.0 - sweepSpeedW) * depH)
+        fireHiBar   := bar_index
+        fireHiNm    := pHiNm
+        pHiLvl      := na
+        pHiBar      := na
+        m6SessFires := m6SessFires + 1
+        m6TotFires  := m6TotFires + 1
+
+    if not na(pLoLvl) and close > pLoLvl
+        usedL = bar_index - pLoBar
+        spdL  = math.max(0.0, 1.0 - usedL / (reclaimBars * 1.0))
+        depL  = math.min(1.0, math.max(0.0, (pLoPen - minPen) / (maxPen - minPen)))
+        fireLoScore := math.min(1.0, sweepSpeedW * spdL + (1.0 - sweepSpeedW) * depL)
+        fireLoBar   := bar_index
+        fireLoNm    := pLoNm
+        pLoLvl      := na
+        pLoBar      := na
+        m6SessFires := m6SessFires + 1
+        m6TotFires  := m6TotFires + 1
+
+// Hold window with linear decay. Without it M6 is live for exactly one bar and
+// the gate would almost never see it align with modules confirming at other
+// speeds -- and M6 carries gate rule 2 alone (D-019).
+m6HiAge   = na(fireHiBar) ? na : bar_index - fireHiBar
+m6LoAge   = na(fireLoBar) ? na : bar_index - fireLoBar
+m6HiLive  = not na(m6HiAge) and m6HiAge <= holdBars
+m6LoLive  = not na(m6LoAge) and m6LoAge <= holdBars
+m6HiScore = m6HiLive ? fireHiScore * math.max(0.0, 1.0 - m6HiAge / ((holdBars + 1) * 1.0)) : 0.0
+m6LoScore = m6LoLive ? fireLoScore * math.max(0.0, 1.0 - m6LoAge / ((holdBars + 1) * 1.0)) : 0.0
+
+// Sweeping a HIGH is evidence for a SHORT reversal (dir -1), and vice versa.
+m6Dir    = m6HiScore > m6LoScore ? -1 : m6LoScore > m6HiScore ? 1 : 0
+m6Score  = math.max(m6HiScore, m6LoScore)
+m6Active = m6Ready and m6Dir != 0 and m6Score > 0.0
+m6Note   = m6Dir == -1 ? "swept " + fireHiNm : m6Dir == 1 ? "swept " + fireLoNm : ""
+
+// resolved tick equivalents, for the status table
+minPenTicks = na(minPen) ? na : minPen / tick
+maxPenTicks = na(maxPen) ? na : maxPen / tick
+
+// =============================================================================
+// MODULE IMPLEMENTATIONS  --  M6 LIVE, REST ARE STUBS
 // =============================================================================
 // Contract reminders that will quietly corrupt the composite if broken:
 //   - score must be 0..1 and must mean the same thing across modules.
@@ -419,11 +746,11 @@ f_mDelta() =>
 f_mExhaust() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
-// ---- M6 [Q] ------------------------------------------------------------------
-// TODO: penetration of a tracked level between sweepMinTicks and sweepMaxTicks,
-//       then a close back inside within reclaimMin. Depends on M2/M3 for levels.
+// ---- M6 [Q] -- IMPLEMENTED ---------------------------------------------------
+// Packages the M6 ENGINE results computed above. All logic lives in that section
+// so this stays a pure accessor, consistent with the other module functions.
 f_mSweep() =>
-    ModuleOut.new(0.0, false, 0, "stub")
+    ModuleOut.new(m6Score, m6Active, m6Dir, m6Note)
 
 // ---- M7 [C] ------------------------------------------------------------------
 // TODO: family-appropriate context via f_sec at ctxTF; regime (ADX / range-vs-ADR);
@@ -583,10 +910,16 @@ hasSetup = finalGrade > 0 and barstate.isconfirmed and instOK and tfSupported an
 f_gateStr(array<bool> ch, int n) =>
     (array.get(ch, CAT_L) ? "L" : "-") + (array.get(ch, CAT_E) ? "E" : "-") + (array.get(ch, CAT_F) ? "F" : "-") + (array.get(ch, CAT_Q) ? "Q" : "-") + (array.get(ch, CAT_C) ? "C" : "-") + " " + str.tostring(n)
 
+// M6 sweep markers. Drawn here, never inside the engine (D-010).
+if sweepShow and confirmed and not na(fireHiBar) and fireHiBar == bar_index
+    label.new(bar_index, high, "S " + fireHiNm, style = label.style_label_down, color = color.new(color.red, 65), textcolor = color.white, size = size.tiny)
+if sweepShow and confirmed and not na(fireLoBar) and fireLoBar == bar_index
+    label.new(bar_index, low, "S " + fireLoNm, style = label.style_label_up, color = color.new(color.green, 65), textcolor = color.white, size = size.tiny)
+
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 13, border_width = 1)
+        st := table.new(position.top_right, 2, 21, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -613,6 +946,23 @@ if showStatus and barstate.islast
     table.cell(st, 1, 11, sideStr, text_size = size.tiny)
     table.cell(st, 0, 12, showRaw ? "Composite" : "Grade", text_size = size.tiny)
     table.cell(st, 1, 12, showRaw ? str.tostring(composite, "#.###") : (gradeStr == "" ? "-" : gradeStr), text_size = size.tiny)
+    if sweepDebug
+        table.cell(st, 0, 13, "-- M6 --", text_size = size.tiny)
+        table.cell(st, 1, 13, m6Ready ? "ready" : "NOT READY", text_size = size.tiny)
+        table.cell(st, 0, 14, "ATR ref", text_size = size.tiny)
+        table.cell(st, 1, 14, sweepAtrRef + " = " + str.tostring(atrRef, "#.####") + " (" + str.tostring(na(atrRef) ? na : atrRef / tick, "#.#") + " tk)", text_size = size.tiny)
+        table.cell(st, 0, 15, "Min pen", text_size = size.tiny)
+        table.cell(st, 1, 15, str.tostring(sweepMinAtr, "#.##") + " ATR = " + str.tostring(minPenTicks, "#.#") + " ticks", text_size = size.tiny)
+        table.cell(st, 0, 16, "Max pen", text_size = size.tiny)
+        table.cell(st, 1, 16, str.tostring(sweepMaxAtr, "#.##") + " ATR = " + str.tostring(maxPenTicks, "#.#") + " ticks", text_size = size.tiny)
+        table.cell(st, 0, 17, "Reclaim", text_size = size.tiny)
+        table.cell(st, 1, 17, str.tostring(reclaimMin) + "m = " + str.tostring(reclaimBars) + " bars" + (reclaimBarsOK ? "" : "  WARN <2"), text_size = size.tiny)
+        table.cell(st, 0, 18, "Hold / levels", text_size = size.tiny)
+        table.cell(st, 1, 18, str.tostring(holdBars) + " bars / " + str.tostring(array.size(lvlP)) + " levels", text_size = size.tiny)
+        table.cell(st, 0, 19, "Funnel pen/band", text_size = size.tiny)
+        table.cell(st, 1, 19, str.tostring(m6PenSeen) + " / " + str.tostring(m6InBand) + " -> " + str.tostring(m6TotFires) + " fired", text_size = size.tiny)
+        table.cell(st, 0, 20, "FIRE RATE", text_size = size.tiny)
+        table.cell(st, 1, 20, str.tostring(m6TotFires / math.max(1, m6Sessions), "#.##") + " / session  (" + str.tostring(m6Sessions) + " sess, " + str.tostring(m6SessFires) + " today)", text_size = size.tiny)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
@@ -620,3 +970,5 @@ plot(finalGrade, "Grade (3=A 2=B 1=C)", display = display.data_window)
 plot(side,       "Side (1=long -1=short)", display = display.data_window)
 plot(showRaw ? composite : na, "Composite (raw)", display = display.data_window)
 plot(onRevAdj,   "M8 bias", display = display.data_window)
+plot(m6Score,    "M6 score", display = display.data_window)
+plot(m6Dir,      "M6 dir",   display = display.data_window)

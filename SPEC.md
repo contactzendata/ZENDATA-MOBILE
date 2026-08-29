@@ -3,7 +3,7 @@
 **Target:** TradingView Pine Script v6, single indicator, `overlay = true`
 **Instruments:** NQ (E-mini Nasdaq-100, CME) · GC (Gold, COMEX) — micros MNQ/MGC as aliases
 **Chart timeframes:** 1m, 5m, 15m
-**Status:** Scaffold complete, spec complete. No module logic implemented.
+**Status:** M6 implemented. Level registry (L0) implemented. M1–M5, M7, M8 are stubs.
 
 > Educational/research only. Counter-trend trading has a structurally low win rate
 > and asymmetric blow-up risk. Every threshold below is an untested hypothesis.
@@ -385,28 +385,53 @@ move with per-family IV symbol and rule-of-16 divisor (15.87).
 
 ---
 
-### M6 — Sweep & reclaim  ·  category **Q**
-**Inputs:** min penetration (4 ticks), max penetration (40 ticks), reclaim window
-(10m), mark toggle.
+### M6 — Sweep & reclaim  ·  category **Q**  ·  **IMPLEMENTED**
+**Inputs:** ATR reference (Chart TF / Daily), ATR length (14), **minimum
+penetration 0.10 × ATR**, **maximum penetration 0.50 × ATR**, reclaim window
+(10 minutes), signal hold (15 minutes), speed-vs-depth score weight (0.6), mark
+toggle, diagnostics toggle.
 
-**Method.** Price penetrates a tracked level by between `sweepMinTicks` and
-`sweepMaxTicks` — beyond the max it is a breakout, not a sweep — then closes back
-inside within `reclaimMin`. This is the stop-run-into-reversal pattern: clustered
-stops at an obvious level (PDH/PDL, round number, prior swing) are triggered, and
-the trapped traders' forced exits fuel the counter-move.
+**Method.** Price penetrates an *intact* level (prior bar closed on the correct
+side) by between `minPen` and `maxPen`, then **closes back inside** within the
+reclaim window. Below the minimum it is noise; above the maximum it is a breakout
+and the pending sweep is killed. A same-bar wick-and-reject is the fastest and
+strongest form. `dir = -1` when a high is swept, `+1` when a low is swept.
+
+**Score.** `speedWeight × speed + (1 − speedWeight) × depth`, where speed falls
+linearly with bars taken to reclaim and depth is the penetration's position
+within the `[min, max]` band. Speed dominates by default: an immediate close back
+inside is the strongest evidence the break failed. Deeper (still in-band) sweeps
+took more resting liquidity.
+
+**Volatility normalization (D-023).** Thresholds are ATR fractions, not ticks. NQ
+runs ~1200–1600 ticks of daily range against GC's 300–600, so a fixed 4–40 tick
+window described two categorically different events. Ticks normalize the price
+*increment* across instruments; they do not normalize *volatility*. The resolved
+tick equivalents are published in the status table — the fractions are not
+trustworthy until you can see what they resolve to on the chart.
+
+**Hold window (D-025).** M6 stays active for `sweepHoldMin` with a decaying score.
+Without it M6 is live for one bar and would essentially never coincide with the
+other modules, which confirm at different speeds — and M6 carries gate rule 2
+alone.
+
+**Levels come from the shared registry (D-022)**, not from M6 privately: PDH/PDL/
+PDC, ONH/ONL, IB, opening range, RTH open, prior swings, round numbers. Built from
+chart bars, zero `request.*` calls, published at session *end* so they are correct
+during the overnight.
 
 **Known weaknesses.**
-- **Confirmation is structurally late.** The reclaim window cannot be evaluated
-  until it elapses, so the module fires *after* the extreme, never at it. This is
-  inherent to bar-by-bar execution with no lookahead, not a tuning problem.
-- **Inter-module coupling.** M6 depends on M2/M3 for the levels it watches — the
-  engine's one real dependency, and a collinearity risk the category floor exists
-  to contain.
-- Pine sees the *price behavior*, not the resting orders. M6 detects a failed
-  penetration; it cannot know stops were there. Describe its output as "failed
-  penetration", never "liquidity taken" (PINE_LIMITS §1).
-
----
+- **Confirmation is structurally late.** The reclaim cannot be evaluated until it
+  happens, so M6 fires *after* the extreme, never at it. Inherent to bar-by-bar
+  execution, not a tuning problem.
+- **Inter-module coupling.** M6 and M2 read the same registry — that is the point,
+  but a sweep of a level and proximity to that level are not independent evidence.
+  Both are Location-adjacent; the category gate and damping contain it.
+- Pine sees *price behavior*, not resting orders. M6 detects a failed penetration;
+  it cannot know stops were there. Call it "failed penetration", never "liquidity
+  taken" (PINE_LIMITS §1).
+- **Reclaim windows under 2 bars** change the event's meaning entirely. The table
+  warns; it does not self-disable.
 
 ### M7 — Context & regime  ·  category **C** + **grade cap**
 **Inputs:** hostile cap (B), context TF (5m), NQ internals (TICK/ADD/VOLD/TRIN)

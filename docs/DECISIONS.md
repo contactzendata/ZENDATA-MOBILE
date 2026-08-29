@@ -514,3 +514,124 @@ one. Its influence is the cap, and nothing else.
 **Wrong if:** measurement shows the prior is strong enough that 0.05 is
 underweighting real information — in which case raise the cap, but keep it a cap.
 Promoting it to a category would still be wrong for the reason above.
+
+---
+
+## D-022 — A shared level registry, built from chart bars, not a daily request
+**Status:** Accepted · 2026-08-29
+
+Levels (PDH/PDL/PDC, ONH/ONL, IB, opening range, RTH open, prior swings, round
+numbers) are computed once in a **shared registry section** and consumed by M6
+today, with M2, M3 and M4 to follow. Their toggles moved from the M2 group into a
+new `L0 - Level registry (shared)` group.
+
+**Built from chart bars, not `request.security(…, "D", …)`.** A daily request
+returns the exchange's daily bar, which for GC is the **23-hour Globex session** —
+not the 08:20–13:30 pit window D-007 specifies. Deriving the levels from intraday
+bars using the session inputs is both correct for gold and free: **zero
+`request.*` calls**, where the original budget had allocated 3.
+
+**Over:** building levels privately inside M6. M2 would then have re-derived the
+same values from the same bars, and the two definitions would drift the first time
+one was tuned. M6 is simply the first consumer.
+
+**Publication timing is part of the contract.** PDH/PDL/PDC publish at RTH session
+**end**, not at the next session's open. Rolling at the open would leave them
+pointing at the session-before-last for the entire overnight — precisely the window
+in which M6 is sweeping them. ONH/ONL publish at overnight end, for the same
+reason. This was a real defect caught in review, not a hypothetical.
+
+**Consequence:** all registry state advances only on confirmed bars, so a forming
+realtime bar cannot move a published level and then take it back.
+
+---
+
+## D-023 — Sweep penetration bands are ATR fractions, not ticks
+**Status:** Accepted · 2026-08-29 · supersedes the tick-based M6 inputs
+
+`sweepMinTicks` / `sweepMaxTicks` are replaced by `sweepMinAtr` (default 0.10) and
+`sweepMaxAtr` (default 0.50), multiplied by a selectable ATR reference.
+
+**Rationale.** NQ runs roughly 1200–1600 ticks of daily range against GC's
+300–600. A fixed 4–40 tick window therefore described two categorically different
+events: on NQ a marginal poke, on GC a substantial excursion. Ticks normalize the
+*price increment* across instruments (D-005) but not the *volatility*, and a sweep
+is a volatility-scaled event.
+
+**`sweepAtrRef` is a genuine fork, exposed rather than decided:**
+- **Chart TF** (default) self-normalizes to the resolution being traded — a sweep
+  on 15m is a bigger event than on 5m, and the bands scale with it. But it means
+  the same fraction is a different absolute distance on each timeframe, which sits
+  in tension with D-005's "same wall-clock meaning across timeframes".
+- **Daily** is timeframe-invariant and normalizes only across instruments, at the
+  cost of one `request.*` call and of ignoring the chart's own resolution.
+
+The tension is real and not resolvable from first principles, so **the resolved
+tick equivalents are published in the status table**. "0.10 ATR" means nothing
+until you can see it resolve to a tick count on the chart in front of you; the
+readout is what makes this decision falsifiable rather than a preference.
+
+**The reclaim window stays minutes-based** per D-005 — it is a duration, not a
+distance, and durations were never the problem. The resolved bar count is
+displayed and **warns below 2 bars**: at 1 bar the reclaim must land on the very
+next bar, which is a materially different and much rarer event than the
+input's wording implies. It warns rather than self-disabling, as specified.
+
+**Wrong if:** the tick readouts show one reference producing absurd numbers across
+the 1m/5m/15m set, in which case the other becomes the default rather than the
+option.
+
+---
+
+## D-024 — M6 ships with its own fire-rate instrumentation
+**Status:** Accepted · 2026-08-29
+
+M6 carries a penetration funnel and a per-session fire counter, surfaced in the
+status table: penetrations seen → within the max band → reclaimed and fired, plus
+fires per session and a session count.
+
+**Why it is in the script rather than in a report.** The fire rate cannot be
+computed anywhere except on a chart with data — there is no way to derive it from
+the source material, and asserting a number without running it would be
+fabrication. Building the counter is the only honest way to deliver the
+measurement.
+
+**Why the funnel and not just the count.** A fire rate of zero has at least three
+distinct causes with three different fixes: nothing penetrates (`sweepMinAtr` too
+high), everything over-penetrates (`sweepMaxAtr` too low), or nothing reclaims in
+time (`reclaimMin` too short). A bare count cannot distinguish them; the funnel
+can, at a glance.
+
+**This is the gating measurement for the whole engine.** Per D-019, M6 carries
+gate rule 2 alone while `requireOF` is off. If its fire rate is near zero, no
+setup can ever grade regardless of how well M1–M5 are built — so this number
+decides whether the sweep definition is usable before any further module work.
+
+**Consequence:** counters are cumulative over the loaded history and reset only on
+recompile. `m6Sessions` counts RTH opens seen, so the average is over whatever
+history the chart holds — read the session count alongside the rate.
+
+---
+
+## D-025 — M6 fires are held for a decaying window, not a single bar
+**Status:** Accepted · 2026-08-29
+
+After a confirmed reclaim, M6 stays `active` for `sweepHoldMin` (default 15
+minutes) with the score decaying linearly.
+
+**Rationale.** Without a hold window M6 is live on exactly one bar. The confluence
+gate requires Location **and** an event **and** a third category to be true on the
+*same* bar — and the other modules confirm at different speeds (M1's band-walk
+guard, M3's TPO brackets, M4's divergence lookback). A one-bar M6 would almost
+never coincide with them, and since M6 carries gate rule 2 alone (D-019), the
+engine would grade approximately nothing for a reason that has nothing to do with
+the market.
+
+**Decay rather than a flat hold:** the evidence genuinely goes stale. A reclaim
+twelve minutes ago is weaker support for a reversal *now* than one that just
+happened, and a flat hold would misrepresent that.
+
+**Wrong if:** the hold turns out to be what makes setups grade — i.e. the same
+sweep keeps paying out across many bars and inflates the fire-to-grade ratio.
+Watch for grades clustering immediately after a single sweep. The fix would be a
+one-grade-per-sweep debounce, not a shorter hold.
