@@ -5,8 +5,8 @@
 // STATUS: SCAFFOLD ONLY. Every analytical module below is a stub returning
 // score = 0.0, active = false, dir = 0. No module logic is implemented yet. The
 // file is intentionally compilable so the input tree, the directional composite,
-// the category floor, and the grading pipeline can be inspected on a live chart
-// before any signal exists.
+// within-category damping, the category composition rules, and the grading
+// pipeline can be inspected on a live chart before any signal exists.
 //
 // DISCLAIMER: Not financial advice. Research tool. Counter-trend trading has a
 // structurally low win rate and asymmetric blow-up risk. Every threshold here is
@@ -15,7 +15,7 @@
 // -----------------------------------------------------------------------------
 // WHAT THIS ENGINE IS, AND WHAT IT DELIBERATELY IS NOT
 // -----------------------------------------------------------------------------
-// The source framework requires five categories of evidence, >= 3 aligned:
+// The source framework requires five categories of evidence:
 //
 //   L  LOCATION        pre-marked level (VWAP sigma band, VAH/VAL, naked POC,
 //                      PDH/PDL/ONH/ONL, GEX wall, expected-move boundary)
@@ -32,9 +32,16 @@
 // source research itself flags as a frequent "real divergence, no reversal" trap.
 //
 // Therefore this engine is a SCREENER, not a trigger. It marks zones where L, E,
-// Q and C align and hands off the order-flow confirmation to a footprint/DOM
+// Q and C align and hands off order-flow confirmation to a footprint/DOM
 // platform. Treating a grade here as an entry signal skips the one category the
 // research calls load-bearing. See docs/PINE_LIMITS.md and DECISIONS D-012.
+//
+// GATING (D-019). A grade requires ALL of:
+//   1. LOCATION present                       -- mandatory, no exceptions
+//   2. at least one of {LIQUIDITY, ORDER-FLOW} -- something must have HAPPENED
+//   3. total distinct categories >= minCats   -- configurable, default 3
+// Composition is enforced; only the count is configurable. "Extended and near a
+// level" with no event is a watch, not a setup.
 //
 // -----------------------------------------------------------------------------
 // INSTRUMENTS
@@ -62,6 +69,7 @@
 //   M5 expected move ...... up to  1   CBOE:VIX (NQ) or CBOE:GVZ (GC)
 //   M7 context ............ up to  4   NQ: TICK/ADD/VOLD/TRIN | GC: DXY/US10Y/US02Y
 //   M7 COT (optional) ..... up to  2   weekly CFTC series
+//   M8 overnight prior .... up to  0   computed from chart bars only
 //   volume source override  up to  2   full-size symbol, if enabled (D-013)
 //   ------------------------------------------------------------------------
 //   Planned worst case .... up to 15 of ~40.
@@ -87,33 +95,34 @@ type ModuleOut
     int    dir    = 0
     string note   = ""
 
-// Evidence categories. The confluence floor counts DISTINCT categories, not
-// modules, so two location modules firing together is still one category.
-// 0 = L location   1 = E extension   2 = F order-flow   3 = Q liquidity   4 = C context
+// Evidence categories. 0=L location 1=E extension 2=F order-flow 3=Q liquidity 4=C context
 CAT_L = 0
 CAT_E = 1
 CAT_F = 2
 CAT_Q = 3
 CAT_C = 4
+N_CAT = 5
 
 // =============================================================================
 // INSTRUMENT DETECTION
 // =============================================================================
 
-grpInst = "1 · Instrument"
+grpInst = "1 - Instrument"
 
 instOverride = input.string("Auto", "Instrument profile", options = ["Auto", "NQ", "GC"], group = grpInst, tooltip = "Auto detects from syminfo.root. Override only on a symbol whose root does not resolve.")
 showStatus   = input.bool(true, "Show status table", group = grpInst)
 
 // Volume sourcing. The source research says "read microstructure on the full-size
-// contract, execute the micro" -- but that argument is about DOM and tape DEPTH,
-// which Pine cannot access at all. For BAR VOLUME the argument does not obviously
-// transfer: MNQ's 2025 ADV (~1.6M contracts) exceeds NQ's (~500k), so the micro's
-// contract-count volume is not the thinner series. Default is therefore OFF.
-// See DECISIONS D-013 for the test that would settle this.
-useFullSizeVol = input.bool(false, "Source volume from full-size contract", group = grpInst, tooltip = "When on, volume-derived modules (M3 profile, M4 delta, M5 RVOL) read the full-size contract instead of the chart symbol. Costs up to 2 request.* calls. OFF by default: the 'read full-size' recommendation is about DOM/tape depth, which Pine cannot see, and MNQ actually carries MORE contract volume than NQ.")
-fullSizeNQ     = input.symbol("CME_MINI:NQ1!", "Full-size symbol · NQ", group = grpInst)
-fullSizeGC     = input.symbol("COMEX:GC1!",    "Full-size symbol · GC", group = grpInst)
+// contract, execute the micro". For DOM and tape that argument is about book
+// DEPTH, which Pine cannot access at all. For BAR VOLUME the right unit is
+// NOTIONAL, not contract count: NQ is $20/pt against MNQ's $2/pt, so NQ's ~500k
+// ADV carries roughly 3x MNQ's ~1.6M ADV in notional terms, and GC's ~270k
+// contracts (~27M oz) roughly 9x MGC's ~300k (~3M oz). The full-size series IS
+// the heavier volume-at-price series in both families. Default is OFF only
+// because the intended workflow charts NQ/GC directly. See D-013.
+useFullSizeVol = input.bool(false, "Source volume from full-size contract", group = grpInst, tooltip = "When on, volume-derived modules (M3 profile, M4 delta, M5 RVOL) read the full-size contract instead of the chart symbol. Costs up to 2 request.* calls. Leave OFF when already charting NQ/GC. Turn ON if charting MNQ/MGC: by notional the full-size series carries roughly 3x (NQ vs MNQ) and 9x (GC vs MGC) the volume-at-price.")
+fullSizeNQ     = input.symbol("CME_MINI:NQ1!", "Full-size symbol - NQ", group = grpInst)
+fullSizeGC     = input.symbol("COMEX:GC1!",    "Full-size symbol - GC", group = grpInst)
 
 rootRaw = str.length(syminfo.root) > 0 ? syminfo.root : syminfo.ticker
 rootUp  = str.upper(rootRaw)
@@ -135,11 +144,12 @@ instOK = isNQ or isGC
 // Tick size from the symbol, never hardcoded: identical across micro and full-size.
 tick = syminfo.mintick
 
-volSrcSym = isGC ? fullSizeGC : fullSizeNQ
+volSrcSym = useFullSizeVol ? (isGC ? fullSizeGC : fullSizeNQ) : syminfo.tickerid
 
 // Back-adjusted continuous contracts shift every historical price at each roll,
 // so absolute horizontal levels drawn on them are unreliable. Detect and warn.
-isContinuous = str.contains(str.upper(syminfo.ticker), "1!") or str.contains(str.upper(syminfo.ticker), "2!")
+tickerUp     = str.upper(syminfo.ticker)
+isContinuous = str.contains(tickerUp, "1!") or str.contains(tickerUp, "2!")
 
 // =============================================================================
 // TIMEFRAME NORMALIZATION
@@ -178,7 +188,7 @@ f_secLTF(string sym, string tf, float expr) =>
 // Pine inputs cannot have conditional defaults, so both profiles are exposed and
 // one is selected at runtime.
 
-grpSess = "2 · Sessions"
+grpSess = "2 - Sessions"
 
 tz        = input.string("America/New_York", "Session timezone", options = ["America/New_York", "America/Chicago", "UTC"], group = grpSess)
 nqRthSess = input.session("0930-1600", "NQ  RTH", group = grpSess, tooltip = "Cash-index session. This is the profile that carries information for NQ; the 23-hour Globex profile does not.")
@@ -186,14 +196,13 @@ nqOnSess  = input.session("1800-0930", "NQ  Overnight", group = grpSess)
 gcRthSess = input.session("0820-1330", "GC  RTH (COMEX pit-equivalent)", group = grpSess, tooltip = "Gold's conventional daily levels are quoted against the pit window, not the 23-hour Globex session, which smears Asia/London/NY into one meaningless profile.")
 gcOnSess  = input.session("1800-0820", "GC  Overnight", group = grpSess)
 
-// Reversal-prone windows from the source research. Used as a soft prior, never
-// as a standalone trigger.
-nqWindows = input.session("0930-1000", "NQ  window · open drive & failure", group = grpSess)
-gcWindows = input.session("0300-0330", "GC  window · London open", group = grpSess)
-ovlpSess  = input.session("0800-1100", "GC  window · London-NY overlap", group = grpSess)
+// Reversal-prone windows from the source research. Soft prior, never a trigger.
+nqWindows = input.session("0930-1000", "NQ  window - open drive and failure", group = grpSess)
+gcWindows = input.session("0300-0330", "GC  window - London open", group = grpSess)
+ovlpSess  = input.session("0800-1100", "GC  window - London/NY overlap", group = grpSess)
 
 // Scheduled-catalyst stand-down. Pine has NO economic event calendar, so this is
-// a manual control. See PINE_LIMITS §4.
+// a manual control. See PINE_LIMITS section 4.
 standDown    = input.bool(false, "Stand down (manual catalyst blackout)", group = grpSess, tooltip = "FOMC / CPI / NFP / PPI. Pine cannot read an economic calendar -- there is no automatic version of this. Set it yourself on event days.")
 blackoutSess = input.session("0830-0900", "Blackout window", group = grpSess, tooltip = "Applied only while 'Stand down' is on.")
 
@@ -206,56 +215,62 @@ inWindow   = not na(time(timeframe.period, isGC ? gcWindows : nqWindows, tz)) or
 inBlackout = standDown and not na(time(timeframe.period, blackoutSess, tz))
 
 // =============================================================================
-// COMPOSITE, CONFLUENCE FLOOR, GRADING
+// COMPOSITE, CONFLUENCE GATE, GRADING
 // =============================================================================
 
-grpScore = "3 · Composite & grading"
+grpScore = "3 - Composite and grading"
 
-// WEIGHTING CONTRACT (D-002):
-//   module OFF       -> excluded from numerator AND denominator ("not measured")
-//   module ON, idle  -> contributes 0.0, weight STAYS in denominator
-//   module ON, active, WRONG SIDE -> contributes 0.0 for the side under
-//                       evaluation, weight stays. Evidence for a low is not
-//                       neutral when you are grading a high.
+// WEIGHTING CONTRACT (D-002 / D-015 / D-020):
+//   module OFF                    -> excluded from numerator AND denominator
+//   module ON, idle               -> contributes 0.0, effective weight stays
+//   module ON, active, WRONG side -> contributes 0.0, effective weight stays
+//   2nd+ enabled module in a CATEGORY -> effective weight scaled by catDamp,
+//                                        in BOTH numerator and denominator
 
-wVwap    = input.float(1.0, "Weight · M1 VWAP extension",        minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
-wStruct  = input.float(1.0, "Weight · M2 Structural levels",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
-wProfile = input.float(1.0, "Weight · M3 Volume/Market profile", minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
-wDelta   = input.float(0.5, "Weight · M4 Delta/CVD (APPROX)",    minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Down-weighted on purpose. Tick-rule approximation, not order flow, and the source research flags CVD divergence as a frequent 'real divergence, no reversal' trap.")
-wExhaust = input.float(1.0, "Weight · M5 Exhaustion & RVOL",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
-wSweep   = input.float(1.0, "Weight · M6 Sweep & reclaim",       minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
-wContext = input.float(0.5, "Weight · M7 Context & regime",      minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Context also acts as a GRADE CAP independent of this weight. The weight is its scoring contribution; the cap is its veto power.")
+wVwap    = input.float(1.0, "Weight - M1 VWAP extension",        minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wStruct  = input.float(1.0, "Weight - M2 Structural levels",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wProfile = input.float(1.0, "Weight - M3 Volume/Market profile", minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wDelta   = input.float(0.5, "Weight - M4 Delta/CVD (APPROX)",    minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Down-weighted on purpose. Tick-rule approximation, not order flow, and the source research flags CVD divergence as a frequent 'real divergence, no reversal' trap.")
+wExhaust = input.float(1.0, "Weight - M5 Exhaustion and RVOL",   minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wSweep   = input.float(1.0, "Weight - M6 Sweep and reclaim",     minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore)
+wContext = input.float(0.5, "Weight - M7 Context and regime",    minval = 0.0, maxval = 5.0, step = 0.1, group = grpScore, tooltip = "Context also acts as a GRADE CAP independent of this weight. The weight is its scoring contribution; the cap is its veto power.")
+
+// WITHIN-CATEGORY DAMPING (D-020). The category gate stops collinear modules from
+// unlocking a grade; this stops them from inflating the SCORE. Declared push
+// order sets precedence: M2 is primary Location (M3 secondary), M1 is primary
+// Extension (M5 secondary). Applied to numerator AND denominator so a damped
+// module cannot drag the composite down merely by existing.
+catDamp = input.float(0.5, "Within-category damping (2nd+ module)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpScore, tooltip = "The second and subsequent ENABLED modules in the same category contribute at this rate. 1.0 disables damping. Precedence is declared push order, not score, so the denominator stays stable and an idle module's weight stays well-defined.")
 
 gradeAmin = input.float(0.75, "Grade A threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore)
 gradeBmin = input.float(0.60, "Grade B threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore)
 gradeCmin = input.float(0.45, "Grade C threshold", minval = 0.0, maxval = 1.0, step = 0.01, group = grpScore, tooltip = "Below this nothing is published.")
 
-// CONFLUENCE FLOOR: distinct CATEGORIES, not module count (D-014). Two location
-// modules agreeing is one category, not two independent confirmations.
-minCats   = input.int(3, "Minimum distinct categories", minval = 1, maxval = 5, group = grpScore, tooltip = "The source checklist requires >= 3 of {Location, Extension, Order-flow, Liquidity, Context}. Counting categories rather than modules is what stops M2 + M3 (both Location) from paying out twice for one observation.")
-requireOF = input.bool(false, "Require an order-flow category hit", group = grpScore, tooltip = "The research argues order-flow confirmation is load-bearing. In Pine the ONLY order-flow input is M4's tick-rule approximation, so requiring it means gating every setup on the weakest module in the engine. OFF by default; the honest fix is to confirm order flow on a footprint platform, not here.")
+// CONFLUENCE GATE (D-019). Composition is ENFORCED and not optional:
+//   Location mandatory + at least one of {Liquidity, Order-flow} + a third category.
+minCats   = input.int(3, "Minimum distinct categories", minval = 2, maxval = 5, group = grpScore, tooltip = "Count only. Composition is enforced regardless: LOCATION is mandatory, and at least one of {LIQUIDITY, ORDER-FLOW} is required. Extended-and-near-a-level with no event is a watch, not a setup.")
+requireOF = input.bool(false, "Require the ORDER-FLOW category specifically", group = grpScore, tooltip = "Narrows rule 2 from {Liquidity OR Order-flow} to Order-flow only. In Pine the sole order-flow input is M4's tick-rule approximation, so this gates every setup on the weakest module in the engine. OFF by default; confirm order flow on a footprint platform instead.")
 showRaw   = input.bool(false, "Show raw composite (development only)", group = grpScore, tooltip = "The engine publishes A/B/C, not a number. 0.71 and 0.69 are not different when they come from seven approximated sub-scores.")
 
 // =============================================================================
 // MODULE INPUTS
 // =============================================================================
 
-// ---- M1 · VWAP extension  [category E] ---------------------------------------
-grpM1 = "M1 · VWAP extension (E)"
+// ---- M1 - VWAP extension  [category E, PRIMARY] ------------------------------
+grpM1 = "M1 - VWAP extension (E)"
 useVwap     = input.bool(true, "Enable VWAP extension", group = grpM1)
 vwapAnchor  = input.string("RTH open", "VWAP anchor", options = ["RTH open", "Session", "Week", "Month", "Overnight open"], group = grpM1, tooltip = "RTH-anchored by default. Overnight volume is too thin for reliable sigma bands.")
 vwapRthOnly = input.bool(true, "Compute bands from RTH volume only", group = grpM1)
-vwapSigmaLo = input.float(2.0, "Sigma · extension begins", minval = 0.5, step = 0.1, group = grpM1, tooltip = "+/-1 sigma contains ~68% of session action, +/-2 sigma ~95%. A 2-sigma tag is a genuinely extended location.")
-vwapSigmaHi = input.float(3.0, "Sigma · score saturates", minval = 0.5, step = 0.1, group = grpM1)
+vwapSigmaLo = input.float(2.0, "Sigma - extension begins", minval = 0.5, step = 0.1, group = grpM1, tooltip = "+/-1 sigma contains ~68% of session action, +/-2 sigma ~95%. A 2-sigma tag is a genuinely extended location.")
+vwapSigmaHi = input.float(3.0, "Sigma - score saturates", minval = 0.5, step = 0.1, group = grpM1)
 vwapWarmMin = input.int(30, "Anchor warm-up (minutes)", minval = 1, group = grpM1, tooltip = "A fresh anchor sits on price with sigma near zero, making extension readings meaningless. Module stays inactive until this elapses.")
 // BAND-WALK GUARD: mechanically fading a band in a trending session is, per the
-// source research, a leading cause of blow-ups. Sustained closes outside the band
-// must flip M1 from "extended" to "trending" and suppress it.
+// source research, a leading cause of blow-ups.
 bandWalkMin = input.int(20, "Band-walk suppression (minutes)", minval = 1, group = grpM1, tooltip = "If price holds beyond the sigma band for this long, treat it as a band-walk (trend), NOT extension, and suppress M1. This is the single most important guard in the module.")
 vwapShow    = input.bool(true, "Plot VWAP and bands", group = grpM1)
 
-// ---- M2 · Structural levels  [category L] ------------------------------------
-grpM2 = "M2 · Structural levels (L)"
+// ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
+grpM2 = "M2 - Structural levels (L)"
 useStruct   = input.bool(true, "Enable structural levels", group = grpM2)
 sPDHL       = input.bool(true, "Prior day high / low", group = grpM2)
 sPDC        = input.bool(true, "Prior day close", group = grpM2)
@@ -270,95 +285,93 @@ roundStep   = input.float(0.0, "Round-number step (0 = auto)", minval = 0.0, gro
 structProx  = input.int(8, "Proximity to level (ticks)", minval = 1, group = grpM2, tooltip = "In TICKS so it carries across NQ (0.25) and GC (0.10) without retuning.")
 structShow  = input.bool(true, "Draw levels", group = grpM2)
 
-// GEX levels (NQ family only). Pine has NO options data -- no chain, no OI, no
-// IV surface, and no way to fetch any. GEX cannot be computed here at any effort
-// level. These are MANUAL entries, updated by hand from an external source, and
-// they go stale. 0.0 = unused. See PINE_LIMITS §4.
+// GEX levels (NQ family only). Pine has NO options data. MANUAL entries, 0 = unused.
 gexEnable   = input.bool(false, "GEX walls (NQ only, MANUAL entry)", group = grpM2, tooltip = "Pine cannot compute or fetch gamma exposure. Type the levels in yourself; they are modeled, OI updates end-of-day, and they are computed on NDX/QQQ then applied to NQ.")
 gexFlip     = input.float(0.0, "  Gamma flip level", group = grpM2)
 gexCallWall = input.float(0.0, "  Call wall", group = grpM2)
 gexPutWall  = input.float(0.0, "  Put wall", group = grpM2)
 
-// ---- M3 · Volume & Market profile  [category L] ------------------------------
-grpM3 = "M3 · Volume & Market profile (L)"
-useProfile   = input.bool(true, "Enable profile", group = grpM3)
-vpRows       = input.int(48, "Profile rows", minval = 8, maxval = 200, group = grpM3, tooltip = "Shares the 500-box budget with every other drawing in this script. 48 rows x 2 sessions = 96 boxes before anything else draws.")
-vpValueArea  = input.float(70.0, "Value area (%)", minval = 50.0, maxval = 95.0, step = 1.0, group = grpM3)
-vpIntrabarTF = input.timeframe("1", "Intrabar TF (current / prior session)", group = grpM3, tooltip = "HYBRID SOURCING (D-001): current and prior sessions from intrabars; older sessions from chart bars. Full intrabar history would exhaust the ~100k intrabar cap within days, and it fails SILENTLY.")
-vpHistSess   = input.int(10, "Historical sessions (chart-bar sourced)", minval = 0, maxval = 40, group = grpM3)
-vpNaked      = input.bool(true, "Track naked / virgin POCs", group = grpM3)
-vpHVNLVN     = input.bool(true, "Mark HVN / LVN", group = grpM3, tooltip = "HVN = acceptance shelf, reversal-friendly. LVN = air pocket, continuation-friendly and never a stop location.")
-// Market Profile / TPO structures. These ARE buildable from bars, unlike footprint.
-vpTPO        = input.bool(true, "TPO structures", group = grpM3)
+// ---- M3 - Volume and Market profile  [category L, secondary] -----------------
+grpM3 = "M3 - Volume/Market profile (L)"
+useProfile    = input.bool(true, "Enable profile", group = grpM3)
+vpRows        = input.int(48, "Profile rows", minval = 8, maxval = 200, group = grpM3, tooltip = "Shares the 500-box budget with every other drawing in this script. 48 rows x 2 sessions = 96 boxes before anything else draws.")
+vpValueArea   = input.float(70.0, "Value area (%)", minval = 50.0, maxval = 95.0, step = 1.0, group = grpM3)
+vpIntrabarTF  = input.timeframe("1", "Intrabar TF (current / prior session)", group = grpM3, tooltip = "HYBRID SOURCING (D-001): current and prior sessions from intrabars; older sessions from chart bars. Full intrabar history would exhaust the ~100k intrabar cap within days, and it fails SILENTLY.")
+vpHistSess    = input.int(10, "Historical sessions (chart-bar sourced)", minval = 0, maxval = 40, group = grpM3)
+vpNaked       = input.bool(true, "Track naked / virgin POCs", group = grpM3)
+vpHVNLVN      = input.bool(true, "Mark HVN / LVN", group = grpM3, tooltip = "HVN = acceptance shelf, reversal-friendly. LVN = air pocket, continuation-friendly and never a stop location.")
+vpTPO         = input.bool(true, "TPO structures", group = grpM3)
 tpoBracketMin = input.int(30, "  TPO bracket (minutes)", minval = 5, group = grpM3)
-tpoSingles   = input.bool(true, "  Single prints / excess tails", group = grpM3, tooltip = "Prices touched in only one bracket. Genuine rejection, and a magnet price tends to return to fill.")
-tpoPoorHL    = input.bool(true, "  Poor highs / poor lows", group = grpM3, tooltip = "Flat extreme across 2+ brackets with no excess tail = UNFINISHED auction. These typically get revisited and EXCEEDED -- a poor high is a warning AGAINST fading, not a reason to fade. M3 must score it negatively.")
-tpo80Rule    = input.bool(false, "  80% rule", group = grpM3, tooltip = "Open outside prior value, re-enter, hold 2 consecutive 30-min brackets inside -> ~80% tendency to traverse the full value area.")
-vpShow       = input.bool(true, "Draw profile", group = grpM3)
+tpoSingles    = input.bool(true, "  Single prints / excess tails", group = grpM3, tooltip = "Prices touched in only one bracket. Genuine rejection, and a magnet price tends to return to fill.")
+tpoPoorHL     = input.bool(true, "  Poor highs / poor lows", group = grpM3, tooltip = "Flat extreme across 2+ brackets with no excess tail = UNFINISHED auction. These typically get revisited and EXCEEDED -- a poor high is a warning AGAINST fading, not a reason to fade. M3 must score it negatively for the fade side (D-016).")
+tpo80Rule     = input.bool(false, "  80% rule", group = grpM3, tooltip = "Open outside prior value, re-enter, hold 2 consecutive 30-min brackets inside -> ~80% tendency to traverse the full value area.")
+vpShow        = input.bool(true, "Draw profile", group = grpM3)
 
-// ---- M4 · Delta / CVD  [category F]  ⚠ APPROXIMATION --------------------------
-grpM4 = "M4 · Delta / CVD — APPROXIMATION (F)"
+// ---- M4 - Delta / CVD  [category F]  APPROXIMATION ---------------------------
+grpM4 = "M4 - Delta/CVD APPROXIMATION (F)"
 useDelta    = input.bool(true, "Enable approximated delta", group = grpM4, tooltip = "THIS IS NOT ORDER FLOW. Pine cannot classify trades against bid/ask. Delta here is inferred from intrabar candle direction (the tick rule). It is the ONLY order-flow-category input available, and it is a proxy.")
 deltaTF     = input.timeframe("1", "Intrabar TF", group = grpM4, tooltip = "Must be strictly lower than the chart TF. On a 1m chart that needs seconds data; the module self-disables rather than reporting zeros.")
 cvdResetOn  = input.string("RTH open", "CVD reset", options = ["RTH open", "Session", "Day", "Never"], group = grpM4)
 deltaDivMin = input.int(50, "Divergence lookback (minutes)", minval = 5, group = grpM4)
 deltaReqLvl = input.bool(true, "Only score divergence at a marked level", group = grpM4, tooltip = "The source research is explicit: CVD divergence away from a pre-marked structural level is a trap, because liquidity at the extreme may simply have been consumed over repeated tests and price breaks anyway. Leave this ON.")
 
-// ---- M5 · Exhaustion & RVOL  [category E] ------------------------------------
-grpM5 = "M5 · Exhaustion & RVOL (E)"
-useExhaust   = input.bool(true, "Enable exhaustion / RVOL", group = grpM5)
-adrDays      = input.int(20, "ADR lookback (days)", minval = 2, group = grpM5)
-exhaustRatio = input.float(1.0, "ADR exhaustion ratio", minval = 0.1, step = 0.05, group = grpM5, tooltip = "Session range / average daily range. The research puts the falloff in continuation probability at roughly 1.0x the typical daily range.")
-rvolBaseN    = input.int(20, "RVOL baseline (sessions)", minval = 2, maxval = 60, group = grpM5, tooltip = "10-20 sessions is the conventional range.")
-rvolMin      = input.float(1.5, "RVOL threshold", minval = 0.0, step = 0.1, group = grpM5, tooltip = "1.5-2.0 flags abnormal participation.")
+// ---- M5 - Exhaustion and RVOL  [category E, secondary] -----------------------
+grpM5 = "M5 - Exhaustion and RVOL (E)"
+useExhaust       = input.bool(true, "Enable exhaustion / RVOL", group = grpM5)
+adrDays          = input.int(20, "ADR lookback (days)", minval = 2, group = grpM5)
+exhaustRatio     = input.float(1.0, "ADR exhaustion ratio", minval = 0.1, step = 0.05, group = grpM5, tooltip = "Session range / average daily range. The research puts the falloff in continuation probability at roughly 1.0x the typical daily range.")
+rvolBaseN        = input.int(20, "RVOL baseline (sessions)", minval = 2, maxval = 60, group = grpM5, tooltip = "10-20 sessions is the conventional range.")
+rvolMin          = input.float(1.5, "RVOL threshold", minval = 0.0, step = 0.1, group = grpM5, tooltip = "1.5-2.0 flags abnormal participation.")
 rvolTodBucketMin = input.int(30, "Time-of-day bucket (minutes)", minval = 1, group = grpM5, tooltip = "Futures volume is strongly U-shaped -- heavy at the RTH open and close, thin midday. RVOL must compare 09:35 to other 09:35s, never to a flat daily average.")
-climaxMult   = input.float(2.0, "Climax volume multiple", minval = 1.0, step = 0.1, group = grpM5, tooltip = "Spike >= this x the 20-period average AT a level. A spike alone is ambiguous -- it marks exhaustion or breakout initiation. It becomes reversal evidence ONLY when price fails to follow through.")
-// Implied-volatility expected move. Rule of 16: daily EM ~ Price x (IV/100) / sqrt(252).
-useEM        = input.bool(true, "Expected-move boundary", group = grpM5)
-emSymNQ      = input.symbol("CBOE:VIX", "  IV symbol · NQ", group = grpM5)
-emSymGC      = input.symbol("CBOE:GVZ", "  IV symbol · GC", group = grpM5, tooltip = "Cboe Gold ETF Volatility Index, quoted on GLD options -- a proxy for COMEX gold vol, not a direct measure of it.")
-emDivisor    = input.float(15.87, "  Rule-of-16 divisor", minval = 1.0, step = 0.01, group = grpM5, tooltip = "sqrt(252) = 15.87.")
+climaxMult       = input.float(2.0, "Climax volume multiple", minval = 1.0, step = 0.1, group = grpM5, tooltip = "Spike >= this x the 20-period average AT a level. A spike alone is ambiguous -- it marks exhaustion or breakout initiation. It becomes reversal evidence ONLY when price fails to follow through.")
+useEM            = input.bool(true, "Expected-move boundary", group = grpM5)
+emSymNQ          = input.symbol("CBOE:VIX", "  IV symbol - NQ", group = grpM5)
+emSymGC          = input.symbol("CBOE:GVZ", "  IV symbol - GC", group = grpM5, tooltip = "Cboe Gold ETF Volatility Index, quoted on GLD options -- a proxy for COMEX gold vol, not a direct measure of it.")
+emDivisor        = input.float(15.87, "  Rule-of-16 divisor", minval = 1.0, step = 0.01, group = grpM5, tooltip = "sqrt(252) = 15.87.")
 
-// ---- M6 · Sweep & reclaim  [category Q] --------------------------------------
-grpM6 = "M6 · Sweep & reclaim (Q)"
-useSweep      = input.bool(true, "Enable sweep & reclaim", group = grpM6)
+// ---- M6 - Sweep and reclaim  [category Q] ------------------------------------
+grpM6 = "M6 - Sweep and reclaim (Q)"
+useSweep      = input.bool(true, "Enable sweep and reclaim", group = grpM6)
 sweepMinTicks = input.int(4,  "Minimum penetration (ticks)", minval = 1, group = grpM6)
 sweepMaxTicks = input.int(40, "Maximum penetration (ticks)", minval = 2, group = grpM6, tooltip = "Beyond this it is a breakout, not a sweep.")
 reclaimMin    = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window. Confirmation is therefore structurally late -- the module cannot fire at the extreme, only after it.")
 sweepShow     = input.bool(true, "Mark sweeps", group = grpM6)
 
-// ---- M7 · Context & regime  [category C, plus GRADE CAP] ---------------------
-grpM7 = "M7 · Context & regime (C)"
-useContext  = input.bool(true, "Enable context & regime", group = grpM7)
+// ---- M7 - Context and regime  [category C, plus GRADE CAP] -------------------
+grpM7 = "M7 - Context and regime (C)"
+useContext  = input.bool(true, "Enable context and regime", group = grpM7)
 ctxCapGrade = input.string("B", "Hostile-context grade cap", options = ["A", "B", "C", "None"], group = grpM7, tooltip = "GRADE CAP, not a veto. The setup is still published, capped, so you can audit what the gate rejected. 'None' suppresses entirely.")
 ctxTF       = input.timeframe("5", "Context timeframe", group = grpM7, tooltip = "Held at >= 5m: internals are noisy at 1m and a gate that flickers is worse than no gate.")
-// NQ internals. Availability is feed-dependent; ignore_invalid_symbol is on, so a
-// missing feed must resolve to active = false, NEVER to neutral context.
-ctxTICK     = input.symbol("USI:TICK", "NQ · TICK", group = grpM7, tooltip = "Normal range +/-600; beyond +/-1000 marks breadth exhaustion. Context-dependent: in RANGE sessions extremes mark reversals, in TRENDS they confirm momentum.")
-ctxADD      = input.symbol("USI:ADD",  "NQ · advance-decline", group = grpM7)
-ctxVOLD     = input.symbol("USI:VOLD", "NQ · up-vol minus down-vol", group = grpM7)
-ctxTRIN     = input.symbol("USI:TRIN", "NQ · TRIN / Arms", group = grpM7, tooltip = "> 2.0 in a decline = capitulation. < 0.5 = frenzied buying that can fade.")
-tickExtreme = input.int(1000, "NQ · TICK extreme", minval = 200, group = grpM7)
-ctxDXY      = input.symbol("TVC:DXY",   "GC · dollar", group = grpM7)
-ctxUS10Y    = input.symbol("TVC:US10Y", "GC · 10y yield", group = grpM7)
-ctxUS02Y    = input.symbol("TVC:US02Y", "GC · 2y yield", group = grpM7, tooltip = "Real (TIPS) yields are the theoretically correct input, not nominals. Post-2022 central-bank buying decoupled gold's LEVEL from real yields; they still transmit intraday but no longer anchor.")
-// Gamma regime (NQ). Manual: Pine has no options data.
-gammaRegime = input.string("Unknown", "NQ · gamma regime (MANUAL)", options = ["Positive", "Negative", "Unknown"], group = grpM7, tooltip = "Positive gamma: dealers sell strength / buy weakness -> pinning, fade extremes. Negative gamma: moves amplify -> do NOT fade. Pine cannot determine this; set it yourself. 'Unknown' must not be treated as favorable.")
-// Regime gate: fading in a trend is the dominant failure mode of this whole style.
+ctxTICK     = input.symbol("USI:TICK", "NQ - TICK", group = grpM7, tooltip = "Normal range +/-600; beyond +/-1000 marks breadth exhaustion. Context-dependent: in RANGE sessions extremes mark reversals, in TRENDS they confirm momentum.")
+ctxADD      = input.symbol("USI:ADD",  "NQ - advance/decline", group = grpM7)
+ctxVOLD     = input.symbol("USI:VOLD", "NQ - up-vol minus down-vol", group = grpM7)
+ctxTRIN     = input.symbol("USI:TRIN", "NQ - TRIN / Arms", group = grpM7, tooltip = "> 2.0 in a decline = capitulation. < 0.5 = frenzied buying that can fade.")
+tickExtreme = input.int(1000, "NQ - TICK extreme", minval = 200, group = grpM7)
+ctxDXY      = input.symbol("TVC:DXY",   "GC - dollar", group = grpM7)
+ctxUS10Y    = input.symbol("TVC:US10Y", "GC - 10y yield", group = grpM7)
+ctxUS02Y    = input.symbol("TVC:US02Y", "GC - 2y yield", group = grpM7, tooltip = "Real (TIPS) yields are the theoretically correct input, not nominals. Post-2022 central-bank buying decoupled gold's LEVEL from real yields; they still transmit intraday but no longer anchor.")
+gammaRegime = input.string("Unknown", "NQ - gamma regime (MANUAL)", options = ["Positive", "Negative", "Unknown"], group = grpM7, tooltip = "Positive gamma: dealers sell strength / buy weakness -> pinning, fade extremes. Negative gamma: moves amplify -> do NOT fade. Pine cannot determine this; set it yourself. 'Unknown' must not be treated as favorable.")
 regimeMethod = input.string("ADX", "Regime method", options = ["ADX", "Range vs ADR", "Both"], group = grpM7)
 adxLen       = input.int(14, "  ADX length", minval = 2, group = grpM7)
 adxTrend     = input.float(25.0, "  ADX trend threshold", minval = 5.0, step = 0.5, group = grpM7, tooltip = "At or above this, treat the session as trending and the fade as hostile.")
-// Overnight -> intraday reversal. The best-evidenced item in the source research:
-// close-to-open predicts open-to-close negatively, documented across four asset
-// classes including index futures, and strongest in the MORNING session.
-useONRev     = input.bool(true, "Overnight -> intraday reversal prior", group = grpM7, tooltip = "A large overnight gap biases the intraday session AGAINST it. Directional prior only, never a standalone trigger.")
-onRevMinPct  = input.float(0.25, "  Minimum overnight move (% of ADR)", minval = 0.0, step = 0.05, group = grpM7)
-onRevAmMin   = input.int(150, "  Prior decays after (minutes from RTH open)", minval = 15, group = grpM7, tooltip = "The effect is strongest in the morning session.")
-// COT. Weekly, Tuesday data released Friday -- context on a weekly horizon, never
-// an intraday timing tool. Availability of these series in Pine is UNVERIFIED.
 useCOT       = input.bool(false, "COT positioning extreme (weekly)", group = grpM7, tooltip = "For gold the signal is never 'commercials are net short' (they structurally are, as hedgers) -- it is how stretched MANAGED MONEY is versus its own multi-year percentile. For Nasdaq the equity-index COT is muddied by hedging and basis trades and is a weaker tool. Symbol availability in Pine is unverified; the module must self-disable if the series does not resolve.")
-cotSym       = input.symbol("", "  COT symbol", group = grpM7)
+cotSym       = input.string("", "  COT symbol", group = grpM7, tooltip = "input.string rather than input.symbol: an empty default is a plain string here, whereas an empty symbol default risks picker validation. M7 must treat an unresolvable series as active = false.")
 cotPctExtreme = input.float(90.0, "  Percentile extreme", minval = 50.0, maxval = 100.0, step = 1.0, group = grpM7)
+
+// ---- M8 - Overnight to intraday reversal prior  [NO category, BIAS ONLY] -----
+// Extracted from M7 (D-021). This is the best-evidenced item in the source
+// research -- close-to-open predicts open-to-close negatively across four asset
+// classes including index futures, strongest in the morning session. But it is a
+// DAILY-HORIZON PRIOR, not a bar-level trigger, so it deliberately does NOT
+// occupy a confluence category and cannot help satisfy the gate. It applies a
+// bounded additive bias to the composite of the side under evaluation.
+grpM8 = "M8 - Overnight reversal prior (bias)"
+useOnRev    = input.bool(true, "Enable overnight reversal prior", group = grpM8)
+onRevMinPct = input.float(0.25, "Minimum overnight move (x ADR)", minval = 0.0, step = 0.05, group = grpM8, tooltip = "Overnight close-to-open displacement as a fraction of average daily range. Below this the prior is too weak to express.")
+onRevSatPct = input.float(0.75, "Saturation overnight move (x ADR)", minval = 0.05, step = 0.05, group = grpM8, tooltip = "Where the prior's magnitude reaches 1.0 before scaling by max influence.")
+onRevAmMin  = input.int(150, "Decay after (minutes from RTH open)", minval = 15, group = grpM8, tooltip = "The documented effect is strongest in the morning session. The prior decays to zero over this window.")
+onRevMaxInf = input.float(0.05, "Maximum influence on composite", minval = 0.0, maxval = 0.25, step = 0.01, group = grpM8, tooltip = "Hard cap on the additive adjustment, in composite units. At 0.05 the prior can move a setup across at most one grade boundary and cannot manufacture a grade from nothing. It is a prior, not evidence.")
+onRevShow   = input.bool(true, "Show in status table", group = grpM8)
 
 // =============================================================================
 // MODULE IMPLEMENTATIONS  --  ALL STUBS
@@ -367,8 +380,7 @@ cotPctExtreme = input.float(90.0, "  Percentile extreme", minval = 50.0, maxval 
 //   - score must be 0..1 and must mean the same thing across modules.
 //   - a module that cannot source its data returns active = false, NEVER a
 //     neutral 0.5. The composite cannot tell a real 0.5 from a fabricated one.
-//   - dir must be honest. dir = 0 contributes to BOTH sides and is how a module
-//     double-counts without anyone noticing.
+//   - dir must be honest. dir = 0 contributes to BOTH sides.
 //   - modules compute; they never draw. Drawing happens in RENDER.
 
 // ---- M1 [E] ------------------------------------------------------------------
@@ -389,11 +401,11 @@ f_mStruct() =>
 // TODO: hybrid profile (D-001). POC/VAH/VAL, HVN/LVN, naked POCs, TPO brackets,
 //       single prints, poor highs/lows, profile shape (D / P / b / double-dist).
 //       Chart-bar-derived POCs must score LOOSER than intrabar-derived ones.
-//       A poor high/low must reduce the score for fading that extreme, not raise it.
+//       A poor high/low REDUCES the score for fading that extreme (D-016).
 f_mProfile() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
-// ---- M4 [F] ⚠ APPROXIMATION ---------------------------------------------------
+// ---- M4 [F] APPROXIMATION ----------------------------------------------------
 // TODO: tick-rule delta from intrabars -> CVD with cvdResetOn -> price/CVD
 //       divergence over deltaDivMin. Gate on deltaReqLvl. Self-disable unless
 //       f_ltfValid(deltaTF).
@@ -409,18 +421,22 @@ f_mExhaust() =>
 
 // ---- M6 [Q] ------------------------------------------------------------------
 // TODO: penetration of a tracked level between sweepMinTicks and sweepMaxTicks,
-//       then a close back inside within reclaimMin. Depends on M2/M3 for levels,
-//       which is the engine's one real inter-module coupling.
+//       then a close back inside within reclaimMin. Depends on M2/M3 for levels.
 f_mSweep() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
 // ---- M7 [C] ------------------------------------------------------------------
 // TODO: family-appropriate context via f_sec at ctxTF; regime (ADX / range-vs-ADR);
-//       overnight-reversal prior; optional COT percentile. Must produce the
-//       sub-score and the hostile flag through INDEPENDENT paths (D-004) --
-//       deriving the cap from a sub-score threshold collapses them into one
-//       signal wearing two hats.
+//       optional COT percentile. Must produce the sub-score and the hostile flag
+//       through INDEPENDENT paths (D-004).
 f_mContext() =>
+    ModuleOut.new(0.0, false, 0, "stub")
+
+// ---- M8 [bias only, no category] ---------------------------------------------
+// TODO: overnight close-to-open displacement as a fraction of ADR, mapped
+//       onRevMinPct..onRevSatPct -> 0..1, decaying to zero over onRevAmMin
+//       minutes from the RTH open. dir OPPOSES the overnight move.
+f_mOnRev() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
 // Hostile-context flag. Independent of M7's sub-score by design.
@@ -439,75 +455,114 @@ mDelta   = f_mDelta()
 mExhaust = f_mExhaust()
 mSweep   = f_mSweep()
 mContext = f_mContext()
+mOnRev   = f_mOnRev()
 
 mods = array.new<ModuleOut>()
 wts  = array.new<float>()
 cats = array.new<int>()
+facs = array.new<float>()
 
-// OFF -> excluded entirely. ON -> weight always counted (D-002).
+// Within-category precedence: first ENABLED module in a category gets factor 1.0,
+// subsequent ones get catDamp. Order below IS the precedence and is deliberate.
+catSeen = array.new<int>(N_CAT, 0)
+
+f_factor(array<int> seen, int cat, float damp) =>
+    n = array.get(seen, cat)
+    array.set(seen, cat, n + 1)
+    n == 0 ? 1.0 : damp
+
+// OFF -> excluded entirely. ON -> effective weight always counted (D-002).
 if useVwap
     array.push(mods, mVwap)
     array.push(wts,  wVwap)
     array.push(cats, CAT_E)
+    array.push(facs, f_factor(catSeen, CAT_E, catDamp))
 if useStruct
     array.push(mods, mStruct)
     array.push(wts,  wStruct)
     array.push(cats, CAT_L)
+    array.push(facs, f_factor(catSeen, CAT_L, catDamp))
 if useProfile
     array.push(mods, mProfile)
     array.push(wts,  wProfile)
     array.push(cats, CAT_L)
+    array.push(facs, f_factor(catSeen, CAT_L, catDamp))
 if useDelta
     array.push(mods, mDelta)
     array.push(wts,  wDelta)
     array.push(cats, CAT_F)
+    array.push(facs, f_factor(catSeen, CAT_F, catDamp))
 if useExhaust
     array.push(mods, mExhaust)
     array.push(wts,  wExhaust)
     array.push(cats, CAT_E)
+    array.push(facs, f_factor(catSeen, CAT_E, catDamp))
 if useSweep
     array.push(mods, mSweep)
     array.push(wts,  wSweep)
     array.push(cats, CAT_Q)
+    array.push(facs, f_factor(catSeen, CAT_Q, catDamp))
 if useContext
     array.push(mods, mContext)
     array.push(wts,  wContext)
     array.push(cats, CAT_C)
+    array.push(facs, f_factor(catSeen, CAT_C, catDamp))
 
-// Evaluate one side. Modules whose dir opposes the side under evaluation
-// contribute 0.0 but KEEP their weight in the denominator -- evidence for a low
-// is not neutral when you are grading a high.
-f_sideEval(array<ModuleOut> m, array<float> w, array<int> c, int side) =>
-    catHit = array.new<bool>(5, false)
-    num = 0.0
-    den = 0.0
+// Evaluate one side. A module whose dir opposes the side contributes 0.0 but
+// KEEPS its effective weight in the denominator (D-015): evidence for a low is
+// not neutral when you are grading a high.
+// `sd` and `nc` are named to avoid shadowing the globals `side` / `nCat` declared
+// below. `outCat` is filled in place -- arrays are passed by reference, which
+// keeps the returned tuple to plain scalars.
+f_sideEval(array<ModuleOut> m, array<float> w, array<int> c, array<float> f, int sd, array<bool> outCat) =>
+    for b = 0 to N_CAT - 1
+        array.set(outCat, b, false)
+    num  = 0.0
+    den  = 0.0
     nAct = 0
     if array.size(m) > 0
         for i = 0 to array.size(m) - 1
             mo = array.get(m, i)
-            wi = array.get(w, i)
-            den := den + wi
-            if mo.active and (mo.dir == side or mo.dir == 0)
-                num := num + mo.score * wi
+            ew = array.get(w, i) * array.get(f, i)
+            den := den + ew
+            if mo.active and (mo.dir == sd or mo.dir == 0)
+                num  := num + mo.score * ew
                 nAct := nAct + 1
-                array.set(catHit, array.get(c, i), true)
-    nCat = 0
-    for b = 0 to 4
-        nCat := nCat + (array.get(catHit, b) ? 1 : 0)
-    [den > 0.0 ? num / den : 0.0, nCat, nAct, array.get(catHit, CAT_F)]
+                array.set(outCat, array.get(c, i), true)
+    nc = 0
+    for b = 0 to N_CAT - 1
+        nc := nc + (array.get(outCat, b) ? 1 : 0)
+    [den > 0.0 ? num / den : 0.0, nc, nAct]
 
-[compLong,  nCatLong,  nActLong,  hasFLong ] = f_sideEval(mods, wts, cats,  1)
-[compShort, nCatShort, nActShort, hasFShort] = f_sideEval(mods, wts, cats, -1)
+catHitL = array.new<bool>(N_CAT, false)
+catHitS = array.new<bool>(N_CAT, false)
 
-longOK  = nCatLong  >= minCats and (not requireOF or hasFLong)
-shortOK = nCatShort >= minCats and (not requireOF or hasFShort)
+[compRawLong,  nCatLong,  nActLong ] = f_sideEval(mods, wts, cats, facs,  1, catHitL)
+[compRawShort, nCatShort, nActShort] = f_sideEval(mods, wts, cats, facs, -1, catHitS)
+
+// Gate composition (D-019). Enforced; only the count is configurable.
+f_gateOK(array<bool> ch, int n) =>
+    hasL = array.get(ch, CAT_L)
+    hasQ = array.get(ch, CAT_Q)
+    hasF = array.get(ch, CAT_F)
+    eventOK = requireOF ? hasF : (hasQ or hasF)
+    hasL and eventOK and n >= minCats
+
+longOK  = f_gateOK(catHitL, nCatLong)
+shortOK = f_gateOK(catHitS, nCatShort)
 
 // Both sides qualifying means the evidence is incoherent, not that both trades
 // are good. Suppress rather than pick the larger number.
 conflict = longOK and shortOK
-side      = conflict ? 0 : longOK ? 1 : shortOK ? -1 : 0
-composite = side == 1 ? compLong : side == -1 ? compShort : 0.0
-nCat      = side == 1 ? nCatLong : side == -1 ? nCatShort : 0
+side     = conflict ? 0 : longOK ? 1 : shortOK ? -1 : 0
+
+compRaw = side == 1 ? compRawLong : side == -1 ? compRawShort : 0.0
+
+// M8 bias: bounded, side-specific, additive. Cannot satisfy the gate and cannot
+// manufacture a grade from nothing (side is already resolved above).
+onRevAdj = (useOnRev and mOnRev.active and side != 0 and mOnRev.dir != 0) ? (mOnRev.dir == side ? mOnRev.score * onRevMaxInf : -mOnRev.score * onRevMaxInf) : 0.0
+
+composite = math.max(0.0, math.min(1.0, compRaw + onRevAdj))
 
 // ---- Grading -----------------------------------------------------------------
 // Internal grade is an int so the context cap is a plain min(): 3=A 2=B 1=C 0=none.
@@ -523,40 +578,45 @@ hasSetup = finalGrade > 0 and barstate.isconfirmed and instOK and tfSupported an
 // =============================================================================
 // RENDER
 // =============================================================================
-// Nothing above draws; nothing here computes. Moving heavy internals to a
-// companion pane later means lifting this section out -- no evaluation code
-// moves with it. (Pine has no cross-script state, so a companion pane means a
-// second script or a library, not an import.)
+// Nothing above draws; nothing here computes.
+
+f_gateStr(array<bool> ch, int n) =>
+    (array.get(ch, CAT_L) ? "L" : "-") + (array.get(ch, CAT_E) ? "E" : "-") + (array.get(ch, CAT_F) ? "F" : "-") + (array.get(ch, CAT_Q) ? "Q" : "-") + (array.get(ch, CAT_C) ? "C" : "-") + " " + str.tostring(n)
 
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 11, border_width = 1)
+        st := table.new(position.top_right, 2, 13, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
     table.cell(st, 1, 1,  aliasName + (instOK ? "" : " (unsupported)"), text_size = size.tiny)
     table.cell(st, 0, 2,  "Contract", text_size = size.tiny)
-    table.cell(st, 1, 2,  syminfo.ticker + (isContinuous ? " ⚠ continuous" : ""), text_size = size.tiny)
+    table.cell(st, 1, 2,  syminfo.ticker + (isContinuous ? " [continuous]" : ""), text_size = size.tiny)
     table.cell(st, 0, 3,  "Chart TF", text_size = size.tiny)
-    table.cell(st, 1, 3,  str.tostring(tfMin, "#.##") + "m" + (tfSupported ? "" : " ⚠ out of design range"), text_size = size.tiny)
+    table.cell(st, 1, 3,  str.tostring(tfMin, "#.##") + "m" + (tfSupported ? "" : " [out of range]"), text_size = size.tiny)
     table.cell(st, 0, 4,  "Tick", text_size = size.tiny)
     table.cell(st, 1, 4,  str.tostring(tick), text_size = size.tiny)
     table.cell(st, 0, 5,  "Session", text_size = size.tiny)
-    table.cell(st, 1, 5,  (inRTH ? "RTH" : inON ? "ON" : "closed") + (inWindow ? " · window" : "") + (inBlackout ? " · BLACKOUT" : ""), text_size = size.tiny)
+    table.cell(st, 1, 5,  (inRTH ? "RTH" : inON ? "ON" : "closed") + (inWindow ? " +window" : "") + (inBlackout ? " BLACKOUT" : ""), text_size = size.tiny)
     table.cell(st, 0, 6,  "Modules on", text_size = size.tiny)
-    table.cell(st, 1, 6,  str.tostring(array.size(wts)) + " / 7", text_size = size.tiny)
-    table.cell(st, 0, 7,  "Categories L/S", text_size = size.tiny)
-    table.cell(st, 1, 7,  str.tostring(nCatLong) + " / " + str.tostring(nCatShort) + "  (need " + str.tostring(minCats) + ")", text_size = size.tiny)
-    table.cell(st, 0, 8,  "Order-flow hit", text_size = size.tiny)
-    table.cell(st, 1, 8,  (hasFLong or hasFShort) ? "yes (approx)" : "no", text_size = size.tiny)
-    table.cell(st, 0, 9,  "Side", text_size = size.tiny)
-    table.cell(st, 1, 9,  sideStr, text_size = size.tiny)
-    table.cell(st, 0, 10, showRaw ? "Composite" : "Grade", text_size = size.tiny)
-    table.cell(st, 1, 10, showRaw ? str.tostring(composite, "#.###") : (gradeStr == "" ? "-" : gradeStr), text_size = size.tiny)
+    table.cell(st, 1, 6,  str.tostring(array.size(wts)) + " / 7  (act L" + str.tostring(nActLong) + " S" + str.tostring(nActShort) + ")", text_size = size.tiny)
+    table.cell(st, 0, 7,  "Long  LEFQC", text_size = size.tiny)
+    table.cell(st, 1, 7,  f_gateStr(catHitL, nCatLong) + (longOK ? " PASS" : " --"), text_size = size.tiny)
+    table.cell(st, 0, 8,  "Short LEFQC", text_size = size.tiny)
+    table.cell(st, 1, 8,  f_gateStr(catHitS, nCatShort) + (shortOK ? " PASS" : " --"), text_size = size.tiny)
+    table.cell(st, 0, 9,  "Gate rule", text_size = size.tiny)
+    table.cell(st, 1, 9,  "L + " + (requireOF ? "F" : "(Q|F)") + " + >=" + str.tostring(minCats), text_size = size.tiny)
+    table.cell(st, 0, 10, "M8 bias", text_size = size.tiny)
+    table.cell(st, 1, 10, onRevShow ? (mOnRev.active ? str.tostring(onRevAdj, "0.000") + " (dir " + str.tostring(mOnRev.dir) + ")" : "idle") : "hidden", text_size = size.tiny)
+    table.cell(st, 0, 11, "Side", text_size = size.tiny)
+    table.cell(st, 1, 11, sideStr, text_size = size.tiny)
+    table.cell(st, 0, 12, showRaw ? "Composite" : "Grade", text_size = size.tiny)
+    table.cell(st, 1, 12, showRaw ? str.tostring(composite, "#.###") : (gradeStr == "" ? "-" : gradeStr), text_size = size.tiny)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
 plot(finalGrade, "Grade (3=A 2=B 1=C)", display = display.data_window)
 plot(side,       "Side (1=long -1=short)", display = display.data_window)
 plot(showRaw ? composite : na, "Composite (raw)", display = display.data_window)
+plot(onRevAdj,   "M8 bias", display = display.data_window)

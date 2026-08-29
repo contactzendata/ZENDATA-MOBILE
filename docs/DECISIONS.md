@@ -258,40 +258,45 @@ the same thing at different quality.
 ---
 
 ## D-013 — Volume sourced from the chart symbol, not the full-size contract
-**Status:** Provisional · 2026-08-29
+**Status:** Accepted · 2026-08-29 · *rationale corrected 2026-08-29*
 
 `useFullSizeVol` defaults **off**. Volume-derived modules (M3, M4, M5) read the
 chart symbol.
 
-**Against the research's own recommendation,** which says to read microstructure
-on the full-size contract (GC/NQ) and execute the micro. That recommendation is
-sound — but its stated reason is **book depth**: micros carry a fraction of the
-resting liquidity and their standalone DOM/tape is too thin to read.
+**Rationale (corrected).** An earlier version of this entry argued the default
+from *contract count* — MNQ ~1.6M ADV vs NQ ~500k — and concluded the micro was
+not the thinner series. **That comparison was invalid.** Contract count is not the
+unit a volume-at-price distribution is built in; notional is. NQ is $20/point
+against MNQ's $2/point, so:
 
-**Pine cannot access book depth at all** (PINE_LIMITS §1). What it reads is bar
-volume, and there the argument does not transfer:
+| | full-size | micro | full-size advantage |
+|---|---|---|---|
+| NQ / MNQ | ~500k × $20/pt = ~$10M/pt | ~1.6M × $2/pt = ~$3.2M/pt | **~3×** |
+| GC / MGC | ~270k × 100oz = ~27M oz | ~301k × 10oz = ~3.0M oz | **~9×** |
 
-- MNQ 2025 ADV ≈ 1.6M contracts vs NQ ≈ 500k. The micro carries *more* contract
-  volume, not less.
-- MGC 2025 record ADV ≈ 300,757 contracts vs GC ≈ 270,000. Comparable by contract
-  count; GC dominates *notional and depth*, which is not what a bar-volume profile
-  measures.
+The full-size contract **is** the heavier volume-at-price series in both families,
+by a wide margin. The research's "read full-size" recommendation is correct for
+bar volume as well as for depth — the earlier entry had the direction of the
+argument backwards.
 
-**Consequence:** the toggle exists and costs up to 2 `request.*` calls when on.
+**So why is the default still off?** Because the intended workflow charts NQ and
+GC directly, where the toggle is a no-op that costs up to 2 `request.*` calls. The
+default follows the workflow, not a claim about which series is better.
 
-**The test that settles this:** build the session profile both ways on the same
-day and compare POC and VAH/VAL placement. If they agree within a tick or two, the
-default stands and the toggle can be removed. If they diverge materially, the
-full-size series is the correct source and the default flips.
+**Consequence:** the toggle's tooltip now states the notional ratios and tells you
+to turn it **on** when charting MNQ/MGC. This is the opposite of the guidance the
+previous rationale implied.
 
-**Wrong if:** micro volume turns out to be dominated by a different participant
-mix (retail/algo splitting into micros) such that the distributions genuinely
-differ in shape rather than scale.
+**Wrong if:** micro and full-size distributions turn out to differ in *shape*
+rather than scale (a genuinely different participant mix), in which case the
+choice becomes a modelling decision rather than a resolution question. The test
+is unchanged: build the session profile both ways on the same day and compare POC
+and VAH/VAL placement.
 
 ---
 
 ## D-014 — Confluence floor counts CATEGORIES, not modules
-**Status:** Accepted · 2026-08-29 · supersedes D-003
+**Status:** Accepted · 2026-08-29 · supersedes D-003 · extended by D-019 (composition) and D-020 (damping)
 
 The floor requires ≥3 **distinct evidence categories** (Location / Extension /
 Order-flow / Liquidity / Context), default 3, matching the source checklist.
@@ -397,3 +402,115 @@ approximation was possible (delta) it was built and labeled; where it is not
 (gamma), no proxy is invented. Inventing a "gamma proxy" from price behavior would
 be the same error as D-016 — a plausible-looking number with no measurement behind
 it.
+
+---
+
+## D-019 — Category composition is enforced, only the count is configurable
+**Status:** Accepted · 2026-08-29 · extends D-014
+
+A grade requires **all three** of:
+
+1. **Location present** — mandatory, no exceptions.
+2. **At least one of {Liquidity, Order-flow}** — something must have *happened*.
+3. **Total distinct categories ≥ `minCats`** — configurable, default 3.
+
+`requireOF` narrows rule 2 from `{Q or F}` to `F` only. Off by default (D-012).
+
+**Over:** D-014's bare count of ≥3. A count treats all category triples as
+equivalent, and they are not. `{Location, Extension, Context}` satisfies a count of
+three while describing a market that is merely *extended near a level in a
+supportive regime* — a description that fits every band-walk on every trend day.
+No event has occurred. That is a watch, not a setup.
+
+**Rationale:** the two mandatory rules encode the framework's actual structure.
+Location is where the whole thesis lives — without it there is no level to fail at,
+and Extension alone is just "price moved a lot". Rule 2 is the *failure* evidence:
+a sweep that reversed (Q) or aggression that stopped working (F). Location plus an
+event is the irreducible core; the third category is corroboration.
+
+**Consequence:** Extension and Context can now never be two of the three on their
+own — they are corroborating categories by construction. This makes M1 and M5
+(both E) and M7 (C) structurally incapable of producing a setup without M2/M3 and
+M6/M4, which is the intended reading of the source framework.
+
+**Consequence for the F category:** with `requireOF` off, **M6 (sweep and reclaim)
+carries rule 2 alone in practice**, since M4 is the approximation. M6's quality
+therefore gates the whole engine far more than its weight of 1.0 suggests. It
+should be among the first modules built and the most carefully tested.
+
+**Wrong if:** the observed hit rate for rule 2 is so low that almost nothing ever
+grades — which would mean the sweep definition (4–40 ticks, 10-minute reclaim) is
+too narrow rather than that the rule is wrong.
+
+---
+
+## D-020 — Within-category damping for the second and subsequent modules
+**Status:** Accepted · 2026-08-29 · extends D-014
+
+The second and subsequent **enabled** modules in a category contribute at
+`catDamp` (default 0.5), applied to **both numerator and denominator**.
+
+**The problem it fixes.** D-014's category floor stopped collinear modules from
+*unlocking* a grade, but they could still *inflate the score*. M2 and M3 are both
+Location: a POC sitting at prior-day high is largely one observation, and under
+flat weighting it paid out twice into the composite. The gate was fixed; the score
+was not.
+
+**Why the denominator is damped too.** If only the numerator were damped, a second
+agreeing module could *lower* the composite — it would add at most `damp × score ×
+w` to the numerator while occupying a full `w` in the denominator. Confirming
+evidence must never reduce a grade. Damping both keeps the composite a true
+fraction of *available* evidence and preserves 1.0 as reachable.
+
+**Precedence is declared push order, not score.** Currently: M1 primary Extension
+(M5 secondary), M2 primary Location (M3 secondary). Each of F, Q and C has one
+member, so damping is inert there today.
+
+**Over:** ranking by contribution so the strongest module in a category takes full
+weight. Rejected because it makes the **denominator score-dependent** — the same
+evidence would yield different composites depending on which module happened to
+score higher — and it leaves an idle module's weight undefined, breaking D-002.
+Declared order is stable, auditable, and independent of the bar.
+
+**Consequence:** the push order in the evaluation section is now load-bearing and
+must be reviewed whenever a module is added or re-categorized. It is a design
+statement ("structural levels are the primary location evidence"), not an
+accident of code layout. `catDamp = 1.0` disables damping.
+
+**Wrong if:** M3 turns out to be the stronger Location signal, in which case the
+push order should swap rather than the mechanism change.
+
+---
+
+## D-021 — Overnight→intraday reversal is a bounded bias, not a category
+**Status:** Accepted · 2026-08-29
+
+Extracted from M7 into its own module **M8**, with its own input group and its own
+status-table line — but it does **not** occupy a confluence category, cannot help
+satisfy the gate, and applies only a bounded additive adjustment to the composite
+of the already-resolved side. Cap is an input, default **0.05**.
+
+**Why extract it.** It is the best-evidenced item in the entire source research —
+close-to-open predicting open-to-close negatively, documented across four asset
+classes including index futures. Burying it inside M7, the noisiest module,
+alongside internals and regime meant its contribution could never be observed or
+falsified separately. It now has an ID and a debug line.
+
+**Why not a category.** It is a **daily-horizon prior**, not a bar-level
+observation. The other seven modules answer "what is true at this bar"; M8 answers
+"which way was today already leaning before this bar existed". Letting it satisfy
+a confluence slot would let a statistical prior stand in for evidence that
+something happened — precisely the substitution D-019 exists to prevent.
+
+**Why capped.** At 0.05 the prior can move a setup across at most one grade
+boundary and cannot manufacture a grade from nothing: `side` is resolved by the
+gate before the bias is applied, so a bar with no qualifying side gets no
+adjustment regardless of how strong the prior is. Evidence decides *whether*;
+the prior only nudges *how good*.
+
+**Consequence:** M8's weight is not in the weights group, because it does not have
+one. Its influence is the cap, and nothing else.
+
+**Wrong if:** measurement shows the prior is strong enough that 0.05 is
+underweighting real information — in which case raise the cap, but keep it a cap.
+Promoting it to a category would still be wrong for the reason above.

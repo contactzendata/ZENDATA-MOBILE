@@ -63,11 +63,15 @@ dollar risk, trade management, execution. This is an `indicator`, not a `strateg
                            M6 Sweep & reclaim       [Q]
                            M7 Context & regime      [C]
                                     │
+                     within-category damping (2nd+ module × 0.5)
+                                    │
                     evaluate LONG side and SHORT side separately
                                     │
-                  category floor: ≥3 DISTINCT categories per side
+              gate: Location AND (Liquidity OR Order-flow) AND ≥3 categories
                                     │
                     both sides qualify → CONFLICT → suppress
+                                    │
+             M8 overnight prior: bounded ± bias on the resolved side (≤0.05)
                                     │
                         A / B / C threshold mapping
                                     │
@@ -99,28 +103,62 @@ Four rules, all load-bearing:
 
 ```
 module OFF                      → excluded from numerator and denominator
-module ON, idle                 → contributes 0.0, weight stays in denominator
-module ON, active, WRONG side   → contributes 0.0, weight stays in denominator
+module ON, idle                 → contributes 0.0, effective weight stays
+module ON, active, WRONG side   → contributes 0.0, effective weight stays
 
-composite(side) = Σ(scoreᵢ × weightᵢ) / Σ(weightᵢ)   over enabled modules,
-                                                      counting only modules whose
-                                                      dir agrees with `side` or is 0
+effective weightᵢ = weightᵢ × factorᵢ
+factorᵢ = 1.0 for the first ENABLED module in its category
+        = catDamp (default 0.5) for the second and subsequent
+
+composite(side) = Σ(scoreᵢ × ewᵢ) / Σ(ewᵢ)   over enabled modules, counting only
+                                              modules whose dir agrees with `side`
+                                              or is 0
 ```
 
 Evidence for a low is not neutral when grading a high, so an opposing module costs
 score rather than being excluded (D-015).
 
-### 2.3 Confluence floor: categories, not modules
+**Within-category damping (D-020).** The category gate stops collinear modules
+from *unlocking* a grade; damping stops them from *inflating the score*. M2 and M3
+are both Location — a POC sitting at prior-day high is largely one observation, and
+under flat weighting it paid out twice. Damping applies to **both numerator and
+denominator**: numerator-only damping would let a second agreeing module *lower*
+the composite, and confirming evidence must never reduce a grade.
 
-The floor counts **distinct categories**, default ≥3. M2 and M3 are both Location:
-firing together they are *one* category, not two independent confirmations. This is
-the structural answer to the collinearity problem — a sweep of a level (Q),
-proximity to that level (L), and a POC at that level (L) are largely one
-observation (D-014).
+Precedence is **declared push order, not score** — M1 primary Extension (M5
+secondary), M2 primary Location (M3 secondary) — so the denominator stays stable
+and an idle module's weight stays well-defined. F, Q and C have one member each,
+so damping is inert there today.
 
-`requireOF` optionally demands an F-category hit. **Off by default**: in Pine that
-would gate every setup on the weakest module in the engine. The honest fix is
-confirming order flow on a footprint platform, not forcing the proxy to carry it.
+### 2.3 Confluence gate: composition, not just count
+
+The gate counts **distinct categories** — M2 and M3 firing together are *one*
+category, not two confirmations (D-014) — and additionally **enforces composition**
+(D-019). A grade requires all three of:
+
+1. **Location present** — mandatory, no exceptions.
+2. **At least one of {Liquidity, Order-flow}** — something must have *happened*.
+3. **Total distinct categories ≥ `minCats`** — configurable, default 3.
+
+Composition is not optional; only the count is. A bare count of three treats all
+category triples as equivalent, and they are not: `{Location, Extension, Context}`
+satisfies a count while describing a market merely *extended near a level in a
+supportive regime* — which fits every band-walk on every trend day. No event has
+occurred. That is a watch, not a setup.
+
+Location is where the thesis lives; rule 2 is the *failure* evidence — a sweep
+that reversed (Q) or aggression that stopped working (F). Location plus an event
+is the irreducible core; the third category is corroboration. Extension and
+Context are therefore corroborating categories by construction and can never be
+two of the three on their own.
+
+`requireOF` narrows rule 2 from `{Q or F}` to `F` only. **Off by default**: in
+Pine that would gate every setup on the weakest module in the engine.
+
+> **Consequence worth planning around:** with `requireOF` off, **M6 carries rule 2
+> alone in practice**, since M4 is the approximation. M6's quality gates the whole
+> engine far more than its weight of 1.0 suggests — it should be among the first
+> modules built and the most carefully tested.
 
 ### 2.4 Grading
 
@@ -192,7 +230,7 @@ forces M3's hybrid sourcing.
 
 ## 3. Modules
 
-### M1 — VWAP extension  ·  category **E**
+### M1 — VWAP extension  ·  category **E** (primary)
 **Inputs:** anchor (RTH open default), RTH-only bands, σ extension start (2.0), σ
 saturation (3.0), warm-up (30m), **band-walk suppression (20m)**, plot toggle.
 
@@ -218,7 +256,7 @@ regime-dependent: 2σ in a compressed overnight is not 2σ on a trend day.
 
 ---
 
-### M2 — Structural levels  ·  category **L**
+### M2 — Structural levels  ·  category **L** (primary)
 **Inputs:** per-level toggles (PDH/PDL, PDC, ONH/ONL, IB, opening range, RTH open,
 round numbers), IB length (60m), OR length (15m), proximity (8 ticks), draw
 toggle; **manual GEX levels** (NQ only, off by default).
@@ -243,7 +281,7 @@ contracts ADV, 59% of total SPX volume.
 
 ---
 
-### M3 — Volume & Market profile  ·  category **L**
+### M3 — Volume & Market profile  ·  category **L** (secondary, damped)
 **Inputs:** rows (48), value area (70%), intrabar TF (1m), historical sessions
 (10), naked POCs, HVN/LVN, TPO structures with 30m brackets, single prints, poor
 highs/lows, 80% rule, draw toggle.
@@ -320,7 +358,7 @@ round-trip speculation, spoofable, and *this module measures a proxy of it*.
 
 ---
 
-### M5 — Exhaustion & RVOL  ·  category **E**
+### M5 — Exhaustion & RVOL  ·  category **E** (secondary, damped)
 **Inputs:** ADR days (20), ADR exhaustion ratio (1.0), RVOL baseline (20 sessions),
 RVOL threshold (1.5), time-of-day bucket (30m), climax multiple (2.0), expected
 move with per-family IV symbol and rule-of-16 divisor (15.87).
@@ -419,6 +457,38 @@ meaningless there.
 
 ---
 
+### M8 — Overnight → intraday reversal prior  ·  **no category, bias only**
+**Inputs:** enable, minimum overnight move (0.25 × ADR), saturation (0.75 × ADR),
+decay window (150 minutes from RTH open), **maximum influence (0.05)**, show in
+status table.
+
+**Method.** Overnight close-to-open displacement as a fraction of ADR, mapped
+`onRevMinPct`..`onRevSatPct` → 0..1, decaying to zero over `onRevAmMin` minutes
+from the RTH open. `dir` **opposes** the overnight move.
+
+**Why it is its own module (D-021).** This is the best-evidenced item in the entire
+source research — close-to-open predicts open-to-close negatively, documented
+across four asset classes including index futures, strongest in the morning
+session. Buried inside M7 alongside internals and regime, its contribution could
+never be observed or falsified separately. It now has an ID and a debug line.
+
+**Why it is not a category.** It is a **daily-horizon prior**, not a bar-level
+observation. The other seven modules answer *"what is true at this bar"*; M8
+answers *"which way was today already leaning before this bar existed"*. Letting
+it fill a confluence slot would let a statistical prior substitute for evidence
+that something happened — exactly what D-019 exists to prevent.
+
+**Why it is capped.** `side` is resolved by the gate *before* the bias applies, so
+a bar with no qualifying side gets no adjustment however strong the prior. At 0.05
+it can move a setup across at most one grade boundary and cannot manufacture a
+grade from nothing. Evidence decides *whether*; the prior nudges *how good*.
+
+**Known weaknesses.** Regime-dependent and decaying, like all documented
+seasonality. The decay window is a guess. It has no weight in the weights group
+because it does not have one — its influence *is* the cap.
+
+---
+
 ## 4. Evidence ledger
 
 Recorded so weights and future changes can be argued from evidence rather than
@@ -452,18 +522,23 @@ confirmed).
 
 Still open:
 
-1. **Grade thresholds** (0.75/0.60/0.45) and **weights** — placeholders, no
-   empirical basis.
-2. **`minCats` = 3** matches the checklist, but whether *which* three matters more
-   than *how many* is untested. Location + Extension without Liquidity is a
-   materially different setup from Location + Liquidity without Extension.
+1. **Grade thresholds** (0.75/0.60/0.45), **weights**, and **`catDamp` = 0.5** —
+   placeholders, no empirical basis.
+2. **Category precedence** (D-020) — M2 over M3 for Location, M1 over M5 for
+   Extension. Defensible but untested; if M3 is the stronger Location signal the
+   push order should swap.
 3. **Should M5 split** into separate Exhaustion and RVOL modules with separate
-   weights?
-4. **Should the overnight-reversal prior be its own module?** It is the
-   best-evidenced item in the entire research document and currently sits as one
-   component inside the noisiest module.
-5. **Volume sourcing** (D-013) — full-size vs chart symbol, currently defaulted off.
-6. **Naked POC decay** — how long does an unfilled POC stay relevant?
+   weights? Note this would make E a three-module category and give damping real
+   work to do there.
+4. **M8's cap** (0.05) and decay window (150m) — both guesses.
+5. **Naked POC decay** — how long does an unfilled POC stay relevant?
+6. **Rule-2 hit rate.** If `{Q or F}` almost never fires, nothing will ever grade.
+   That would indict M6's sweep definition (4–40 ticks, 10-minute reclaim) rather
+   than the rule — but it is the first thing to measure once M6 exists.
+
+Resolved since the last revision: directionality (`dir`), collinearity in both
+gating (D-019) and scoring (D-020), M8's placement (D-021), and the D-013 volume
+question (settled on notional, not contract count).
 
 ---
 
@@ -493,10 +568,15 @@ The engine is layer one of the setup the research recommends:
 | 3 · Execution | MGC / MNQ | Risk-sized execution at the same price through the same matching engine. |
 
 Reading microstructure on the full-size contract is the research's explicit
-recommendation, but note the reason: **depth**, which Pine cannot access at all.
-For *bar volume* the argument does not obviously transfer — MNQ's 2025 ADV
-(~1.6M contracts) exceeds NQ's (~500k). Hence D-013 defaults volume sourcing to the
-chart symbol, with a toggle and a stated test.
+recommendation, and it holds for bar volume too — but the unit is **notional, not
+contract count**. NQ is $20/pt against MNQ's $2/pt, so NQ's ~500k ADV carries ~3×
+MNQ's ~1.6M in notional; GC's ~270k contracts (~27M oz) carry ~9× MGC's ~301k
+(~3M oz). The full-size series is the heavier volume-at-price series in both
+families.
+
+`useFullSizeVol` still defaults **off** — but only because this workflow charts
+NQ/GC directly, where the toggle is a no-op costing 2 `request.*` calls. **Turn it
+on when charting MNQ/MGC** (D-013).
 
 ---
 
