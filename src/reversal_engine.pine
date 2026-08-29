@@ -1039,7 +1039,7 @@ if structShow and barstate.islast
             sw = array.get(lvlSwept, i)
             nr = i == m2NearIdx and m2InWindow
             col = sw ? color.orange : nr ? color.aqua : color.new(color.gray, 40)
-            ln = line.new(bar_index - f_bars(240), lp, bar_index + 3, lp, color = col, width = nr ? 2 : 1, style = sw ? line.style_solid : line.style_dotted)
+            ln = line.new(math.max(0, bar_index - f_bars(240)), lp, bar_index + 3, lp, color = col, width = nr ? 2 : 1, style = sw ? line.style_solid : line.style_dotted)
             array.push(lvlLines, ln)
             lb = label.new(bar_index + 3, lp, array.get(lvlN, i) + (sw ? "*" : ""), style = label.style_label_left, color = color.new(color.black, 100), textcolor = col, size = size.tiny)
             array.push(lvlLabels, lb)
