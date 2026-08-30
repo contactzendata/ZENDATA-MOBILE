@@ -357,6 +357,7 @@ sweepAtrRef  = input.string("Chart TF", "ATR reference", options = ["Chart TF", 
 sweepAtrLen  = input.int(14, "ATR length", minval = 2, group = grpM6)
 sweepMinAtr  = input.float(0.10, "Minimum penetration (x ATR)", minval = 0.01, maxval = 2.0, step = 0.01, group = grpM6, tooltip = "Below this the poke is noise. Typical range 0.05-0.15 on a chart-TF ATR.")
 sweepMaxAtr  = input.float(0.50, "Maximum penetration (x ATR)", minval = 0.02, maxval = 5.0, step = 0.01, group = grpM6, tooltip = "Beyond this it is a breakout, not a sweep. Must exceed the minimum or M6 self-disables.")
+intactMin    = input.int(30, "Level 'intact' lookback (minutes)", minval = 1, group = grpM6, tooltip = "A level counts as INTACT only if EVERY close in this window sat on one side of it. Replaces a one-bar lookback (D-030), which a level being chopped satisfied every other bar forever -- the level flipped intact/broken/intact and re-fired indefinitely. Set to one bar's worth of minutes to restore the old behaviour for comparison.")
 reclaimMin   = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window. Stays MINUTES-based per D-005. The resolved bar count is shown in the status table and warns below 2 bars -- at 1 bar the reclaim must land on the very next bar, which is a materially different (and much rarer) event.")
 sweepHoldMin = input.int(15, "Signal hold (minutes)", minval = 1, group = grpM6, tooltip = "M6 stays active this long after a confirmed reclaim, with the score decaying linearly. Without a hold window M6 fires on ONE bar and the confluence gate would almost never see it align with modules that confirm at different speeds -- and M6 carries gate rule 2 alone (D-019).")
 sweepSpeedW  = input.float(0.6, "Score weight: reclaim speed vs depth", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM6, tooltip = "Speed is weighted higher by default: an immediate close back inside is the strongest evidence the break failed. Depth is the remainder -- a deeper sweep (still inside the max) took more resting liquidity.")
@@ -588,6 +589,16 @@ reclaimBars   = f_bars(reclaimMin)
 holdBars      = f_bars(sweepHoldMin)
 reclaimBarsOK = reclaimBars >= 2
 
+// INTACT TEST (D-030). Independent of any particular level, so computed once
+// outside the level loop rather than per level: the extreme CLOSE over the
+// lookback, offset by one bar so the penetrating bar itself is excluded -- a bar
+// may legitimately penetrate and close beyond the level, with the reclaim
+// arriving later.
+intactBars   = f_bars(intactMin)
+maxClosePrev = ta.highest(close, intactBars)[1]
+minClosePrev = ta.lowest(close,  intactBars)[1]
+intactOK     = not na(maxClosePrev) and not na(minClosePrev)
+
 m6Ready = useSweep and not na(atrRef) and atrRef > 0.0 and maxPen > minPen and array.size(lvlP) > 0
 
 // pending penetrations awaiting a reclaim
@@ -626,6 +637,7 @@ var array<int>   fireByClass = array.new<int>(14, 0)
 var array<float> firedLvls   = array.new<float>()   // levels already fired THIS session
 var int m6PenBars    = 0    // BARS with >=1 penetration, vs m6PenSeen which is level-bars
 var int m6RepeatFire = 0    // fires on a level that already fired this session
+var int m6IntactRej  = 0    // penetrations rejected because the level was not intact
 
 
 if confirmed and rthStart
@@ -663,7 +675,9 @@ if confirmed and m6Ready
         lv = array.get(lvlP, i)
         nm = array.get(lvlN, i)
         // upside sweep: level intact at the prior close, wick through it now
-        if close[1] < lv and high > lv + minPen
+        if high > lv + minPen and not (intactOK and maxClosePrev < lv)
+            m6IntactRej := m6IntactRej + 1
+        if intactOK and maxClosePrev < lv and high > lv + minPen
             m6PenSeen := m6PenSeen + 1
             anyPen := true
             cid = array.get(lvlC, i)
@@ -677,7 +691,9 @@ if confirmed and m6Ready
                     bestHiNm  := nm
                     bestHiCls := cid
         // downside sweep
-        if close[1] > lv and low < lv - minPen
+        if low < lv - minPen and not (intactOK and minClosePrev > lv)
+            m6IntactRej := m6IntactRej + 1
+        if intactOK and minClosePrev > lv and low < lv - minPen
             m6PenSeen := m6PenSeen + 1
             anyPen := true
             cid2 = array.get(lvlC, i)
@@ -1194,7 +1210,7 @@ var string[] CLS_NM = array.from("PDH","PDL","PDC","ONH","ONL","IBH","IBL","ORH"
 var table dt = na
 if sweepDebug and barstate.islast
     if na(dt)
-        dt := table.new(position.bottom_right, 4, 20, border_width = 1)
+        dt := table.new(position.bottom_right, 4, 22, border_width = 1)
     table.cell(dt, 0, 0, "M6 BY CLASS", text_size = size.tiny)
     table.cell(dt, 1, 0, "pen",   text_size = size.tiny)
     table.cell(dt, 2, 0, "fire",  text_size = size.tiny)
@@ -1223,13 +1239,17 @@ if sweepDebug and barstate.islast
     table.cell(dt, 1, 18, str.tostring(pivBars) + "b", text_size = size.tiny)
     table.cell(dt, 2, 18, str.tostring(pivCountPre), text_size = size.tiny)
     table.cell(dt, 3, 18, str.tostring(pivCountPre / (sessN * 1.0), "0.0") + "/sess", text_size = size.tiny)
+    table.cell(dt, 0, 19, "intact lookback", text_size = size.tiny)
+    table.cell(dt, 1, 19, str.tostring(intactBars) + "b", text_size = size.tiny)
+    table.cell(dt, 2, 19, "rejected:", text_size = size.tiny)
+    table.cell(dt, 3, 19, str.tostring(m6IntactRej), text_size = size.tiny)
     lvlListStr = ""
     if array.size(lvlN) > 0
         for i = 0 to array.size(lvlN) - 1
             lvlListStr := lvlListStr + array.get(lvlN, i) + " "
-    table.cell(dt, 0, 19, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
-    table.cell(dt, 1, 19, lvlListStr, text_size = size.tiny)
-    table.merge_cells(dt, 1, 19, 3, 19)
+    table.cell(dt, 0, 20, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
+    table.cell(dt, 1, 20, lvlListStr, text_size = size.tiny)
+    table.merge_cells(dt, 1, 20, 3, 20)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.

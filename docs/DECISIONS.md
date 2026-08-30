@@ -805,3 +805,111 @@ sweep sits on an extreme-type level.
 Until 1–4 exist there is no basis for choosing, and either change made blind would
 double-count or destroy the most common reversal setup in the framework — the same
 risk D-027 was written to avoid.
+
+---
+
+## D-029 — M6 diagnostics are per-class, and count events three ways
+**Status:** Accepted · 2026-08-29
+
+The M6 funnel is broken out by level class, with distinct penetration *bars*
+reported alongside the raw counter, plus repeat fires, intact-test rejections,
+pivot churn, and a live dump of the registry contents.
+
+**Why the raw counter was not enough.** `m6PenSeen` increments **per level, per
+bar, per direction**. It is a count of level-bar observations, not of events, so
+"6249 penetrations" over 41 sessions never meant 6249 things happened. The ratio
+arguments built on it survive (numerator and denominator share the basis) but the
+magnitude arguments do not. `m6PenBars` counts bars with at least one penetration;
+the gap between the two measures the inflation.
+
+**The level dump earns its place.** A reported 42 live levels against a registry
+with exactly 14 push sites and non-`var` arrays is unexplainable from the code.
+Rather than theorise, the table prints the level names. An instrument that
+disagrees with the source is a reason to read the instrument, not to build a
+theory on the reading.
+
+---
+
+## D-030 — "Intact" means N bars on one side, not one
+**Status:** Accepted · 2026-08-29 · replaces the one-bar test in M6
+
+A level counts as intact for an upside sweep only if **every close in the last
+`intactMin` minutes** was below it (mirrored for downside). Default 30 minutes.
+Implemented as `ta.highest(close, intactBars)[1] < lv` — computed **once**, outside
+the level loop, since the extreme close does not depend on which level is being
+tested. The `[1]` offset excludes the penetrating bar, which may legitimately close
+beyond the level with the reclaim arriving later.
+
+**What was wrong.** `close[1] < lv` is a one-bar lookback. A level being chopped
+flips intact/broken/intact on alternating bars, so — with no cooldown anywhere in
+M6 — **a chopping level re-fires every second bar, indefinitely.** That is the
+mechanism behind the label wall, and it is a design omission rather than a
+mis-set parameter.
+
+**Scope of the fix, stated honestly.** This addresses chop around *stable* levels
+(PDH/PDL/ONH/ONL/IB/OR/RTHo). It does **not** address swing levels, and the reason
+is instructive: `lastPH` is the highest high of its window, so every close in that
+window is at or below it by construction. **A freshly confirmed pivot passes the
+intact test automatically.** If SwH/SwL dominate the class breakdown, they need a
+different treatment — a minimum age, a minimum separation from price, or exclusion
+from M6's sweepable set — and that should be chosen from the numbers, not guessed.
+
+**Consequence for sequencing:** this fix may absorb most of what a consumption rule
+was meant to do. Measure after it before building D-031.
+
+**Wrong if:** the rejection counter shows it discarding genuine first touches — a
+level approached for the first time after price crossed it needs `intactBars` clean
+closes before it can be swept, which delays but should not prevent.
+
+---
+
+## D-031 — PROPOSED: per-class re-arm gate (consumption). **Not implemented**
+**Status:** Proposed · 2026-08-29 · awaiting post-D-030 numbers
+
+**The requirement.** Permanent consumption is wrong: PDH swept at 10:00 and swept
+again at 14:00 is a double top, one of the better setups in the framework, and a
+first-sweep-consumes rule produces nothing the second time. The rule must separate
+*a level being chopped* from *a level retested after price meaningfully left and
+returned*.
+
+**Proposed rule.** A level is **armed** by default and becomes **spent** on firing.
+It re-arms only when **both**:
+
+1. **Excursion** — price has traded at least `reArmAtr × ATR` away from the level,
+   on the side it reclaimed to, at any point since the fire.
+2. **Time** — at least `reArmMin` minutes have elapsed since the fire.
+
+Both, not either. Time alone lets slow chop re-arm; distance alone lets a fast
+spike re-arm. The excursion is ATR-scaled for the same reason penetration is
+(D-023).
+
+**Keyed by CLASS, not by price.** The registry rebuilds `lvlP` every bar, so
+price-keyed state would need an unbounded keyed store. But each class holds at most
+one price at a time, so three persistent arrays of 14 — spent price, spent bar, max
+excursion since — suffice, and a class's state resets when its price changes.
+
+That keying exposes something useful: a relocating swing pivot is a *new price*, so
+it resets its own state and re-arms immediately. The rule would therefore do almost
+nothing for swing levels — further evidence that swing levels are a separate
+problem (D-030) rather than a consumption problem.
+
+**Costs and risks.**
+- A genuinely tight double top — one where the pullback is under `reArmAtr` — gets
+  suppressed. That is a real loss, not a hypothetical, so `reArmAtr` should start
+  modest (~0.75–1.0) and **the suppressed fires must be counted**, so the rule can
+  be judged on what it discards as well as what it admits. Same principle as D-024
+  and D-026.
+- Interaction with D-027: M2's proximity damping should stay keyed to M6's *hold
+  window*, not to the spent state. The redundancy D-027 corrects is mechanical to
+  the reclaim, not to the level having been used.
+- Session boundaries deliberately get no special case: excursion-plus-time should
+  handle an overnight sweep followed by an RTH retest without an extra assumption.
+
+**Ranked second, as a possible backstop rather than a replacement:** a hard cap of
+N fires per class per session. Blunt, carries no notion of what happened in
+between, but it bounds the label wall directly and is trivial to reason about.
+
+**Do not implement until** the post-D-030 class breakdown is in. If the intact fix
+alone brings the rate into single digits per session, this rule may be unnecessary
+complexity — and it is easier to add it later than to disentangle it from a fix
+that was already sufficient.
