@@ -353,6 +353,7 @@ emDivisor        = input.float(15.87, "  Rule-of-16 divisor", minval = 1.0, step
 // so the fractions can be sanity-checked against the chart in front of you.
 grpM6 = "M6 - Sweep and reclaim (Q)"
 useSweep     = input.bool(true, "Enable sweep and reclaim", group = grpM6)
+sweepUseSwings = input.bool(false, "Allow swing pivots to be swept", group = grpM6, tooltip = "OFF by default (D-032). The mismatch is DEFINITIONAL, not a tuning problem: lastPH is the highest high of its own window, so every close in that window is at or below it by construction and a freshly confirmed pivot passes any intact test automatically. It is also relocated to wherever price just was, so it is almost always the nearest level. Swings stay in the registry as M2 location context -- proximity to a recent extreme is real information -- they simply cannot be 'swept' in the sense M6 means. Turning this on restores the measured 4.0 and 4.6 fires/session from SwH/SwL.")
 sweepAtrRef  = input.string("Chart TF", "ATR reference", options = ["Chart TF", "Daily"], group = grpM6, tooltip = "Chart TF self-normalizes to the resolution you trade: a sweep on 15m is a bigger event than on 5m, and the bands scale with it. Daily is timeframe-invariant and normalizes only across instruments. Chart TF is the default; check the resolved tick equivalents in the status table and pick whichever produces sane numbers on YOUR chart.")
 sweepAtrLen  = input.int(14, "ATR length", minval = 2, group = grpM6)
 sweepMinAtr  = input.float(0.10, "Minimum penetration (x ATR)", minval = 0.01, maxval = 2.0, step = 0.01, group = grpM6, tooltip = "Below this the poke is noise. Typical range 0.05-0.15 on a chart-TF ATR.")
@@ -360,6 +361,9 @@ sweepMaxAtr  = input.float(0.50, "Maximum penetration (x ATR)", minval = 0.02, m
 intactMin    = input.int(30, "Level 'intact' lookback (minutes)", minval = 1, group = grpM6, tooltip = "A level counts as INTACT only if EVERY close in this window sat on one side of it. Replaces a one-bar lookback (D-030), which a level being chopped satisfied every other bar forever -- the level flipped intact/broken/intact and re-fired indefinitely. Set to one bar's worth of minutes to restore the old behaviour for comparison.")
 reclaimMin   = input.int(10, "Reclaim window (minutes)", minval = 1, group = grpM6, tooltip = "Price must close back inside the swept level within this window. Stays MINUTES-based per D-005. The resolved bar count is shown in the status table and warns below 2 bars -- at 1 bar the reclaim must land on the very next bar, which is a materially different (and much rarer) event.")
 sweepHoldMin = input.int(15, "Signal hold (minutes)", minval = 1, group = grpM6, tooltip = "M6 stays active this long after a confirmed reclaim, with the score decaying linearly. Without a hold window M6 fires on ONE bar and the confluence gate would almost never see it align with modules that confirm at different speeds -- and M6 carries gate rule 2 alone (D-019).")
+useReArm     = input.bool(true, "Re-arm gate (consumption)", group = grpM6, tooltip = "D-031. After a level fires it is SPENT and cannot fire again until price has BOTH travelled a real distance away from it AND time has passed. Both, not either: time alone lets slow chop re-arm, distance alone lets a fast spike re-arm. This is what separates a level being chopped from a genuine retest -- a double top at 10:00 and 14:00 still fires twice.")
+reArmAtr     = input.float(0.75, "  Re-arm excursion (x ATR)", minval = 0.0, maxval = 5.0, step = 0.05, group = grpM6, tooltip = "How far price must travel away from the level, on the side it reclaimed to, before the level can fire again. ATR-scaled for the same reason penetration is (D-023). LOOSEN THIS FIRST if the fire rate lands too low -- a tight double top whose pullback is under this threshold gets suppressed, which is a real cost.")
+reArmMin     = input.int(45, "  Re-arm minimum elapsed (minutes)", minval = 1, group = grpM6, tooltip = "Minutes since the fire. Minutes-based per D-005.")
 sweepSpeedW  = input.float(0.6, "Score weight: reclaim speed vs depth", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM6, tooltip = "Speed is weighted higher by default: an immediate close back inside is the strongest evidence the break failed. Depth is the remainder -- a deeper sweep (still inside the max) took more resting liquidity.")
 sweepShow    = input.bool(true, "Mark sweeps", group = grpM6)
 sweepDebug   = input.bool(true, "Show M6 diagnostics in status table", group = grpM6, tooltip = "Resolved tick equivalents, the penetration funnel, and the raw fire rate per session. Turn off once M6 is characterized.")
@@ -504,67 +508,82 @@ rDn = math.floor(close / rStep) * rStep
 lvlP = array.new<float>()
 lvlN = array.new<string>()
 lvlC = array.new<int>()      // class id, parallel to lvlP/lvlN (diagnostics)
+lvlSwp = array.new<bool>()   // is this level SWEEPABLE by M6? (D-032)
 
 if sPDHL
     if not na(pdH)
         array.push(lvlP, pdH)
         array.push(lvlN, "PDH")
         array.push(lvlC, 0)
+        array.push(lvlSwp, true)
     if not na(pdL)
         array.push(lvlP, pdL)
         array.push(lvlN, "PDL")
         array.push(lvlC, 1)
+        array.push(lvlSwp, true)
 if sPDC and not na(pdC)
     array.push(lvlP, pdC)
     array.push(lvlN, "PDC")
     array.push(lvlC, 2)
+    array.push(lvlSwp, true)
 if sONHL
     if not na(onH)
         array.push(lvlP, onH)
         array.push(lvlN, "ONH")
         array.push(lvlC, 3)
+        array.push(lvlSwp, true)
     if not na(onL)
         array.push(lvlP, onL)
         array.push(lvlN, "ONL")
         array.push(lvlC, 4)
+        array.push(lvlSwp, true)
 if sIB
     if not na(ibH)
         array.push(lvlP, ibH)
         array.push(lvlN, "IBH")
         array.push(lvlC, 5)
+        array.push(lvlSwp, true)
     if not na(ibL)
         array.push(lvlP, ibL)
         array.push(lvlN, "IBL")
         array.push(lvlC, 6)
+        array.push(lvlSwp, true)
 if sOR
     if not na(orH)
         array.push(lvlP, orH)
         array.push(lvlN, "ORH")
         array.push(lvlC, 7)
+        array.push(lvlSwp, true)
     if not na(orL)
         array.push(lvlP, orL)
         array.push(lvlN, "ORL")
         array.push(lvlC, 8)
+        array.push(lvlSwp, true)
 if sRTHopen and not na(rthOpen)
     array.push(lvlP, rthOpen)
     array.push(lvlN, "RTHo")
     array.push(lvlC, 9)
+    array.push(lvlSwp, true)
 if sSwing
     if not na(lastPH)
         array.push(lvlP, lastPH)
         array.push(lvlN, "SwH")
         array.push(lvlC, 10)
+        array.push(lvlSwp, sweepUseSwings)
     if not na(lastPL)
         array.push(lvlP, lastPL)
         array.push(lvlN, "SwL")
         array.push(lvlC, 11)
+        array.push(lvlSwp, sweepUseSwings)
 if sRound
     array.push(lvlP, rUp)
     array.push(lvlN, "Rnd+")
     array.push(lvlC, 12)
+    array.push(lvlSwp, true)
     array.push(lvlP, rDn)
     array.push(lvlN, "Rnd-")
     array.push(lvlC, 13)
+    array.push(lvlSwp, true)
 
 // =============================================================================
 // M6 ENGINE  --  sweep and reclaim (category Q)
@@ -594,6 +613,7 @@ reclaimBarsOK = reclaimBars >= 2
 // lookback, offset by one bar so the penetrating bar itself is excluded -- a bar
 // may legitimately penetrate and close beyond the level, with the reclaim
 // arriving later.
+reArmBars    = f_bars(reArmMin)
 intactBars   = f_bars(intactMin)
 maxClosePrev = ta.highest(close, intactBars)[1]
 minClosePrev = ta.lowest(close,  intactBars)[1]
@@ -638,6 +658,16 @@ var array<float> firedLvls   = array.new<float>()   // levels already fired THIS
 var int m6PenBars    = 0    // BARS with >=1 penetration, vs m6PenSeen which is level-bars
 var int m6RepeatFire = 0    // fires on a level that already fired this session
 var int m6IntactRej  = 0    // penetrations rejected because the level was not intact
+var int m6ReArmSup   = 0    // IN-BAND penetrations skipped because the class was spent
+
+// ---- D-031 re-arm state. Keyed by CLASS, not by price: the registry rebuilds
+// lvlP every bar, so price-keyed state would need an unbounded store, but each
+// class holds at most one price at a time. A class whose price CHANGES (session
+// roll, relocated pivot) has its state cleared -- the old level no longer exists.
+var array<float> clsSpentPx  = array.new<float>(14, na)
+var array<int>   clsSpentBar = array.new<int>(14, -1)
+var array<int>   clsSpentDir = array.new<int>(14, 0)
+var array<float> clsExcursn  = array.new<float>(14, 0.0)
 
 
 if confirmed and rthStart
@@ -674,6 +704,29 @@ if confirmed and m6Ready
     for i = 0 to array.size(lvlP) - 1
         lv = array.get(lvlP, i)
         nm = array.get(lvlN, i)
+        ci = array.get(lvlC, i)
+
+        // --- D-031: maintain spent state for this class -----------------------
+        spPx = array.get(clsSpentPx, ci)
+        if not na(spPx)
+            if math.abs(lv - spPx) > tick
+                // the level relocated: the price that was spent no longer exists
+                array.set(clsSpentPx,  ci, na)
+                array.set(clsSpentBar, ci, -1)
+                array.set(clsExcursn,  ci, 0.0)
+            else
+                sd = array.get(clsSpentDir, ci)
+                ex = array.get(clsExcursn, ci)
+                array.set(clsExcursn, ci, sd == -1 ? math.max(ex, spPx - low) : sd == 1 ? math.max(ex, high - spPx) : ex)
+
+        // --- armed? ------------------------------------------------------------
+        armed = true
+        spPx2 = array.get(clsSpentPx, ci)
+        if useReArm and not na(spPx2)
+            spBar = array.get(clsSpentBar, ci)
+            armed := array.get(clsExcursn, ci) >= reArmAtr * atrRef and spBar >= 0 and (bar_index - spBar) >= reArmBars
+
+        sweepable = array.get(lvlSwp, i) and armed
         // upside sweep: level intact at the prior close, wick through it now
         if high > lv + minPen and not (intactOK and maxClosePrev < lv)
             m6IntactRej := m6IntactRej + 1
@@ -685,7 +738,9 @@ if confirmed and m6Ready
             penH = high - lv
             if penH <= maxPen
                 m6InBand := m6InBand + 1
-                if penH > bestHiPen
+                if not sweepable
+                    m6ReArmSup := m6ReArmSup + 1
+                if sweepable and penH > bestHiPen
                     bestHiPen := penH
                     bestHiLvl := lv
                     bestHiNm  := nm
@@ -701,7 +756,9 @@ if confirmed and m6Ready
             penL = lv - low
             if penL <= maxPen
                 m6InBand := m6InBand + 1
-                if penL > bestLoPen
+                if not sweepable
+                    m6ReArmSup := m6ReArmSup + 1
+                if sweepable and penL > bestLoPen
                     bestLoPen := penL
                     bestLoLvl := lv
                     bestLoNm  := nm
@@ -735,6 +792,11 @@ if confirmed and m6Ready
         fireHiPrice := pHiLvl
         if pHiCls >= 0
             array.set(fireByClass, pHiCls, array.get(fireByClass, pHiCls) + 1)
+            // spent: a high was swept, so price reclaimed BELOW the level
+            array.set(clsSpentPx,  pHiCls, pHiLvl)
+            array.set(clsSpentBar, pHiCls, bar_index)
+            array.set(clsSpentDir, pHiCls, -1)
+            array.set(clsExcursn,  pHiCls, 0.0)
         dupH = false
         if array.size(firedLvls) > 0
             for k = 0 to array.size(firedLvls) - 1
@@ -759,6 +821,11 @@ if confirmed and m6Ready
         fireLoPrice := pLoLvl
         if pLoCls >= 0
             array.set(fireByClass, pLoCls, array.get(fireByClass, pLoCls) + 1)
+            // spent: a low was swept, so price reclaimed ABOVE the level
+            array.set(clsSpentPx,  pLoCls, pLoLvl)
+            array.set(clsSpentBar, pLoCls, bar_index)
+            array.set(clsSpentDir, pLoCls, 1)
+            array.set(clsExcursn,  pLoCls, 0.0)
         dupL = false
         if array.size(firedLvls) > 0
             for k = 0 to array.size(firedLvls) - 1
@@ -1219,7 +1286,8 @@ if sweepDebug and barstate.islast
     for c = 0 to 13
         pc = array.get(penByClass, c)
         fc = array.get(fireByClass, c)
-        table.cell(dt, 0, c + 1, array.get(CLS_NM, c) + (pc == 0 and fc == 0 ? " (off)" : ""), text_size = size.tiny)
+        noSw = (c == 10 or c == 11) and not sweepUseSwings
+        table.cell(dt, 0, c + 1, array.get(CLS_NM, c) + (noSw ? " [no-sw]" : pc == 0 and fc == 0 ? " (off)" : ""), text_size = size.tiny)
         table.cell(dt, 1, c + 1, str.tostring(pc), text_size = size.tiny)
         table.cell(dt, 2, c + 1, str.tostring(fc), text_size = size.tiny)
         table.cell(dt, 3, c + 1, str.tostring(fc / (sessN * 1.0), "0.0"), text_size = size.tiny)
@@ -1247,6 +1315,10 @@ if sweepDebug and barstate.islast
     if array.size(lvlN) > 0
         for i = 0 to array.size(lvlN) - 1
             lvlListStr := lvlListStr + array.get(lvlN, i) + " "
+    table.cell(dt, 0, 21, "re-arm suppressed", text_size = size.tiny)
+    table.cell(dt, 1, 21, str.tostring(m6ReArmSup), text_size = size.tiny)
+    table.cell(dt, 2, 21, useReArm ? (str.tostring(reArmAtr, "0.00") + "atr/" + str.tostring(reArmBars) + "b") : "OFF", text_size = size.tiny)
+    table.cell(dt, 3, 21, "~" + str.tostring(m6ReArmSup * 0.59, "0") + " fires", text_size = size.tiny)
     table.cell(dt, 0, 20, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
     table.cell(dt, 1, 20, lvlListStr, text_size = size.tiny)
     table.merge_cells(dt, 1, 20, 3, 20)

@@ -863,8 +863,8 @@ closes before it can be swept, which delays but should not prevent.
 
 ---
 
-## D-031 — PROPOSED: per-class re-arm gate (consumption). **Not implemented**
-**Status:** Proposed · 2026-08-29 · awaiting post-D-030 numbers
+## D-031 — Per-class re-arm gate (consumption)
+**Status:** Accepted · 2026-08-29 · implemented after the post-D-030 measurement
 
 **The requirement.** Permanent consumption is wrong: PDH swept at 10:00 and swept
 again at 14:00 is a double top, one of the better setups in the framework, and a
@@ -909,7 +909,73 @@ problem (D-030) rather than a consumption problem.
 N fires per class per session. Blunt, carries no notion of what happened in
 between, but it bounds the label wall directly and is trivial to reason about.
 
-**Do not implement until** the post-D-030 class breakdown is in. If the intact fix
-alone brings the rate into single digits per session, this rule may be unnecessary
-complexity — and it is easier to add it later than to disentangle it from a fix
-that was already sufficient.
+**Implemented as specified.** The post-D-030 measurement settled it: the intact fix
+alone cut GC from 50.2 to 21.5 fires/session (−57%), but **46% of the remaining 882
+fires were repeats on a level that had already fired that session**. Too large to
+leave, and it persists beyond the swing removal — PDC (2.1/session) and RTHo
+(1.7/session) are both above the 1.0–1.3 of the other stable classes.
+
+Defaults: `reArmAtr` 0.75, `reArmMin` 45 minutes.
+
+**Suppression is counted, but the counter is an upper bound and is labelled as
+one.** `m6ReArmSup` counts *in-band penetrations skipped because the class was
+spent*, not fires that would have occurred — an exact count would need a shadow
+reclaim state machine running on suppressed levels. The observed in-band→fire
+ratio was 882/1494 ≈ 59%, so the table shows `~N × 0.59 fires` as an estimate
+beside the raw count. Read it as an estimate.
+
+**Unarmed levels are excluded from candidate selection, not merely from firing.**
+M6 keeps one pending per side and takes the deepest in-band penetration. If a spent
+level could win that selection and then be suppressed at fire time, it would block
+an armed level's opportunity on the same bar. So the filter is applied where the
+candidate is chosen.
+
+**If the rate lands below ~3/session, `reArmAtr` is the first thing to loosen** —
+that is the parameter that suppresses tight double tops, which are real setups.
+
+---
+
+## D-032 — Swing pivots stay in the registry but leave M6's sweepable set
+**Status:** Accepted · 2026-08-29
+
+`sweepUseSwings` defaults **off**. SwH/SwL remain in the level registry and remain
+available to M2 as location context; they are simply not sweepable.
+
+**Measured.** On GC 5m over 41 sessions, SwH and SwL — 2 of 12 classes — produced
+**35% of penetrations (949/2715) and 40% of fires (354/882)**, at 4.0 and 4.6 per
+session against 1.0–2.1 for every other class.
+
+**The mismatch is definitional, not a matter of degree**, which is why the fix is
+removal rather than a minimum-age or minimum-separation filter:
+
+1. `lastPH` is the highest high of its own window, so **every close in that window
+   is at or below it by construction**. A freshly confirmed pivot passes any
+   intact test automatically — D-030 cannot touch it, and no stricter version
+   could.
+2. The level is **relocated to wherever price just was**, so it is almost always
+   the nearest level to price and therefore the most penetration-prone.
+3. Under D-031 a relocated pivot is a *new price*, so it resets its own re-arm
+   state and re-arms immediately. Consumption cannot touch it either.
+
+A filter tuned against any of these three would be fighting the definition. A swing
+pivot is a description of where price has recently been; a sweep is an excursion
+through a level that was *established before* price arrived. Those are different
+objects.
+
+**Why they stay in the registry.** Proximity to a recent extreme is real location
+information and M2 should have it. Removing them from the registry entirely would
+discard that to fix an unrelated problem.
+
+**Side effect, and it is a benefit.** M2 and M6 now operate on **partially
+different level sets**. That reduces the D-027 cross-category collinearity
+*structurally* rather than by damping: a swing level can supply M2's Location
+without any possibility of M6 also claiming Liquidity for the same price. D-027's
+damping still applies to the levels both modules share.
+
+**Reversible by input**, so the measured 4.0 and 4.6 per session can be restored
+for comparison.
+
+**Wrong if:** M6's fire rate on the remaining classes turns out too sparse to
+satisfy gate rule 2 (D-019), where M6 carries the requirement alone. The answer
+then is a better-defined swing level — one established and then *left* before being
+tested — not re-admitting the current definition.
