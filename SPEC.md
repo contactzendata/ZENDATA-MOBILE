@@ -3,7 +3,7 @@
 **Target:** TradingView Pine Script v6, single indicator, `overlay = true`
 **Instruments:** NQ (E-mini Nasdaq-100, CME) · GC (Gold, COMEX) — micros MNQ/MGC as aliases
 **Chart timeframes:** 1m, 5m, 15m
-**Status:** L0 registry, M2 and M6 implemented. M1, M3, M4, M5, M7, M8 are stubs.
+**Status:** L0 registry, M2 and M6 implemented. M1, M3, M4, M5, M7, M8 are stubs. Module work paused pending the D-035 blind review — see `docs/OPEN_ITEMS.md`.
 
 > Educational/research only. Counter-trend trading has a structurally low win rate
 > and asymmetric blow-up risk. Every threshold below is an untested hypothesis.
@@ -632,6 +632,8 @@ on when charting MNQ/MGC** (D-013).
 | `src/reversal_engine.pine` | The indicator. Scaffold, inputs, directional composite, grading. |
 | `docs/PINE_LIMITS.md` | Platform constraints. Read before proposing a module. |
 | `docs/DECISIONS.md` | Running log, D-001 onward. |
+| `docs/OPEN_ITEMS.md` | Status reconciliation: what is decided, what is open, what each open item waits on. |
+| `docs/REVIEW_PROTOCOL.md` | The M6 blind review — buckets, matching rule, miss tags, pre-registered interpretation. |
 
 ## 9. Disclaimer
 

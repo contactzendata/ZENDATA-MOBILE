@@ -1046,7 +1046,7 @@ are innocent and the bug is the double-pending path above.
 ---
 
 ## D-034 — Barrier-type vs reference-type levels: classify and measure
-**Status:** Accepted (measurement stage) · 2026-08-29
+**Status:** Accepted · CLOSED by measurement · 2026-08-29
 
 **The argument, which is sound.** A sweep is a liquidity event: resting stops beyond
 a level are triggered and price rejects. Stops cluster beyond **extremes** —
@@ -1180,6 +1180,10 @@ order.
 **Supporting change:** sweep labels now carry class, score, penetration in ticks and
 bars-to-reclaim, with opacity graded by score (solid >= 0.70, mid >= 0.45, faint
 below), so agreement can be scored at a glance without hovering each marker.
+
+**The scoring definition lives in `docs/REVIEW_PROTOCOL.md`**, written before the
+results so the interpretation is pre-registered rather than reconstructed after the
+numbers arrive.
 
 **Implementation note.** The level-drawing CLEAR now runs unconditionally rather
 than inside the draw condition. Previously, disabling drawings left the last
