@@ -1045,8 +1045,8 @@ are innocent and the bug is the double-pending path above.
 
 ---
 
-## D-034 — PROPOSED: barrier-type vs reference-type levels. **Not implemented**
-**Status:** Proposed · 2026-08-29
+## D-034 — Barrier-type vs reference-type levels: classify and measure
+**Status:** Accepted (measurement stage) · 2026-08-29
 
 **The argument, which is sound.** A sweep is a liquidity event: resting stops beyond
 a level are triggered and price rejects. Stops cluster beyond **extremes** —
@@ -1079,13 +1079,36 @@ its own and needed no counts: a pivot passes any intact test by construction. He
 the argument is structural but the evidence offered for it is a raw rate, and raw
 rates are exposure-confounded.
 
-**Proposed sequencing:**
-1. Add the `barrier` / `reference` classification to the registry as a field. It is
-   needed regardless — **D-028 requires exactly this field** for the M1 damping
-   question (M1's redundancy is with *being at a session extreme*, which is the
-   same distinction). One field, two open items.
-2. Add per-class exposure counting: bars where the level sat within the proximity
-   window of price.
-3. Leave reference-type levels **sweepable** initially, and compare fires per
-   exposure-bar across the two groups.
-4. Flip the default only if the normalized rate confirms the raw ordering.
+**Implemented as a measurement, not yet as a filter.**
+
+1. `CLS_TYP`, a class-indexed constant: 0 = BARRIER (PDH/PDL, ONH/ONL, IBH/IBL,
+   ORH/ORL, SwH/SwL), 1 = REFERENCE (PDC, RTHo, Rnd±). **This is the same field
+   D-028 needs** for the M1 damping question — M1's redundancy is with *being at a
+   session extreme*, which is exactly this distinction. Added once, serving both;
+   do not add a second.
+2. **Exposure** is counted per class as bars in which the level sat within one
+   `maxPen` of price — bars on which a sweep of it was *geometrically possible*.
+   That is the correct denominator. Proximity in M2's sense (`structProx`) would be
+   the wrong window: it measures where a setup could be scored, not where a sweep
+   could occur.
+3. `sweepUseReference` defaults **ON**, deliberately, so the two groups can be
+   compared rather than one being assumed wrong.
+4. The table reports per-class `expBar` and `f/100xb`, plus BARRIER and REFERENCE
+   aggregates. **Flip the default only if reference still leads on `f/100xb`.**
+
+**Why the raw ordering could not settle it.** Fires/session is exposure-confounded:
+a mid-range level is near price far more often than PDH is, so it gets more chances
+to fire. PDC and RTHo having the top two *penetration* counts (245, 218) is exactly
+what mid-range exposure predicts, independent of whether they are the wrong kind of
+level. If they still lead per bar-of-proximity, the structural argument is
+confirmed. If they fall below PDH/PDL, the raw ordering was an artifact and
+excluding them would discard the *better-behaved* level type.
+
+This is the reverse of D-032, where the definitional argument stood without counts:
+a pivot passes any intact test by construction, so no measurement could rescue it.
+Here the argument is structural but the evidence offered for it was a raw rate.
+
+**Noted for when the numbers arrive:** round numbers are classified REFERENCE, but
+they carry a second defect — `ceil(close/step)*step` **relocates** whenever price
+crosses a step boundary, which is the D-032 swing problem again. They are off by
+default; if they are ever enabled they need a fixed anchoring, not just a type.

@@ -354,6 +354,7 @@ emDivisor        = input.float(15.87, "  Rule-of-16 divisor", minval = 1.0, step
 grpM6 = "M6 - Sweep and reclaim (Q)"
 useSweep     = input.bool(true, "Enable sweep and reclaim", group = grpM6)
 sweepUseSwings = input.bool(false, "Allow swing pivots to be swept", group = grpM6, tooltip = "OFF by default (D-032). The mismatch is DEFINITIONAL, not a tuning problem: lastPH is the highest high of its own window, so every close in that window is at or below it by construction and a freshly confirmed pivot passes any intact test automatically. It is also relocated to wherever price just was, so it is almost always the nearest level. Swings stay in the registry as M2 location context -- proximity to a recent extreme is real information -- they simply cannot be 'swept' in the sense M6 means. Turning this on restores the measured 4.0 and 4.6 fires/session from SwH/SwL.")
+sweepUseReference = input.bool(true, "Allow REFERENCE-type levels to be swept", group = grpM6, tooltip = "D-034. Barrier-type levels (PDH/PDL, ONH/ONL, IBH/IBL, ORH/ORL) are extremes that stops rest beyond. Reference-type levels (PDC, RTHo, round numbers) are magnets price rotates around by construction -- arguably not sweepable at all, since rotation across a magnet is the auction working rather than failing. Left ON deliberately so the two groups can be COMPARED on fires per bar-of-proximity. Raw fires/session is exposure-confounded: a mid-range level is near price far more often than PDH is, so it gets more chances. Flip this off only if reference levels still lead after normalization.")
 sweepAtrRef  = input.string("Chart TF", "ATR reference", options = ["Chart TF", "Daily"], group = grpM6, tooltip = "Chart TF self-normalizes to the resolution you trade: a sweep on 15m is a bigger event than on 5m, and the bands scale with it. Daily is timeframe-invariant and normalizes only across instruments. Chart TF is the default; check the resolved tick equivalents in the status table and pick whichever produces sane numbers on YOUR chart.")
 sweepAtrLen  = input.int(14, "ATR length", minval = 2, group = grpM6)
 sweepMinAtr  = input.float(0.10, "Minimum penetration (x ATR)", minval = 0.01, maxval = 2.0, step = 0.01, group = grpM6, tooltip = "Below this the poke is noise. Typical range 0.05-0.15 on a chart-TF ATR.")
@@ -585,6 +586,17 @@ if sRound
     array.push(lvlC, 13)
     array.push(lvlSwp, true)
 
+// Level TYPE, indexed by class id (D-034). 0 = BARRIER, 1 = REFERENCE.
+//   BARRIER   an extreme; a position is protected against it, so stops rest beyond
+//             it and breaking through it is a liquidity event.
+//   REFERENCE a magnet; price rotates around it all session by construction, and
+//             crossing it is ordinary rotation rather than a failed auction.
+// This is the same field D-028 needs for the M1 damping question -- M1's
+// redundancy is with BEING AT A SESSION EXTREME, which is exactly this
+// distinction. Added once, serving both.
+//        PDH PDL PDC ONH ONL IBH IBL ORH ORL RTHo SwH SwL Rnd+ Rnd-
+var array<int> CLS_TYP = array.from(0,  0,  1,  0,  0,  0,  0,  0,  0,  1,   0,  0,  1,   1)
+
 // =============================================================================
 // M6 ENGINE  --  sweep and reclaim (category Q)
 // =============================================================================
@@ -666,6 +678,10 @@ var int m6ReArmSupBars = 0  // BARS with >=1 such skip (comparable to a fire cou
 // fired before since the RTH open -- INCLUDING the legitimate re-armed retest
 // D-031 exists to permit. It is not the population D-031 gates. These are.
 var array<int> repeatByClass = array.new<int>(14, 0)
+// D-034 exposure: BARS in which the level sat within one max-penetration of price,
+// i.e. bars on which a sweep of it was geometrically possible. This is the correct
+// denominator for comparing level types; fires/session is not.
+var array<int> expByClass = array.new<int>(14, 0)
 var int   m6FireSpent   = 0   // fires where the class was SPENT at fire time
 var int   m6ReArmedOK   = 0   //   ...and had satisfied excursion AND time (intended)
 var int   m6Leak        = 0   //   ...and had NOT (must be 0; non-zero = gate leak)
@@ -719,6 +735,10 @@ if confirmed and m6Ready
         nm = array.get(lvlN, i)
         ci = array.get(lvlC, i)
 
+        // D-034 exposure: was a sweep of this level geometrically possible here?
+        if math.abs(close - lv) <= maxPen
+            array.set(expByClass, ci, array.get(expByClass, ci) + 1)
+
         // --- D-031: maintain spent state for this class -----------------------
         spPx = array.get(clsSpentPx, ci)
         if not na(spPx)
@@ -739,7 +759,8 @@ if confirmed and m6Ready
             spBar = array.get(clsSpentBar, ci)
             armed := array.get(clsExcursn, ci) >= reArmAtr * atrRef and spBar >= 0 and (bar_index - spBar) >= reArmBars
 
-        sweepable = array.get(lvlSwp, i) and armed
+        typOK = array.get(CLS_TYP, ci) == 0 or sweepUseReference
+        sweepable = array.get(lvlSwp, i) and armed and typOK
         // upside sweep: level intact at the prior close, wick through it now
         if high > lv + minPen and not (intactOK and maxClosePrev < lv)
             m6IntactRej := m6IntactRej + 1
@@ -1326,22 +1347,28 @@ var string[] CLS_NM = array.from("PDH","PDL","PDC","ONH","ONL","IBH","IBL","ORH"
 var table dt = na
 if sweepDebug and barstate.islast
     if na(dt)
-        dt := table.new(position.bottom_right, 5, 26, border_width = 1)
+        dt := table.new(position.bottom_right, 7, 26, border_width = 1)
     table.cell(dt, 0, 0, "M6 BY CLASS", text_size = size.tiny)
     table.cell(dt, 1, 0, "pen",   text_size = size.tiny)
     table.cell(dt, 2, 0, "fire",  text_size = size.tiny)
     table.cell(dt, 3, 0, "f/sess", text_size = size.tiny)
     table.cell(dt, 4, 0, "rpt", text_size = size.tiny)
+    table.cell(dt, 5, 0, "expBar", text_size = size.tiny)
+    table.cell(dt, 6, 0, "f/100xb", text_size = size.tiny)
     sessN = math.max(1, m6Sessions)
     for c = 0 to 13
         pc = array.get(penByClass, c)
         fc = array.get(fireByClass, c)
-        noSw = (c == 10 or c == 11) and not sweepUseSwings
-        table.cell(dt, 0, c + 1, array.get(CLS_NM, c) + (noSw ? " [no-sw]" : pc == 0 and fc == 0 ? " (off)" : ""), text_size = size.tiny)
+        noSw = ((c == 10 or c == 11) and not sweepUseSwings) or (array.get(CLS_TYP, c) == 1 and not sweepUseReference)
+        tg = array.get(CLS_TYP, c) == 0 ? " B" : " R"
+        table.cell(dt, 0, c + 1, array.get(CLS_NM, c) + tg + (noSw ? " [no-sw]" : ""), text_size = size.tiny)
         table.cell(dt, 1, c + 1, str.tostring(pc), text_size = size.tiny)
         table.cell(dt, 2, c + 1, str.tostring(fc), text_size = size.tiny)
         table.cell(dt, 3, c + 1, str.tostring(fc / (sessN * 1.0), "0.0"), text_size = size.tiny)
         table.cell(dt, 4, c + 1, str.tostring(array.get(repeatByClass, c)), text_size = size.tiny)
+        xb = array.get(expByClass, c)
+        table.cell(dt, 5, c + 1, str.tostring(xb), text_size = size.tiny)
+        table.cell(dt, 6, c + 1, xb > 0 ? str.tostring(100.0 * fc / xb, "0.00") : "-", text_size = size.tiny)
     table.cell(dt, 0, 15, "TOTAL", text_size = size.tiny)
     table.cell(dt, 1, 15, str.tostring(m6PenSeen), text_size = size.tiny)
     table.cell(dt, 2, 15, str.tostring(m6TotFires), text_size = size.tiny)
@@ -1377,13 +1404,32 @@ if sweepDebug and barstate.islast
     table.cell(dt, 2, 22, "re-armed:", text_size = size.tiny)
     table.cell(dt, 3, 22, str.tostring(m6ReArmedOK), text_size = size.tiny)
     table.cell(dt, 4, 22, "LEAK: " + str.tostring(m6Leak), text_size = size.tiny)
+    bFire = 0
+    bExp  = 0
+    rFire = 0
+    rExp  = 0
+    for c = 0 to 13
+        if array.get(CLS_TYP, c) == 0
+            bFire := bFire + array.get(fireByClass, c)
+            bExp  := bExp  + array.get(expByClass, c)
+        else
+            rFire := rFire + array.get(fireByClass, c)
+            rExp  := rExp  + array.get(expByClass, c)
+    table.cell(dt, 0, 24, "BARRIER agg", text_size = size.tiny)
+    table.cell(dt, 2, 24, str.tostring(bFire), text_size = size.tiny)
+    table.cell(dt, 5, 24, str.tostring(bExp), text_size = size.tiny)
+    table.cell(dt, 6, 24, bExp > 0 ? str.tostring(100.0 * bFire / bExp, "0.00") : "-", text_size = size.tiny)
+    table.cell(dt, 0, 25, "REFERENCE agg", text_size = size.tiny)
+    table.cell(dt, 2, 25, str.tostring(rFire), text_size = size.tiny)
+    table.cell(dt, 5, 25, str.tostring(rExp), text_size = size.tiny)
+    table.cell(dt, 6, 25, rExp > 0 ? str.tostring(100.0 * rFire / rExp, "0.00") : "-", text_size = size.tiny)
     table.cell(dt, 0, 23, "re-arm margin (mean)", text_size = size.tiny)
     table.cell(dt, 1, 23, m6ReArmedOK > 0 ? str.tostring(m6ReArmExcSum / m6ReArmedOK, "0.00") + "x thr" : "-", text_size = size.tiny)
     table.cell(dt, 2, 23, "bars:", text_size = size.tiny)
     table.cell(dt, 3, 23, m6ReArmedOK > 0 ? str.tostring(m6ReArmBarSum / (m6ReArmedOK * 1.0), "0.0") + " of " + str.tostring(reArmBars) : "-", text_size = size.tiny)
     table.cell(dt, 0, 20, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
     table.cell(dt, 1, 20, lvlListStr, text_size = size.tiny)
-    table.merge_cells(dt, 1, 20, 4, 20)
+    table.merge_cells(dt, 1, 20, 6, 20)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
