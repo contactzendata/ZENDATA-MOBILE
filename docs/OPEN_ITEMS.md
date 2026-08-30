@@ -12,13 +12,13 @@ Full reasoning for every `D-nnn` lives in `DECISIONS.md`; this is the index.
 | **L0 level registry** | built — 12 live classes, 0 `request.*` calls |
 | **M2 structural levels** (L) | built — proximity and stacking scored separately |
 | **M6 sweep & reclaim** (Q) | built — ~10 fires/session GC 5m, gate verified leak-free |
-| **M1 VWAP extension** (E) | built — session-anchored VWAP, sigma bands, band-walk suppressor |
+| **M1 VWAP extension** (E) | built — session-BLOCK anchored, directional band-walk (D-038) |
 | M8 overnight prior (bias) | **stub** |
 | M3 volume/market profile (L) | **stub** |
 | M4 delta/CVD (F) | **stub** |
 | M5 exhaustion & RVOL (E) | **stub** |
 | M7 context & regime (C) | **stub** |
-| Composite / gate / grading | built — **L + Q + E is now satisfiable, so grades can occur for the first time** |
+| Composite / gate / grading | built — gate opened 17x on GC 5m but **max composite 0.432 < 0.45 floor**; re-measuring after D-038 |
 
 `request.*` budget: **2 call sites**, both wrapped. 1 live (M6 daily ATR, only when
 selected). Compile risk from `ta.pivothigh` with a computed length: **cleared**.

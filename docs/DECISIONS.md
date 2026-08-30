@@ -1248,7 +1248,7 @@ it knows least. Watch the first graded setups after each anchor reset.
 ---
 
 ## D-037 — Gate funnel, and two M1 defects found by reading the code
-**Status:** Accepted (diagnostic) · 2026-08-29 · **defects reported, not yet fixed**
+**Status:** Accepted (diagnostic) · 2026-08-29 · **defects confirmed and fixed in D-038**
 
 M1 landed, category E became fillable, and **nothing graded** on GC 5m across the
 full window. Two of the three candidate explanations are answerable from the source
@@ -1321,3 +1321,84 @@ Two probes target the hypotheses directly:
 
 **No thresholds, weights or `catDamp` touched.** Fitting a threshold to a gate that
 never opens would move the failure somewhere less visible.
+
+---
+
+## D-038 — M1 fixes: session-block anchoring, and a directional band-walk
+**Status:** Accepted · 2026-08-29 · fixes the defects diagnosed in D-037
+
+### The measurement that settled it (GC 5m, 11,268 bars)
+
+| | |
+|---|---|
+| M1 active | 641 (5.7%) |
+| M2 active | 2408 (21.4%) |
+| M6 active | 1491 (13.2%) |
+| ALL THREE | **72** |
+| stage L → L+(Q\|F) → +3rd | 2408 → 332 → **17** |
+| GATE PASS | 17 (0.41/session) |
+| graded C/B/A | **0 / 0 / 0** |
+| max composite | **0.432** against a 0.45 floor |
+| M6 live outside RTH | **1021 of 1491 = 68%** |
+| M1 walk-blocked while M6 live | 180 = 12.1% of M6 |
+
+**Defect B was the binding constraint** at 68%; Defect A real but secondary at
+12.1%; and the composite topped out *below the C floor*, so even the 17 bars that
+cleared the gate had nothing to grade. Three failures stacked, which is why the
+output was not merely sparse but exactly zero.
+
+### Fix B — session-block anchoring, not full-session accumulation
+
+Of the two options in D-037, **accumulating across the whole session while keeping
+the RTH anchor is wrong for GC specifically**. D-007 already holds that the
+23-hour Globex session is not one auction; a VWAP anchored at the pit open but
+accumulating Asian volume would be a mean over a period the instrument does not
+trade as one thing — statistically well-defined and economically meaningless.
+
+Instead the anchor is now **session-aware**: three configurable auction blocks per
+instrument family, anchored at the start of each and accumulating within it.
+
+- **GC:** Asia `1800-0300`, London `0300-0820`, NY pit `0820-1330`
+- **NQ:** Asia `1800-0400`, Europe/pre `0400-0930`, RTH `0930-1600`
+
+`Session blocks` is the new default. **`RTH open` remains available and is the
+right choice for NQ**, where the cash session genuinely is the auction — the
+blocks are exposed as inputs precisely so that stays a choice rather than an
+assumption.
+
+**Outside every block, M1 is now `active = false`.** The old behaviour — holding a
+frozen VWAP and reporting a z-score against a mean that stopped updating hours ago
+— was worse than absence, because it was confidently wrong rather than silent.
+`vwapRthOnly` is removed; the accumulation window is now implied by the anchor.
+
+### Fix A — a band-walk must be *advancing*, not merely *outside*
+
+The old test was `|z| >= vwapSigmaLo` for `bandWalkBars` consecutive bars — the
+same threshold that makes M1 active, so the counter started on the bar M1 became
+eligible and capped its active window at `bandWalkBars − 1` bars.
+
+The new test tracks the running peak of `|z|` for the current excursion and how
+long since that peak was extended:
+
+> **band-walk = outside for `bandWalkBars` **and** the peak extended within the
+> last `m1StallMin` minutes.**
+
+A stalled excursion — beyond the band but no longer making new extremes — is
+exactly the setup, and now scores. A peak that keeps rising is a trend, and is
+suppressed.
+
+**The threshold separation proposed in D-037 was dropped as unnecessary.** Once the
+condition is directional the mechanical cap disappears on its own, because a
+stalled excursion no longer trips the counter regardless of sharing a threshold.
+One fewer knob with no evidence behind it.
+
+### Thresholds deliberately untouched
+
+`0.432` was measured with M1 dead 78% of the time and self-capped at 3 bars in the
+remainder. **It is not evidence about the 0.45 floor.** Any threshold fitted to
+that number would be fitted to two defects. Re-measure first.
+
+**Wrong if:** the blocks turn out to fragment a genuinely continuous auction — the
+London/NY overlap is one move on gold, and the `0820` boundary cuts through it. If
+the NY block's VWAP looks wrong in the first hour, the London block should extend
+through the overlap rather than the boundary being moved.

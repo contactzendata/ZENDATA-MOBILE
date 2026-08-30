@@ -271,8 +271,13 @@ showRaw   = input.bool(false, "Show raw composite (development only)", group = g
 // ---- M1 - VWAP extension  [category E, PRIMARY] ------------------------------
 grpM1 = "M1 - VWAP extension (E)"
 useVwap     = input.bool(true, "Enable VWAP extension", group = grpM1)
-vwapAnchor  = input.string("RTH open", "VWAP anchor", options = ["RTH open", "Session", "Week", "Month", "Overnight open"], group = grpM1, tooltip = "RTH-anchored by default. Overnight volume is too thin for reliable sigma bands.")
-vwapRthOnly = input.bool(true, "Compute bands from RTH volume only", group = grpM1)
+vwapAnchor  = input.string("Session blocks", "VWAP anchor", options = ["Session blocks", "RTH open", "Session", "Week", "Month", "Overnight open"], group = grpM1, tooltip = "SESSION BLOCKS (default, D-038): anchor at the start of each auction block and accumulate within it, so M1 is alive during Asia, London and NY separately rather than dead outside one of them. Each block VWAP then measures a coherent auction. RTH OPEN: one anchor, accumulating only inside RTH -- correct for NQ, where the cash session genuinely IS the auction; on GC it leaves M1 dead for ~78% of the session. Outside every block (or outside RTH) M1 is INACTIVE rather than reporting a z-score against a frozen mean.")
+vwapBlk1NQ  = input.session("1800-0400", "  NQ block 1 (Asia)", group = grpM1)
+vwapBlk2NQ  = input.session("0400-0930", "  NQ block 2 (Europe / pre)", group = grpM1)
+vwapBlk3NQ  = input.session("0930-1600", "  NQ block 3 (RTH)", group = grpM1)
+vwapBlk1GC  = input.session("1800-0300", "  GC block 1 (Asia)", group = grpM1)
+vwapBlk2GC  = input.session("0300-0820", "  GC block 2 (London)", group = grpM1)
+vwapBlk3GC  = input.session("0820-1330", "  GC block 3 (NY pit)", group = grpM1, tooltip = "Matches D-007's pit window. A VWAP anchored at the pit open but accumulating Asian volume would be a mean over a period the instrument does not trade as one auction.")
 vwapB1      = input.float(1.0, "Band 1 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only. ~68% of session action sits inside +/-1 sigma.")
 vwapB2      = input.float(2.0, "Band 2 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only. ~95% inside +/-2 sigma -- a 2-sigma tag is a genuinely extended location.")
 vwapB3      = input.float(2.5, "Band 3 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only.")
@@ -282,6 +287,7 @@ vwapWarmMin = input.int(30, "Anchor warm-up (minutes)", minval = 1, group = grpM
 // BAND-WALK GUARD: mechanically fading a band in a trending session is, per the
 // source research, a leading cause of blow-ups.
 bandWalkMin = input.int(20, "Band-walk suppression (minutes)", minval = 1, group = grpM1, tooltip = "Consecutive closes beyond the score-ramp sigma for this long = a band-walk (trend), not extension. Mechanically fading a walking band is, per the source research, a leading cause of blow-ups. This is the single most important guard in the module.")
+m1StallMin  = input.int(10, "  Stall window (minutes)", minval = 1, group = grpM1, tooltip = "D-038 fix A. A band-walk is price beyond the band AND STILL MAKING NEW EXTREMES. If |z| has not made a new extreme for this long, the excursion has STALLED -- which is the setup, not the thing to suppress. Previously any excursion lasting bandWalkMin was suppressed, which capped M1's active window at bandWalkBars-1 bars and killed it on exactly the bars it existed to score.")
 bandWalkDamp = input.float(0.0, "  Band-walk damping factor", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM1, tooltip = "What the distance term is multiplied by during a band-walk. 0.0 = full suppression, and M1 also goes INACTIVE so category E does not fill -- a trending market must not satisfy the gate's third category. Raise it only if you want band-walks scored rather than rejected.")
 m1ExtremeDamp = input.float(1.0, "  Damp on barrier-level sweep (D-028)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM1, tooltip = "OFF by default (1.0 = no damping). Wired now that CLS_TYP exists so D-028's measurements can run the moment M5 lands, without another registry change. When M6 has an active sweep on a BARRIER-type level, M1's distance is arguably redundant -- sweeps happen at extremes and extremes are where VWAP extension is largest. Do not enable until measured.")
 vwapShow    = input.bool(true, "Plot VWAP and bands", group = grpM1)
@@ -1049,11 +1055,25 @@ chgW = timeframe.change("W")
 chgM = timeframe.change("M")
 // All three evaluated unconditionally: timeframe.change() carries series state and
 // must not sit inside a branch that some bars skip.
+// Auction blocks (D-038). Each block gets its own anchor, so M1 measures one
+// coherent auction at a time instead of a mean across periods the instrument does
+// not trade as one thing.
+vwapB1s = isGC ? vwapBlk1GC : vwapBlk1NQ
+vwapB2s = isGC ? vwapBlk2GC : vwapBlk2NQ
+vwapB3s = isGC ? vwapBlk3GC : vwapBlk3NQ
+inBlk1 = not na(time(timeframe.period, vwapB1s, tz))
+inBlk2 = not na(time(timeframe.period, vwapB2s, tz))
+inBlk3 = not na(time(timeframe.period, vwapB3s, tz))
+m1BlkId = inBlk3 ? 3 : inBlk2 ? 2 : inBlk1 ? 1 : 0
+m1BlkReset = m1BlkId != 0 and m1BlkId != nz(m1BlkId[1], 0)
+
 // Written as an if/else chain rather than a wrapped ternary: Pine ends a statement
 // at a line break whenever the line so far parses as complete, so a continuation
 // line beginning with ":" is a syntax error, not a continuation.
 m1Reset = false
-if vwapAnchor == "RTH open"
+if vwapAnchor == "Session blocks"
+    m1Reset := m1BlkReset
+else if vwapAnchor == "RTH open"
     m1Reset := rthStart
 else if vwapAnchor == "Overnight open"
     m1Reset := onStart
@@ -1064,13 +1084,21 @@ else if vwapAnchor == "Week"
 else
     m1Reset := chgM
 
+// The accumulation window. Outside it M1 is INACTIVE, not stale: reporting a
+// z-score against a mean that stopped updating hours ago is worse than absence.
+m1InWindow = true
+if vwapAnchor == "Session blocks"
+    m1InWindow := m1BlkId != 0
+else if vwapAnchor == "RTH open"
+    m1InWindow := inRTH
+
 var float m1SumV    = 0.0
 var float m1SumPV   = 0.0
 var float m1SumP2V  = 0.0
 var int   m1AnchorT = na
 
-m1Src   = hlc3
-m1UseBar = (not vwapRthOnly) or inRTH
+m1Src    = hlc3
+m1UseBar = m1InWindow
 
 if confirmed
     if m1Reset
@@ -1097,12 +1125,31 @@ m1Warm   = not na(m1AgeMin) and m1AgeMin >= vwapWarmMin
 
 // BAND-WALK: consecutive closes beyond the score ramp. A walking band is trend,
 // not extension, and fading it mechanically is the documented way to blow up.
+// BAND-WALK, directional (D-038 fix A). Beyond the band is not enough -- the
+// excursion must still be ADVANCING. Track the running peak of |z| for the current
+// excursion and how long it has been since that peak was extended. A stalled
+// excursion is the setup; a peak that keeps rising is a trend.
 bandWalkBars = f_bars(bandWalkMin)
+m1StallBars  = f_bars(m1StallMin)
 m1Outside    = not na(m1Z) and math.abs(m1Z) >= vwapSigmaLo
-var int m1OutRun = 0
+var int   m1OutRun   = 0
+var int   m1StallRun = 0
+var float m1ExcPeak  = 0.0
 if confirmed
-    m1OutRun := m1Outside ? m1OutRun + 1 : 0
-m1BandWalk = m1OutRun >= bandWalkBars
+    if m1Outside
+        m1OutRun := m1OutRun + 1
+        m1Az = math.abs(m1Z)
+        if m1Az > m1ExcPeak + 0.01
+            m1ExcPeak  := m1Az
+            m1StallRun := 0
+        else
+            m1StallRun := m1StallRun + 1
+    else
+        m1OutRun   := 0
+        m1StallRun := 0
+        m1ExcPeak  := 0.0
+// Suppress only a walk that is BOTH sustained and still extending its peak.
+m1BandWalk = m1OutRun >= bandWalkBars and m1StallRun < m1StallBars
 
 // term 1: distance
 m1DistRaw = na(m1Z) ? 0.0 : math.min(1.0, math.max(0.0, (math.abs(m1Z) - vwapSigmaLo) / math.max(0.01, vwapSigmaHi - vwapSigmaLo)))
@@ -1122,9 +1169,9 @@ m1Dir = na(m1Z) ? 0 : m1Z > 0.0 ? -1 : m1Z < 0.0 ? 1 : 0
 // A band-walk at full suppression must make M1 INACTIVE, not merely zero-scored:
 // an active module fills category E, and a trending market must never satisfy the
 // gate's third category (D-019).
-m1Active = useVwap and m1Warm and not na(m1Z) and m1Dir != 0 and m1DistRaw > 0.0 and (not m1BandWalk or bandWalkDamp > 0.0)
+m1Active = useVwap and m1InWindow and m1Warm and not na(m1Z) and m1Dir != 0 and m1DistRaw > 0.0 and (not m1BandWalk or bandWalkDamp > 0.0)
 
-m1Note = (na(m1Z) ? "z -" : "z " + str.tostring(m1Z, "0.00")) + (m1BandWalk ? " BANDWALK" : "") + (m1OnBarrier and m1ExtremeDamp < 1.0 ? " bar-damp" : "")
+m1Note = (na(m1Z) ? "z -" : "z " + str.tostring(m1Z, "0.00")) + (not m1InWindow ? " OUT-OF-BLOCK" : "") + (m1BandWalk ? " BANDWALK" : "") + (m1OnBarrier and m1ExtremeDamp < 1.0 ? " bar-damp" : "")
 
 // =============================================================================
 // MODULE IMPLEMENTATIONS  --  M1 + M2 + M6 LIVE, REST ARE STUBS
@@ -1381,8 +1428,8 @@ var array<int> gfHist = array.new<int>(6, 0)
 // hypothesis probes
 var int gfWalkBlk    = 0   // M1 suppressed by band-walk while otherwise eligible
 var int gfM6AndWalk  = 0   // ...on a bar where M6 was live: mutual exclusion
-var int gfM6Rth      = 0   // M6 live inside RTH  (M1 anchor accumulating)
-var int gfM6Off      = 0   // M6 live outside RTH (M1 anchor frozen, if vwapRthOnly)
+var int gfM6InWin    = 0   // M6 live while M1's accumulation window is OPEN
+var int gfM6OutWin    = 0  // M6 live while it is CLOSED -- the dead zone (D-038 fix B)
 
 f_stgL(array<bool> ch) =>
     array.get(ch, CAT_L)
@@ -1434,10 +1481,10 @@ if confirmed and instOK and tfSupported
         if m6Active
             gfM6AndWalk := gfM6AndWalk + 1
     if m6Active
-        if inRTH
-            gfM6Rth := gfM6Rth + 1
+        if m1InWindow
+            gfM6InWin := gfM6InWin + 1
         else
-            gfM6Off := gfM6Off + 1
+            gfM6OutWin := gfM6OutWin + 1
 
 // =============================================================================
 // RENDER
@@ -1556,7 +1603,7 @@ if showStatus and barstate.islast
         table.cell(st, 1, 27, str.tostring(m2Score, "0.000") + "  = " + str.tostring(structProxW, "0.0") + "*prox + " + str.tostring(1.0 - structProxW, "0.0") + "*stack", text_size = size.tiny)
     if vwapDebug
         table.cell(st, 0, 28, "-- M1 --", text_size = size.tiny)
-        table.cell(st, 1, 28, m1Active ? ("active dir " + str.tostring(m1Dir)) : (not m1Warm ? "warming up" : m1BandWalk ? "BAND-WALK" : m1DistRaw <= 0.0 ? "inside ramp" : "idle"), text_size = size.tiny)
+        table.cell(st, 1, 28, m1Active ? ("active dir " + str.tostring(m1Dir)) : (not m1InWindow ? "OUT OF BLOCK" : not m1Warm ? "warming up" : m1BandWalk ? "BAND-WALK" : m1DistRaw <= 0.0 ? "inside ramp" : "idle"), text_size = size.tiny)
         table.cell(st, 0, 29, "VWAP / sigma", text_size = size.tiny)
         table.cell(st, 1, 29, (na(m1Vwap) ? "-" : str.tostring(m1Vwap, format.mintick)) + " / " + (na(m1Sigma) ? "-" : str.tostring(m1Sigma, "0.####")), text_size = size.tiny)
         table.cell(st, 0, 30, "z-score (signed)", text_size = size.tiny)
@@ -1564,7 +1611,7 @@ if showStatus and barstate.islast
         table.cell(st, 0, 31, "distance (raw)", text_size = size.tiny)
         table.cell(st, 1, 31, str.tostring(m1DistRaw, "0.00") + "  ramp " + str.tostring(vwapSigmaLo, "0.0") + "-" + str.tostring(vwapSigmaHi, "0.0") + "s", text_size = size.tiny)
         table.cell(st, 0, 32, "band-walk", text_size = size.tiny)
-        table.cell(st, 1, 32, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + " bars -> x" + str.tostring(m1WalkDamp, "0.00"), text_size = size.tiny)
+        table.cell(st, 1, 32, "out " + str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + "  stall " + str.tostring(m1StallRun) + "/" + str.tostring(m1StallBars) + " -> x" + str.tostring(m1WalkDamp, "0.00"), text_size = size.tiny)
         table.cell(st, 0, 33, "barrier damp (D-028)", text_size = size.tiny)
         table.cell(st, 1, 33, "x" + str.tostring(m1ExtDamp, "0.00") + (m1OnBarrier ? "  (on barrier)" : ""), text_size = size.tiny)
         table.cell(st, 0, 34, "M1 score", text_size = size.tiny)
@@ -1726,17 +1773,17 @@ if sweepDebug and barstate.islast
     table.cell(gt, 1, 18, str.tostring(gfM6AndWalk), text_size = size.tiny)
     table.cell(gt, 2, 18, "of M6:", text_size = size.tiny)
     table.cell(gt, 3, 18, str.tostring(gfM6 > 0 ? 100.0 * gfM6AndWalk / gfM6 : 0.0, "0.0") + "%", text_size = size.tiny)
-    table.cell(gt, 0, 19, "M6 live in RTH", text_size = size.tiny)
-    table.cell(gt, 1, 19, str.tostring(gfM6Rth), text_size = size.tiny)
-    table.cell(gt, 2, 19, "outside:", text_size = size.tiny)
-    table.cell(gt, 3, 19, str.tostring(gfM6Off), text_size = size.tiny)
-    table.cell(gt, 0, 20, "M1 anchor / RTH-only", text_size = size.tiny)
+    table.cell(gt, 0, 19, "M6 live, M1 win OPEN", text_size = size.tiny)
+    table.cell(gt, 1, 19, str.tostring(gfM6InWin), text_size = size.tiny)
+    table.cell(gt, 2, 19, "CLOSED:", text_size = size.tiny)
+    table.cell(gt, 3, 19, str.tostring(gfM6OutWin) + " (" + str.tostring(gfM6 > 0 ? 100.0 * gfM6OutWin / gfM6 : 0.0, "0.0") + "%)", text_size = size.tiny)
+    table.cell(gt, 0, 20, "M1 anchor / block", text_size = size.tiny)
     table.cell(gt, 1, 20, vwapAnchor, text_size = size.tiny)
-    table.cell(gt, 3, 20, vwapRthOnly ? "RTH-only" : "all bars", text_size = size.tiny)
-    table.cell(gt, 0, 21, "band-walk trigger", text_size = size.tiny)
-    table.cell(gt, 1, 21, str.tostring(bandWalkBars) + "b at " + str.tostring(vwapSigmaLo, "0.0") + "s", text_size = size.tiny)
-    table.cell(gt, 2, 21, "M1 cap:", text_size = size.tiny)
-    table.cell(gt, 3, 21, str.tostring(math.max(0, bandWalkBars - 1)) + "b max", text_size = size.tiny)
+    table.cell(gt, 3, 20, vwapAnchor == "Session blocks" ? ("blk " + str.tostring(m1BlkId)) : (m1InWindow ? "open" : "closed"), text_size = size.tiny)
+    table.cell(gt, 0, 21, "walk: run/stall", text_size = size.tiny)
+    table.cell(gt, 1, 21, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + "  stall " + str.tostring(m1StallRun) + "/" + str.tostring(m1StallBars), text_size = size.tiny)
+    table.cell(gt, 2, 21, "peak |z|:", text_size = size.tiny)
+    table.cell(gt, 3, 21, str.tostring(m1ExcPeak, "0.00"), text_size = size.tiny)
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.
