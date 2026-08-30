@@ -1108,7 +1108,80 @@ This is the reverse of D-032, where the definitional argument stood without coun
 a pivot passes any intact test by construction, so no measurement could rescue it.
 Here the argument is structural but the evidence offered for it was a raw rate.
 
+### RESULT (GC 5m, 41 sessions) — the raw ordering was an artifact, and it was inverted
+
+| | fires | f/100 exposure-bars |
+|---|---|---|
+| **BARRIER** | — | **3.64** |
+| **REFERENCE** | — | **2.35** |
+
+Barrier leads by **55%**. Per class, **PDH is the strongest at 3.88 and PDC the
+weakest at 1.94** — the exact reverse of the fires-per-session ordering (PDC 1.5
+vs PDH 0.9) that motivated the hypothesis.
+
+**`sweepUseReference` stays ON.** The structural argument had the right direction —
+barriers do outperform references — but the evidence originally offered for it
+pointed the opposite way, because PDC and RTHo sit mid-range and were simply near
+price far more often. Excluding them would have removed levels that fire *less* per
+unit of opportunity than the barriers being kept, while also removing the barrier
+advantage from view.
+
+**The general lesson, worth carrying into every later module:** a rate is only
+evidence when its denominator is the set of opportunities, not the set of sessions.
+Any future "class X fires too much" claim needs the same normalization before it
+justifies a filter. D-032 remains the exception — there the argument was
+definitional and no denominator could rescue it.
+
 **Noted for when the numbers arrive:** round numbers are classified REFERENCE, but
 they carry a second defect — `ceil(close/step)*step` **relocates** whenever price
 crosses a step boundary, which is the D-032 swing problem again. They are off by
 default; if they are ever enabled they need a fixed anchoring, not just a type.
+
+---
+
+## D-035 — Blind review mode, and the number the diagnostics cannot see
+**Status:** Accepted · 2026-08-29
+
+`blindMode` suppresses every drawing — level lines, level labels, sweep markers,
+grade labels — while leaving both diagnostic tables live. The status table header
+reads `** BLIND **` so the state is never ambiguous.
+
+**Why an input rather than just switching the indicator off.** Turning the
+indicator off takes the tables with it. The review needs the diagnostics available
+during the overlay pass, and needs the marks absent during the marking pass.
+
+**Why the protocol is blind at all.** Reading the engine's marks and asking "would
+I have taken that?" is a much weaker test — the marks anchor the judgement. Marking
+the session first, independently, is the only way to get an honest third bucket.
+
+**The three buckets, and which one matters most:**
+
+| Bucket | Visible to diagnostics? |
+|---|---|
+| matched | yes |
+| M6-only | yes — every counter in the script measures this population |
+| **yours-only** | **no. A missed event leaves no trace in any counter.** |
+
+Every number produced so far — fire rate, funnel, per-class breakdown, exposure
+normalization, leak assertion — measures whether M6 does what it says. **None of
+them measure whether what it says is worth saying.** A perfectly counted 10
+fires/session of events no discretionary reader would mark is a well-built detector
+of nothing. The yours-only bucket is the only instrument that can detect that, and
+it cannot be built in Pine because it requires the judgement the engine is trying
+to approximate.
+
+**Consequence for module order.** If agreement is poor, M6's definition changes and
+anything built on it gets rebuilt — so M1/M3/M5 wait. If it is decent, the
+composition of the *yours-only* misses selects the next module: misses that need
+extension context argue for M1/M5, misses that need volume context argue for M3.
+The next module is chosen by what M6 structurally cannot see, not by the planned
+order.
+
+**Supporting change:** sweep labels now carry class, score, penetration in ticks and
+bars-to-reclaim, with opacity graded by score (solid >= 0.70, mid >= 0.45, faint
+below), so agreement can be scored at a glance without hovering each marker.
+
+**Implementation note.** The level-drawing CLEAR now runs unconditionally rather
+than inside the draw condition. Previously, disabling drawings left the last
+rebuild stranded on the chart — which would have defeated blind mode on any
+partial recalculation.
