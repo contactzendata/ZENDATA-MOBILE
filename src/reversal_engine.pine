@@ -273,13 +273,19 @@ grpM1 = "M1 - VWAP extension (E)"
 useVwap     = input.bool(true, "Enable VWAP extension", group = grpM1)
 vwapAnchor  = input.string("RTH open", "VWAP anchor", options = ["RTH open", "Session", "Week", "Month", "Overnight open"], group = grpM1, tooltip = "RTH-anchored by default. Overnight volume is too thin for reliable sigma bands.")
 vwapRthOnly = input.bool(true, "Compute bands from RTH volume only", group = grpM1)
-vwapSigmaLo = input.float(2.0, "Sigma - extension begins", minval = 0.5, step = 0.1, group = grpM1, tooltip = "+/-1 sigma contains ~68% of session action, +/-2 sigma ~95%. A 2-sigma tag is a genuinely extended location.")
-vwapSigmaHi = input.float(3.0, "Sigma - score saturates", minval = 0.5, step = 0.1, group = grpM1)
+vwapB1      = input.float(1.0, "Band 1 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only. ~68% of session action sits inside +/-1 sigma.")
+vwapB2      = input.float(2.0, "Band 2 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only. ~95% inside +/-2 sigma -- a 2-sigma tag is a genuinely extended location.")
+vwapB3      = input.float(2.5, "Band 3 (sigma)", minval = 0.1, step = 0.1, group = grpM1, tooltip = "Plot only.")
+vwapSigmaLo = input.float(2.0, "Score ramp starts (sigma)", minval = 0.5, step = 0.1, group = grpM1, tooltip = "Below this |z| the module is INACTIVE -- there is no extension to score, so category E does not fill. Aligned with band 2 by default.")
+vwapSigmaHi = input.float(2.5, "Score saturates (sigma)", minval = 0.5, step = 0.1, group = grpM1, tooltip = "Aligned with band 3 by default. Between the two the distance term interpolates linearly.")
 vwapWarmMin = input.int(30, "Anchor warm-up (minutes)", minval = 1, group = grpM1, tooltip = "A fresh anchor sits on price with sigma near zero, making extension readings meaningless. Module stays inactive until this elapses.")
 // BAND-WALK GUARD: mechanically fading a band in a trending session is, per the
 // source research, a leading cause of blow-ups.
-bandWalkMin = input.int(20, "Band-walk suppression (minutes)", minval = 1, group = grpM1, tooltip = "If price holds beyond the sigma band for this long, treat it as a band-walk (trend), NOT extension, and suppress M1. This is the single most important guard in the module.")
+bandWalkMin = input.int(20, "Band-walk suppression (minutes)", minval = 1, group = grpM1, tooltip = "Consecutive closes beyond the score-ramp sigma for this long = a band-walk (trend), not extension. Mechanically fading a walking band is, per the source research, a leading cause of blow-ups. This is the single most important guard in the module.")
+bandWalkDamp = input.float(0.0, "  Band-walk damping factor", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM1, tooltip = "What the distance term is multiplied by during a band-walk. 0.0 = full suppression, and M1 also goes INACTIVE so category E does not fill -- a trending market must not satisfy the gate's third category. Raise it only if you want band-walks scored rather than rejected.")
+m1ExtremeDamp = input.float(1.0, "  Damp on barrier-level sweep (D-028)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM1, tooltip = "OFF by default (1.0 = no damping). Wired now that CLS_TYP exists so D-028's measurements can run the moment M5 lands, without another registry change. When M6 has an active sweep on a BARRIER-type level, M1's distance is arguably redundant -- sweeps happen at extremes and extremes are where VWAP extension is largest. Do not enable until measured.")
 vwapShow    = input.bool(true, "Plot VWAP and bands", group = grpM1)
+vwapDebug   = input.bool(true, "Show M1 diagnostics in status table", group = grpM1)
 
 // ---- L0 - Level registry (SHARED infrastructure, not a module) ----------------
 // Consumed by M2 (proximity scoring), M3 (naked POC context), M4 (deltaReqLvl)
@@ -661,12 +667,14 @@ var int    fireHiBar   = na
 var float  fireHiScore = 0.0
 var string fireHiNm    = ""
 var float  fireHiPrice = na
+var int    fireHiCls   = -1
 var float  fireHiPenTk = na
 var int    fireHiUsed  = na
 var int    fireLoBar   = na
 var float  fireLoScore = 0.0
 var string fireLoNm    = ""
 var float  fireLoPrice = na
+var int    fireLoCls   = -1
 var float  fireLoPenTk = na
 var int    fireLoUsed  = na
 
@@ -843,6 +851,7 @@ if confirmed and m6Ready
         fireHiBar   := bar_index
         fireHiNm    := pHiNm
         fireHiPrice := pHiLvl
+        fireHiCls   := pHiCls
         fireHiPenTk := pHiPen / tick
         fireHiUsed  := usedH
         if pHiCls >= 0
@@ -891,6 +900,7 @@ if confirmed and m6Ready
         fireLoBar   := bar_index
         fireLoNm    := pLoNm
         fireLoPrice := pLoLvl
+        fireLoCls   := pLoCls
         fireLoPenTk := pLoPen / tick
         fireLoUsed  := usedL
         if pLoCls >= 0
@@ -1020,7 +1030,95 @@ m2Active = useStruct and m2InWindow and m2Dir != 0
 m2Note = m2NearNm + (m2NearSwept ? " (swept: prox damped)" : "") + " x" + str.tostring(m2StackN)
 
 // =============================================================================
-// MODULE IMPLEMENTATIONS  --  M2 + M6 LIVE, REST ARE STUBS
+// M1 ENGINE  --  VWAP extension (category E)
+// =============================================================================
+// Two SEPARATE terms, scored and logged apart, mirroring M2 (D-036):
+//
+//   DISTANCE   |z| mapped vwapSigmaLo..vwapSigmaHi -> 0..1. The raw extension.
+//   DAMPING    band-walk factor x barrier-sweep factor. What the raw score is
+//              multiplied by, and why.
+//
+// Kept apart because D-028 asks whether M1's redundancy with M6 lives in the
+// DISTANCE term specifically. A blended score cannot answer that.
+//
+// Sigma is a running volume-weighted standard deviation about the anchored VWAP,
+// accumulated from sum(v), sum(pv) and sum(p^2 v) since the anchor.
+
+chgD = timeframe.change("D")
+chgW = timeframe.change("W")
+chgM = timeframe.change("M")
+// All three evaluated unconditionally: timeframe.change() carries series state and
+// must not sit inside a branch that some bars skip.
+m1Reset = vwapAnchor == "RTH open"       ? rthStart
+        : vwapAnchor == "Overnight open" ? onStart
+        : vwapAnchor == "Session"        ? chgD
+        : vwapAnchor == "Week"           ? chgW
+        :                                  chgM
+
+var float m1SumV    = 0.0
+var float m1SumPV   = 0.0
+var float m1SumP2V  = 0.0
+var int   m1AnchorT = na
+
+m1Src   = hlc3
+m1UseBar = (not vwapRthOnly) or inRTH
+
+if confirmed
+    if m1Reset
+        m1SumV    := 0.0
+        m1SumPV   := 0.0
+        m1SumP2V  := 0.0
+        m1AnchorT := time
+    if m1UseBar and volume > 0
+        m1SumV   := m1SumV   + volume
+        m1SumPV  := m1SumPV  + m1Src * volume
+        m1SumP2V := m1SumP2V + m1Src * m1Src * volume
+
+m1Vwap  = m1SumV > 0.0 ? m1SumPV / m1SumV : na
+m1Var   = m1SumV > 0.0 and not na(m1Vwap) ? math.max(0.0, m1SumP2V / m1SumV - m1Vwap * m1Vwap) : na
+m1Sigma = na(m1Var) ? na : math.sqrt(m1Var)
+
+// SIGNED z-score, exposed for other modules. Positive = above VWAP.
+m1Z = (not na(m1Vwap) and not na(m1Sigma) and m1Sigma > 0.0) ? (close - m1Vwap) / m1Sigma : na
+
+// Warm-up. A fresh anchor sits on price with sigma near zero, so every extension
+// reading in that window is noise wearing a number.
+m1AgeMin = na(m1AnchorT) ? na : (time - m1AnchorT) / 60000.0
+m1Warm   = not na(m1AgeMin) and m1AgeMin >= vwapWarmMin
+
+// BAND-WALK: consecutive closes beyond the score ramp. A walking band is trend,
+// not extension, and fading it mechanically is the documented way to blow up.
+bandWalkBars = f_bars(bandWalkMin)
+m1Outside    = not na(m1Z) and math.abs(m1Z) >= vwapSigmaLo
+var int m1OutRun = 0
+if confirmed
+    m1OutRun := m1Outside ? m1OutRun + 1 : 0
+m1BandWalk = m1OutRun >= bandWalkBars
+
+// term 1: distance
+m1DistRaw = na(m1Z) ? 0.0 : math.min(1.0, math.max(0.0, (math.abs(m1Z) - vwapSigmaLo) / math.max(0.01, vwapSigmaHi - vwapSigmaLo)))
+
+// term 2: damping, itself two factors kept separable
+m1WalkDamp = m1BandWalk ? bandWalkDamp : 1.0
+// D-028 wiring, inert at the default 1.0. CLS_TYP comes from D-034.
+m6FireCls   = m6Active ? (m6Dir == -1 ? fireHiCls : m6Dir == 1 ? fireLoCls : -1) : -1
+m1OnBarrier = m6FireCls >= 0 and array.get(CLS_TYP, m6FireCls) == 0
+m1ExtDamp   = m1OnBarrier ? m1ExtremeDamp : 1.0
+
+m1Score = math.min(1.0, m1DistRaw * m1WalkDamp * m1ExtDamp)
+
+// Above VWAP = extended high = a SHORT reversal candidate.
+m1Dir = na(m1Z) ? 0 : m1Z > 0.0 ? -1 : m1Z < 0.0 ? 1 : 0
+
+// A band-walk at full suppression must make M1 INACTIVE, not merely zero-scored:
+// an active module fills category E, and a trending market must never satisfy the
+// gate's third category (D-019).
+m1Active = useVwap and m1Warm and not na(m1Z) and m1Dir != 0 and m1DistRaw > 0.0 and (not m1BandWalk or bandWalkDamp > 0.0)
+
+m1Note = (na(m1Z) ? "z -" : "z " + str.tostring(m1Z, "0.00")) + (m1BandWalk ? " BANDWALK" : "") + (m1OnBarrier and m1ExtremeDamp < 1.0 ? " bar-damp" : "")
+
+// =============================================================================
+// MODULE IMPLEMENTATIONS  --  M1 + M2 + M6 LIVE, REST ARE STUBS
 // =============================================================================
 // Contract reminders that will quietly corrupt the composite if broken:
 //   - score must be 0..1 and must mean the same thing across modules.
@@ -1029,12 +1127,10 @@ m2Note = m2NearNm + (m2NearSwept ? " (swept: prox damped)" : "") + " x" + str.to
 //   - dir must be honest. dir = 0 contributes to BOTH sides.
 //   - modules compute; they never draw. Drawing happens in RENDER.
 
-// ---- M1 [E] ------------------------------------------------------------------
-// TODO: anchored VWAP + running sigma; extension in sigma mapped
-//       vwapSigmaLo..vwapSigmaHi -> 0..1; dir = -1 above, +1 below.
-//       Inactive during warm-up AND during a band-walk (bandWalkMin).
+// ---- M1 [E] -- IMPLEMENTED ---------------------------------------------------
+// Packages the M1 ENGINE results. Pure accessor, as with M2 and M6.
 f_mVwap() =>
-    ModuleOut.new(0.0, false, 0, "stub")
+    ModuleOut.new(m1Score, m1Active, m1Dir, m1Note)
 
 // ---- M2 [L] -- IMPLEMENTED ---------------------------------------------------
 // Packages the M2 ENGINE results. Pure accessor, as with M6.
@@ -1308,7 +1404,7 @@ if showGradeLbl and not blindMode and confirmed and gradeOnset and side != 0
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 28, border_width = 1)
+        st := table.new(position.top_right, 2, 35, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  blindMode ? "** BLIND **" : "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -1367,6 +1463,21 @@ if showStatus and barstate.islast
         table.cell(st, 1, 26, str.tostring(m2StackN) + " lvls -> " + str.tostring(m2Stack, "0.00") + "  (full at " + str.tostring(structStackFull) + ")", text_size = size.tiny)
         table.cell(st, 0, 27, "M2 score", text_size = size.tiny)
         table.cell(st, 1, 27, str.tostring(m2Score, "0.000") + "  = " + str.tostring(structProxW, "0.0") + "*prox + " + str.tostring(1.0 - structProxW, "0.0") + "*stack", text_size = size.tiny)
+    if vwapDebug
+        table.cell(st, 0, 28, "-- M1 --", text_size = size.tiny)
+        table.cell(st, 1, 28, m1Active ? ("active dir " + str.tostring(m1Dir)) : (not m1Warm ? "warming up" : m1BandWalk ? "BAND-WALK" : m1DistRaw <= 0.0 ? "inside ramp" : "idle"), text_size = size.tiny)
+        table.cell(st, 0, 29, "VWAP / sigma", text_size = size.tiny)
+        table.cell(st, 1, 29, (na(m1Vwap) ? "-" : str.tostring(m1Vwap, format.mintick)) + " / " + (na(m1Sigma) ? "-" : str.tostring(m1Sigma, "0.####")), text_size = size.tiny)
+        table.cell(st, 0, 30, "z-score (signed)", text_size = size.tiny)
+        table.cell(st, 1, 30, na(m1Z) ? "-" : str.tostring(m1Z, "0.00"), text_size = size.tiny)
+        table.cell(st, 0, 31, "distance (raw)", text_size = size.tiny)
+        table.cell(st, 1, 31, str.tostring(m1DistRaw, "0.00") + "  ramp " + str.tostring(vwapSigmaLo, "0.0") + "-" + str.tostring(vwapSigmaHi, "0.0") + "s", text_size = size.tiny)
+        table.cell(st, 0, 32, "band-walk", text_size = size.tiny)
+        table.cell(st, 1, 32, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + " bars -> x" + str.tostring(m1WalkDamp, "0.00"), text_size = size.tiny)
+        table.cell(st, 0, 33, "barrier damp (D-028)", text_size = size.tiny)
+        table.cell(st, 1, 33, "x" + str.tostring(m1ExtDamp, "0.00") + (m1OnBarrier ? "  (on barrier)" : ""), text_size = size.tiny)
+        table.cell(st, 0, 34, "M1 score", text_size = size.tiny)
+        table.cell(st, 1, 34, str.tostring(m1Score, "0.000") + "  = dist x walk x bar", text_size = size.tiny)
 
 // ---- D-029 diagnostic table: per-class funnel breakdown ----------------------
 // Answers "how much of the penetration count is which level class". Rendered as a
@@ -1473,3 +1584,18 @@ plot(m2ProxRaw,  "M2 proximity (raw)",     display = display.data_window)
 plot(m2Prox,     "M2 proximity (damped)",  display = display.data_window)
 plot(m2Stack,    "M2 stacking",            display = display.data_window)
 plot(m2Score,    "M2 score",               display = display.data_window)
+plot(m1Z,        "M1 z-score (signed)",    display = display.data_window)
+plot(m1DistRaw,  "M1 distance (raw)",      display = display.data_window)
+plot(m1WalkDamp, "M1 band-walk damp",      display = display.data_window)
+plot(m1ExtDamp,  "M1 barrier damp",        display = display.data_window)
+plot(m1Score,    "M1 score",               display = display.data_window)
+
+// VWAP and sigma bands. Drawn only when not blind (D-035).
+m1PlotOn = vwapShow and not blindMode
+plot(m1PlotOn ? m1Vwap : na, "VWAP", color = color.new(color.blue, 0), linewidth = 2)
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap + vwapB1 * m1Sigma : na, "+1s", color = color.new(color.gray, 45))
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap - vwapB1 * m1Sigma : na, "-1s", color = color.new(color.gray, 45))
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap + vwapB2 * m1Sigma : na, "+2s", color = color.new(color.orange, 25))
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap - vwapB2 * m1Sigma : na, "-2s", color = color.new(color.orange, 25))
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap + vwapB3 * m1Sigma : na, "+2.5s", color = color.new(color.red, 20))
+plot(m1PlotOn and not na(m1Sigma) ? m1Vwap - vwapB3 * m1Sigma : na, "-2.5s", color = color.new(color.red, 20))

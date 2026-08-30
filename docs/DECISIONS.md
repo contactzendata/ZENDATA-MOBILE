@@ -1185,7 +1185,62 @@ below), so agreement can be scored at a glance without hovering each marker.
 results so the interpretation is pre-registered rather than reconstructed after the
 numbers arrive.
 
+**DEFERRED 2026-08-29, not cancelled.** Not run, for a reason worth recording:
+insufficient discretionary screen time on GC/NQ for the marks to be a meaningful
+baseline, and a working definition close enough to M6's own logic that agreement
+would have been **circular**. A pass under those conditions yields a number that
+looks like validation and is not — and which would then be cited in every later
+decision as though it meant something. Declining to generate it is the right call.
+
+The cost is carried in `OPEN_ITEMS.md` §1 rather than being written off: M6's
+definition is unvalidated, the *yours-only* and *matched-oppose* populations remain
+structurally invisible, and every module built above M6 inherits that unknown
+through D-019's category-Q gate keeping. Revisit with more screen time, or once the
+engine is grading and can be watched live — marks taken from watching it be wrong
+in real time are a different and arguably better baseline than a cold chart.
+
 **Implementation note.** The level-drawing CLEAR now runs unconditionally rather
 than inside the draw condition. Previously, disabling drawings left the last
 rebuild stranded on the chart — which would have defeated blind mode on any
 partial recalculation.
+
+---
+
+## D-036 — M1 logs distance and damping as separate terms
+**Status:** Accepted · 2026-08-29
+
+M1's score is `distance x band-walk damping x barrier damping`, with each factor
+scored, logged and plotted **separately**, mirroring M2's proximity/stacking split
+(D-027).
+
+**Why separable.** D-028 asks whether M1's redundancy with M6 lives in the
+**distance** term specifically — sweeps happen at extremes, and extremes are where
+VWAP extension is largest. A blended score cannot answer that question. The split
+is what makes the measurement possible later without rebuilding the module.
+
+**A band-walk sets `active = false`, not merely `score = 0`.** This is the
+load-bearing detail. Under D-002 a zero-scored active module still contributes its
+weight — but `active` also fills the **category**, and category E filling is what
+lets the D-019 gate reach three. A trending market must never satisfy the gate's
+third category. `bandWalkDamp` defaults to 0.0 (full suppression); raising it above
+zero keeps M1 active with a reduced score, which is a deliberate and different
+choice.
+
+**D-028's check is wired and inert.** `m1ExtremeDamp` defaults to 1.0. The
+barrier-vs-reference classification it needs (`CLS_TYP`) already exists from D-034,
+and M6's fired class is now retained through the hold window, so the D-028
+measurements can run the moment M5 lands — no further registry or module change.
+
+**Anchor resets are evaluated unconditionally.** `timeframe.change()` carries series
+state, so all three (`D`/`W`/`M`) are computed every bar and the anchor selection
+picks among the results. Putting them inside the branch would corrupt the ones not
+taken.
+
+**Sigma is a running volume-weighted standard deviation** about the anchored VWAP,
+from `sum(v)`, `sum(pv)` and `sum(p^2 v)` since the anchor — not a rolling stdev of
+price. Bands default to 1.0 / 2.0 / 2.5 sigma, with the score ramp aligned to
+2.0 → 2.5 so the plotted bands and the scored thresholds are the same objects.
+
+**Wrong if:** the warm-up (30 min) turns out too short — a freshly anchored VWAP
+has near-zero sigma, which inflates |z| and would make M1 fire hardest exactly when
+it knows least. Watch the first graded setups after each anchor reset.
