@@ -1244,3 +1244,80 @@ price. Bands default to 1.0 / 2.0 / 2.5 sigma, with the score ramp aligned to
 **Wrong if:** the warm-up (30 min) turns out too short — a freshly anchored VWAP
 has near-zero sigma, which inflates |z| and would make M1 fire hardest exactly when
 it knows least. Watch the first graded setups after each anchor reset.
+
+---
+
+## D-037 — Gate funnel, and two M1 defects found by reading the code
+**Status:** Accepted (diagnostic) · 2026-08-29 · **defects reported, not yet fixed**
+
+M1 landed, category E became fillable, and **nothing graded** on GC 5m across the
+full window. Two of the three candidate explanations are answerable from the source
+without running anything, and both are defects introduced in D-036.
+
+### Defect A — the band-walk guard caps M1's own active window
+
+`m1Outside` uses `|z| >= vwapSigmaLo`, and `m1DistRaw > 0` — M1's activation
+condition — requires `|z| > vwapSigmaLo`. **The same threshold gates both.** So the
+band-walk counter starts incrementing on the exact bar M1 becomes eligible, and:
+
+> **M1 can be active for at most `bandWalkBars − 1` consecutive bars per excursion.**
+> On GC 5m that is **3 bars**, from `f_bars(20) = 4`.
+
+The guard was meant to catch a *trend walking the band*. As written it fires on any
+excursion lasting 20 minutes, which is an ordinary extended move — the exact
+condition M1 exists to detect. It does not distinguish "price is beyond the band"
+from "price is *still advancing* beyond the band".
+
+**Proposed fix (not applied):** separate the two thresholds, and make the
+walk condition directional. A band-walk is price beyond the band **and still making
+new extremes** — e.g. the running max of `|z|` continuing to rise — not merely
+sitting outside it. A stalled excursion is exactly what should score.
+
+### Defect B — M1 is frozen outside RTH while M6 fires around the clock
+
+`vwapRthOnly` defaults true and `vwapAnchor` defaults to `RTH open`, so
+`m1UseBar = inRTH` and **no accumulation happens outside RTH**. For GC, RTH is
+08:20–13:30 = **62 of 288 daily 5m bars (21.5%)**.
+
+Outside that window VWAP and sigma hold yesterday's closing values while price
+drifts away, so `|z|` inflates on a stale anchor, the band-walk guard then
+suppresses it, and M1 is effectively dead for ~78% of the session. **M6 fires
+across all 24 hours.** Most M6 fires therefore land where M1 cannot contribute.
+
+**Proposed fix (not applied):** either accumulate across the whole session while
+keeping the RTH anchor, or make M1 explicitly `active = false` outside RTH rather
+than reporting a z-score against a frozen mean. The current state is the worst of
+both — silently wrong rather than honestly absent.
+
+### Finding C — M1 and M6 are anti-correlated in time, by construction
+
+Not a defect; a structural property worth recording, and it sharpens D-028.
+
+**M6 fires on the reclaim, which is a move back toward VWAP.** M1's extension is
+maximal at the sweep extreme and is *already decaying* by the time M6 confirms. The
+hold window (D-025) mitigates this but cannot remove it.
+
+So the M1/M6 relationship may not be **redundancy** at all — the two may be
+measuring the same event **at different phases**. If so, D-028's proposed damping
+would be exactly the wrong treatment: it would penalise a pairing that is
+complementary in time rather than duplicative in information. The gate funnel's
+`M1 & M6` count is the first direct measurement of this.
+
+### The funnel
+
+Same shape as the M6 funnel — show which *stage* is starving rather than only that
+the output is empty. Per-bar counts of each module active, all three pairwise
+coincidences, the triple, then the gate stages (L → L+(Q|F) → +3rd category →
+PASS), grade counts, the max composite ever reached, and a six-bucket composite
+histogram over bars where anything was active.
+
+Two probes target the hypotheses directly:
+
+- **`M1 walk-blocked ...while M6 live`** — bars where M1 was otherwise eligible but
+  suppressed by the band-walk *on a bar where M6 was live*. This is Defect A and
+  the mutual-exclusion hypothesis measured as one number.
+- **`M6 live in RTH / outside`** — Defect B measured directly. If the outside count
+  dominates, M1's anchor configuration is the binding constraint, not any threshold.
+
+**No thresholds, weights or `catDamp` touched.** Fitting a threshold to a gate that
+never opens would move the failure somewhere less visible.
