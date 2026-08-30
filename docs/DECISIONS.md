@@ -979,3 +979,113 @@ for comparison.
 satisfy gate rule 2 (D-019), where M6 carries the requirement alone. The answer
 then is a better-defined swing level — one established and then *left* before being
 tested — not re-admitting the current definition.
+
+---
+
+## D-033 — The REPEAT counter measures a population D-031 does not gate
+**Status:** Accepted · 2026-08-29 · diagnosis, then instrumentation
+
+**The observation.** After D-031/D-032 on GC 5m: fires fell 882 → 408, but the
+repeat share moved 46% → 48%. The gate more than halved total fires while appearing
+not to touch repeats at all.
+
+**The diagnosis: the two are measuring different populations.**
+
+`m6RepeatFire` increments on **any fire at a price that has already fired since the
+last RTH open**, regardless of elapsed time or distance travelled. It is
+session-scoped and price-keyed.
+
+D-031 blocks a fire only while the class is spent **and** has not yet satisfied
+excursion-plus-time. Once both are satisfied the level re-arms and is *supposed* to
+fire again — that is the double-top case the rule was written to preserve.
+
+**So a legitimate 10:00/14:00 double top increments the REPEAT counter.** The 48%
+is not evidence the gate failed. It is also not evidence it worked: the counter
+cannot distinguish a leak from an intended re-arm, so it can support neither
+conclusion.
+
+**A composition effect explains the flat share.** Swing levels relocate ~33 times
+per session, so each fire was usually at a *new* price and was therefore counted as
+a non-repeat. Removing them (D-032) removed mostly non-repeat fires, which
+mechanically raises the repeat share of what remains. 46% → 48% across a change of
+population is not a comparison of like with like.
+
+**The ~0.59 suppression estimate was wrong and is removed.** It projected 785
+skipped in-band penetrations into ~463 suppressed fires, against an actual
+non-swing reduction of ~120. The ratio was derived from a population counted per
+*pending*, then applied to one counted per *level-bar* — many of the 785 are the
+same level re-penetrated on consecutive bars while spent, which would never have
+been separate fires. The row now reports skipped level-bars and skipped *bars*,
+with no projection.
+
+### Instrumentation added
+
+- `m6FireSpent` — fires where the class was spent at fire time. **This is the
+  D-031-relevant repeat count**, class-keyed and not session-scoped.
+- `m6ReArmedOK` — of those, had satisfied both conditions. Intended behaviour.
+- `m6Leak` — of those, had **not**. **Must be zero.** Non-zero is a gate leak.
+- `repeatByClass` — repeats broken out per class.
+- Mean re-arm margin: excursion as a multiple of threshold, and elapsed bars.
+  A mean near 1.0× says repeats are scraping through and the threshold is
+  marginal; a mean well above says they are clearing it comfortably and the
+  threshold is not what is admitting them.
+
+### A leak path exists in the current code
+
+`pHi` and `pLo` pendings are independent, and `armed` is evaluated at **candidate
+selection**, not at fire. So on one class: a low-sweep pending fires and marks the
+class spent, and a high-sweep pending created earlier on the same class can then
+fire on a later bar while spent. `m6Leak` is precisely the assertion that detects
+this. If it comes back non-zero, the fix is to re-check `armed` at fire time as
+well as at selection — not to change the thresholds.
+
+**Do not tune `reArmAtr` or `reArmMin` until `m6Leak` is known.** If it is zero the
+gate is tight and 48% is entirely intended retests; if it is non-zero the thresholds
+are innocent and the bug is the double-pending path above.
+
+---
+
+## D-034 — PROPOSED: barrier-type vs reference-type levels. **Not implemented**
+**Status:** Proposed · 2026-08-29
+
+**The argument, which is sound.** A sweep is a liquidity event: resting stops beyond
+a level are triggered and price rejects. Stops cluster beyond **extremes** —
+PDH/PDL, ONH/ONL, IBH/IBL, ORH/ORL — because those are what a position is protected
+against. Nobody parks a protective stop at yesterday's *close* or at the RTH *open*.
+
+Measured on GC 5m: **PDC 1.5/session and RTHo 1.2 lead every extreme-type level**,
+including PDH 0.9 and PDL 0.7. If the argument holds, that ordering is the same
+definitional mismatch as swings wearing a different class.
+
+**The better name is barrier vs reference.** PDC and RTHo are **magnets** — price
+rotates around them by construction, all session. A sweep needs a **barrier**:
+something price must break *through*, with orders resting beyond it. Rotation
+across a magnet is not a failed auction, it is the auction working.
+
+**One measurement could invert this, and it should be taken first.** Fire count is
+partly a function of **exposure** — how much time a level spends near price. PDC and
+RTHo sit in the middle of the range and are near price constantly; PDH and PDL are
+far away most of the session. Their raw penetration counts are also the highest
+(245 and 218), which is consistent with exposure rather than with level type.
+
+The correct normalization is **fires per bar-of-proximity**, not fires per session.
+If PDC still leads after normalizing, the definitional argument is confirmed and
+exclusion is right. If it falls below PDH/PDL, the raw ordering was an exposure
+artifact and excluding it would discard a level type that is *better* behaved per
+unit of opportunity.
+
+This differs from the swing case (D-032), where the definitional argument stood on
+its own and needed no counts: a pivot passes any intact test by construction. Here
+the argument is structural but the evidence offered for it is a raw rate, and raw
+rates are exposure-confounded.
+
+**Proposed sequencing:**
+1. Add the `barrier` / `reference` classification to the registry as a field. It is
+   needed regardless — **D-028 requires exactly this field** for the M1 damping
+   question (M1's redundancy is with *being at a session extreme*, which is the
+   same distinction). One field, two open items.
+2. Add per-class exposure counting: bars where the level sat within the proximity
+   window of price.
+3. Leave reference-type levels **sweepable** initially, and compare fires per
+   exposure-bar across the two groups.
+4. Flip the default only if the normalized rate confirms the raw ordering.
