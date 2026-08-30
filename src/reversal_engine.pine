@@ -1049,11 +1049,20 @@ chgW = timeframe.change("W")
 chgM = timeframe.change("M")
 // All three evaluated unconditionally: timeframe.change() carries series state and
 // must not sit inside a branch that some bars skip.
-m1Reset = vwapAnchor == "RTH open"       ? rthStart
-        : vwapAnchor == "Overnight open" ? onStart
-        : vwapAnchor == "Session"        ? chgD
-        : vwapAnchor == "Week"           ? chgW
-        :                                  chgM
+// Written as an if/else chain rather than a wrapped ternary: Pine ends a statement
+// at a line break whenever the line so far parses as complete, so a continuation
+// line beginning with ":" is a syntax error, not a continuation.
+m1Reset = false
+if vwapAnchor == "RTH open"
+    m1Reset := rthStart
+else if vwapAnchor == "Overnight open"
+    m1Reset := onStart
+else if vwapAnchor == "Session"
+    m1Reset := chgD
+else if vwapAnchor == "Week"
+    m1Reset := chgW
+else
+    m1Reset := chgM
 
 var float m1SumV    = 0.0
 var float m1SumPV   = 0.0
