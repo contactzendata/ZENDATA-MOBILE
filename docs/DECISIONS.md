@@ -1601,3 +1601,60 @@ line at **any scope**, including for-loop induction variables and function
 parameters, and lives in `tools/pinecheck.py` so it is run rather than
 reconstructed. Two prior compile errors (the wrapped ternary, this one) would both
 have been caught by it.
+
+---
+
+## D-042 — The cross-check was correct; the way it was displayed was not
+**Status:** Accepted · 2026-08-29
+
+The derived-vs-independent cross-check reported an apparent 20x gap on M2&M6
+(26 vs 558). It was not a derivation bug. **Reconciling the reported histogram
+against every constraint identifies exactly one value that satisfies all eight
+simultaneously.**
+
+| constraint | with `c3 = 39` | with `c3 = 139` |
+|---|---|---|
+| M1 = c1+c3+c5+c7 | 715 vs 815 ✗ | 815 ✓ |
+| M2 = c2+c3+c6+c7 | 2352 vs 2452 ✗ | 2452 ✓ |
+| M6 = c4+c5+c6+c7 | 1511 ✓ | 1511 ✓ |
+| M1&M2 = c3+c7 | 80 vs 180 ✗ | 180 ✓ |
+| M1&M6 = c5+c7 | 124 ✓ | 124 ✓ |
+| M2&M6 = c6+c7 | 558 ✓ | 558 ✓ |
+| ALL3 = c7 | 41 ✓ | 41 ✓ |
+| sum = bars | 11443 vs 11543 ✗ | 11543 ✓ |
+
+The decisive one is **sum vs bars**, because that check is computed *in Pine from
+the same array* and was reported as passing. A histogram summing to 11,543 requires
+`c3 = 139`. With it, the bit masks (`M1&M2 = c3+c7`, `M2&M6 = c6+c7`) are correct
+and every derived value matches its independent counter.
+
+**So the instrument was sound and the earlier readings were transcription
+artifacts.** That also disposes of the 79 → 41 question: `ALL3 = c7 = 41` agrees
+with the independent counter, and the 79 came from a build predating the
+single-source histogram, read through the same hand-transcription path.
+
+### The actual defect, which is mine
+
+Two display choices made the instrument hostile to the only way it can be read —
+a human copying numbers off a screen:
+
+1. **Packed cells.** Three counts crammed into one cell as `a/b/c`. A dropped
+   leading digit in a run of digits is invisible and silently changes the
+   conclusion. I did this repeatedly across all three tables.
+2. **An aggregate flag on a specific row.** `okAll` covered singles, pairs *and*
+   the triple, but sat on the singles row, so it reads as "the singles agree". A
+   pass/fail marker must sit on the thing it tests, or it misdirects exactly when
+   it matters.
+
+### Fixed
+
+The cross-check is now **one comparison per row** — M1, M2, M6, each pair, and the
+triple — each with derived and independent in separate columns and its own
+`OK`/`BAD` marker. The histogram prints **one bucket per cell**, so no cell carries
+a run of digits. The sum-vs-bars check gets its own row and marker.
+
+**Standing rule, extending D-041:** an instrument is not just its arithmetic, it is
+its arithmetic *plus how it is read*. A correct number in an unreadable layout has
+the same effect as a wrong number. Never pack multiple values into one cell in a
+diagnostic table, and never attach an aggregate pass/fail to a row that displays
+only part of what it covers.
