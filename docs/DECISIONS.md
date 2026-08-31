@@ -1945,3 +1945,59 @@ The next lift is mechanical but larger: convert the scalar `gf*` counters into a
 single `gfCnt` array so the whole telemetry block becomes array mutation and can
 move wholesale. That is also the D-041 shape — one source, derived views — so it is
 a change worth making on its own terms rather than only to satisfy a compiler.
+
+---
+
+## D-049 — One renderer per section: the per-function external-element limit
+**Status:** Accepted · 2026-08-29 · follows D-048
+
+`CE10116: f_fillStatus uses 258 external elements. The limit is 254.` External
+elements are the values returned by `request.*()` calls, the script's **inputs**,
+and user-function parameters — with **int, float and bool counting for two**.
+
+**D-048 traded one limit for another.** Collapsing the whole status table into a
+single function concentrated every input reference the engine has into one scope.
+The main body got shorter; that function got denser. The limits are on different
+axes — statements in the global scope, external elements per function — and
+satisfying one by moving code can violate the other.
+
+### The fix
+
+One function per **section**, split along the debug gates that already existed:
+
+- status → `f_stCore`, `f_stSweep`, `f_stStruct`, `f_stVwap`, `f_stM5`, `f_stCtx`
+- gate funnel → `f_gtFunnel`, `f_gtProbes`, `f_gtDerived`, `f_gtM5`, `f_gtRvol`,
+  `f_gtESrc`, `f_gtM7`
+
+Each section touches only its own module's inputs, so the count distributes instead
+of accumulating. The `if <debugFlag>` gates moved to the call sites, which also
+means an unused section costs nothing at render time.
+
+### What the mechanical split broke, and the checker gap it exposed
+
+Partitioning the gate table by table **row number** cut straight through
+computation blocks: `dM1`…`d26` were computed in one section and displayed in the
+next, `bN2` and `m5StateSum` likewise. Each function is now **self-contained** —
+it recomputes the handful of `array.get` values it needs, which is cheap and
+removes the ordering dependency entirely.
+
+Two checker corrections came out of it:
+
+1. It now recognises that a name declared in function `F` and referenced inside
+   function `G` is **not a leak when `G` declares it too** — Pine gives each
+   function its own scope, and the first version flagged eight false positives.
+   A checker that cries wolf gets ignored, which is how the original blind spot
+   survived.
+2. Dead locals left behind by the split (`f_gtProbes` was computing fourteen values
+   it no longer displayed) are now removed rather than tolerated.
+
+### The standing tension, stated plainly
+
+The diagnostics have earned their place — D-039, D-046 and D-047 were each settled
+by them, and D-042 was settled by fixing how one was *displayed*. But they now
+outweigh the engine in statement count and compete with it for two fixed budgets.
+
+If either limit tightens again, the honest move is retiring diagnostics whose
+questions are **closed** — the derived-vs-independent cross-check has served its
+purpose, and the M6 class breakdown settled D-032 and D-034 — rather than thinning
+the engine to make room for instruments that are no longer asking anything.

@@ -86,7 +86,17 @@ for nm,a,b in fnspans:
         if not m: continue
         v=m.group(1)
         if len(v)<3: continue
-        out=[k+1 for k,x in enumerate(code) if not (a<=k<b) and re.search(r'\b'+re.escape(v)+r'\b', re.sub(r'"[^"]*"','""',x))]
+        # A reference inside ANOTHER function that declares the same name locally is
+        # not a leak -- Pine gives each function its own scope.
+        def declared_in(span):
+            return any(re.match(r'^\s+(?:var\s+)?(?:float|int|bool|string|table|label|line|array<[^>]+>)?\s*'+re.escape(v)+r'\s*=(?!=)', x) for x in code[span[0]+1:span[1]])
+        out=[]
+        for k,x in enumerate(code):
+            if a<=k<b: continue
+            if not re.search(r'\b'+re.escape(v)+r'\b', re.sub(r'"[^"]*"','""',x)): continue
+            owner=next(((s2,e2) for n2,s2,e2 in fnspans if s2<=k<e2), None)
+            if owner and declared_in(owner): continue
+            out.append(k+1)
         if out: leaks.append((nm,v,out[:3]))
 print("SCOPE LEAKS (declared in fn, used outside):", leaks[:8] if leaks else "none")
 
