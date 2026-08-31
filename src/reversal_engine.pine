@@ -574,80 +574,84 @@ lvlN = array.new<string>()
 lvlC = array.new<int>()      // class id, parallel to lvlP/lvlN (diagnostics)
 lvlSwp = array.new<bool>()   // is this level SWEEPABLE by M6? (D-032)
 
-if sPDHL
-    if not na(pdH)
-        array.push(lvlP, pdH)
-        array.push(lvlN, "PDH")
-        array.push(lvlC, 0)
+// Wrapped per D-048: array.push mutation is legal inside a Pine function; only
+// assignment to a global would not be.
+f_buildLevels() =>
+    if sPDHL
+        if not na(pdH)
+            array.push(lvlP, pdH)
+            array.push(lvlN, "PDH")
+            array.push(lvlC, 0)
+            array.push(lvlSwp, true)
+        if not na(pdL)
+            array.push(lvlP, pdL)
+            array.push(lvlN, "PDL")
+            array.push(lvlC, 1)
+            array.push(lvlSwp, true)
+    if sPDC and not na(pdC)
+        array.push(lvlP, pdC)
+        array.push(lvlN, "PDC")
+        array.push(lvlC, 2)
         array.push(lvlSwp, true)
-    if not na(pdL)
-        array.push(lvlP, pdL)
-        array.push(lvlN, "PDL")
-        array.push(lvlC, 1)
+    if sONHL
+        if not na(onH)
+            array.push(lvlP, onH)
+            array.push(lvlN, "ONH")
+            array.push(lvlC, 3)
+            array.push(lvlSwp, true)
+        if not na(onL)
+            array.push(lvlP, onL)
+            array.push(lvlN, "ONL")
+            array.push(lvlC, 4)
+            array.push(lvlSwp, true)
+    if sIB
+        if not na(ibH)
+            array.push(lvlP, ibH)
+            array.push(lvlN, "IBH")
+            array.push(lvlC, 5)
+            array.push(lvlSwp, true)
+        if not na(ibL)
+            array.push(lvlP, ibL)
+            array.push(lvlN, "IBL")
+            array.push(lvlC, 6)
+            array.push(lvlSwp, true)
+    if sOR
+        if not na(orH)
+            array.push(lvlP, orH)
+            array.push(lvlN, "ORH")
+            array.push(lvlC, 7)
+            array.push(lvlSwp, true)
+        if not na(orL)
+            array.push(lvlP, orL)
+            array.push(lvlN, "ORL")
+            array.push(lvlC, 8)
+            array.push(lvlSwp, true)
+    if sRTHopen and not na(rthOpen)
+        array.push(lvlP, rthOpen)
+        array.push(lvlN, "RTHo")
+        array.push(lvlC, 9)
         array.push(lvlSwp, true)
-if sPDC and not na(pdC)
-    array.push(lvlP, pdC)
-    array.push(lvlN, "PDC")
-    array.push(lvlC, 2)
-    array.push(lvlSwp, true)
-if sONHL
-    if not na(onH)
-        array.push(lvlP, onH)
-        array.push(lvlN, "ONH")
-        array.push(lvlC, 3)
+    if sSwing
+        if not na(lastPH)
+            array.push(lvlP, lastPH)
+            array.push(lvlN, "SwH")
+            array.push(lvlC, 10)
+            array.push(lvlSwp, sweepUseSwings)
+        if not na(lastPL)
+            array.push(lvlP, lastPL)
+            array.push(lvlN, "SwL")
+            array.push(lvlC, 11)
+            array.push(lvlSwp, sweepUseSwings)
+    if sRound
+        array.push(lvlP, rUp)
+        array.push(lvlN, "Rnd+")
+        array.push(lvlC, 12)
         array.push(lvlSwp, true)
-    if not na(onL)
-        array.push(lvlP, onL)
-        array.push(lvlN, "ONL")
-        array.push(lvlC, 4)
+        array.push(lvlP, rDn)
+        array.push(lvlN, "Rnd-")
+        array.push(lvlC, 13)
         array.push(lvlSwp, true)
-if sIB
-    if not na(ibH)
-        array.push(lvlP, ibH)
-        array.push(lvlN, "IBH")
-        array.push(lvlC, 5)
-        array.push(lvlSwp, true)
-    if not na(ibL)
-        array.push(lvlP, ibL)
-        array.push(lvlN, "IBL")
-        array.push(lvlC, 6)
-        array.push(lvlSwp, true)
-if sOR
-    if not na(orH)
-        array.push(lvlP, orH)
-        array.push(lvlN, "ORH")
-        array.push(lvlC, 7)
-        array.push(lvlSwp, true)
-    if not na(orL)
-        array.push(lvlP, orL)
-        array.push(lvlN, "ORL")
-        array.push(lvlC, 8)
-        array.push(lvlSwp, true)
-if sRTHopen and not na(rthOpen)
-    array.push(lvlP, rthOpen)
-    array.push(lvlN, "RTHo")
-    array.push(lvlC, 9)
-    array.push(lvlSwp, true)
-if sSwing
-    if not na(lastPH)
-        array.push(lvlP, lastPH)
-        array.push(lvlN, "SwH")
-        array.push(lvlC, 10)
-        array.push(lvlSwp, sweepUseSwings)
-    if not na(lastPL)
-        array.push(lvlP, lastPL)
-        array.push(lvlN, "SwL")
-        array.push(lvlC, 11)
-        array.push(lvlSwp, sweepUseSwings)
-if sRound
-    array.push(lvlP, rUp)
-    array.push(lvlN, "Rnd+")
-    array.push(lvlC, 12)
-    array.push(lvlSwp, true)
-    array.push(lvlP, rDn)
-    array.push(lvlN, "Rnd-")
-    array.push(lvlC, 13)
-    array.push(lvlSwp, true)
+    0
 
 // Level TYPE, indexed by class id (D-034). 0 = BARRIER, 1 = REFERENCE.
 //   BARRIER   an extreme; a position is protected against it, so stops rest beyond
@@ -656,9 +660,12 @@ if sRound
 //             crossing it is ordinary rotation rather than a failed auction.
 // This is the same field D-028 needs for the M1 damping question -- M1's
 // redundancy is with BEING AT A SESSION EXTREME, which is exactly this
-// distinction. Added once, serving both.
+// distinction. Added once, serving both. MUST stay at global scope: it is read by
+// M1's barrier check and by the class-breakdown table.
 //        PDH PDL PDC ONH ONL IBH IBL ORH ORL RTHo SwH SwL Rnd+ Rnd-
 var array<int> CLS_TYP = array.from(0,  0,  1,  0,  0,  0,  0,  0,  0,  1,   0,  0,  1,   1)
+
+f_buildLevels()
 
 // =============================================================================
 // M6 ENGINE  --  sweep and reclaim (category Q)
@@ -1511,41 +1518,46 @@ m1Rank = ePrimary == "M1" ? 0 : 1
 m5Rank = ePrimary == "M5" ? 0 : 1
 
 // OFF -> excluded entirely. ON -> effective weight always counted (D-002).
-if useVwap and M1_IMPL
-    array.push(mods, mVwap)
-    array.push(wts,  wVwap)
-    array.push(cats, CAT_E)
-    array.push(prec, m1Rank)
-if useStruct and M2_IMPL
-    array.push(mods, mStruct)
-    array.push(wts,  wStruct)
-    array.push(cats, CAT_L)
-    array.push(prec, 0)
-if useProfile and M3_IMPL
-    array.push(mods, mProfile)
-    array.push(wts,  wProfile)
-    array.push(cats, CAT_L)
-    array.push(prec, 1)
-if useDelta and M4_IMPL
-    array.push(mods, mDelta)
-    array.push(wts,  wDelta)
-    array.push(cats, CAT_F)
-    array.push(prec, 0)
-if useExhaust and M5_IMPL
-    array.push(mods, mExhaust)
-    array.push(wts,  wExhaust)
-    array.push(cats, CAT_E)
-    array.push(prec, m5Rank)
-if useSweep and M6_IMPL
-    array.push(mods, mSweep)
-    array.push(wts,  wSweep)
-    array.push(cats, CAT_Q)
-    array.push(prec, 0)
-if useContext and M7_IMPL
-    array.push(mods, mContext)
-    array.push(wts,  wContext)
-    array.push(cats, CAT_C)
-    array.push(prec, 0)
+// Wrapped per D-048. Pushes only; the composite contract is unchanged.
+f_pushModules() =>
+    if useVwap and M1_IMPL
+        array.push(mods, mVwap)
+        array.push(wts,  wVwap)
+        array.push(cats, CAT_E)
+        array.push(prec, m1Rank)
+    if useStruct and M2_IMPL
+        array.push(mods, mStruct)
+        array.push(wts,  wStruct)
+        array.push(cats, CAT_L)
+        array.push(prec, 0)
+    if useProfile and M3_IMPL
+        array.push(mods, mProfile)
+        array.push(wts,  wProfile)
+        array.push(cats, CAT_L)
+        array.push(prec, 1)
+    if useDelta and M4_IMPL
+        array.push(mods, mDelta)
+        array.push(wts,  wDelta)
+        array.push(cats, CAT_F)
+        array.push(prec, 0)
+    if useExhaust and M5_IMPL
+        array.push(mods, mExhaust)
+        array.push(wts,  wExhaust)
+        array.push(cats, CAT_E)
+        array.push(prec, m5Rank)
+    if useSweep and M6_IMPL
+        array.push(mods, mSweep)
+        array.push(wts,  wSweep)
+        array.push(cats, CAT_Q)
+        array.push(prec, 0)
+    if useContext and M7_IMPL
+        array.push(mods, mContext)
+        array.push(wts,  wContext)
+        array.push(cats, CAT_C)
+        array.push(prec, 0)
+    0
+
+f_pushModules()
 
 // pass 2: lowest rank present in each category takes 1.0, the rest take catDamp.
 minRank = array.new<int>(N_CAT, 9999)
@@ -1753,22 +1765,9 @@ f_stgL(array<bool> ch) =>
 f_stgLQ(array<bool> ch) =>
     array.get(ch, CAT_L) and (array.get(ch, CAT_Q) or array.get(ch, CAT_F))
 
-if confirmed and instOK and tfSupported
-    gfBars := gfBars + 1
-    if m1Active
-        gfM1 := gfM1 + 1
-    if m2Active
-        gfM2 := gfM2 + 1
-    if m6Active
-        gfM6 := gfM6 + 1
-    if m1Active and m2Active
-        gfM12 := gfM12 + 1
-    if m1Active and m6Active
-        gfM16 := gfM16 + 1
-    if m2Active and m6Active
-        gfM26 := gfM26 + 1
-    if m1Active and m2Active and m6Active
-        gfAll3 := gfAll3 + 1
+// Wrapped per D-048. Every write here is array.set on a global array, which is
+// legal inside a function; the scalar counters stay in the main body.
+f_telemetryClassify() =>
     m7s = 0
     if not (useContext and M7_IMPL)
         m7s := 0
@@ -1834,6 +1833,25 @@ if confirmed and instOK and tfSupported
     else
         rvs := 5
     array.set(m5RvolHist, rvs, array.get(m5RvolHist, rvs) + 1)
+    0
+
+if confirmed and instOK and tfSupported
+    gfBars := gfBars + 1
+    if m1Active
+        gfM1 := gfM1 + 1
+    if m2Active
+        gfM2 := gfM2 + 1
+    if m6Active
+        gfM6 := gfM6 + 1
+    if m1Active and m2Active
+        gfM12 := gfM12 + 1
+    if m1Active and m6Active
+        gfM16 := gfM16 + 1
+    if m2Active and m6Active
+        gfM26 := gfM26 + 1
+    if m1Active and m2Active and m6Active
+        gfAll3 := gfAll3 + 1
+    f_telemetryClassify()
 
     m1p = m1Active ? 1 : 0
     m2p = m2Active ? 2 : 0
@@ -1928,9 +1946,10 @@ if showGradeLbl and not blindMode and confirmed and gradeOnset and side != 0
     label.new(bar_index, side == 1 ? low : high, lblTxt, style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(side == 1 ? color.green : color.red, 25), textcolor = color.white, size = size.small)
 
 var table st = na
-if showStatus and barstate.islast
-    if na(st)
-        st := table.new(position.top_right, 2, 51, border_width = 1)
+
+// Wrapped in a function: Pine caps the number of statements in the MAIN
+// body, and these renderers were ~400 of them at global scope (D-048).
+f_fillStatus() =>
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  blindMode ? "** BLIND **" : "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -2062,6 +2081,12 @@ if showStatus and barstate.islast
         table.cell(st, 1, 49, (ungatedGrade == 3 ? "A" : ungatedGrade == 2 ? "B" : ungatedGrade == 1 ? "C" : "-") + " -> " + (finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C" : "-"), text_size = size.tiny)
         table.cell(st, 0, 50, "M7 score", text_size = size.tiny)
         table.cell(st, 1, 50, str.tostring(m7Score, "0.000"), text_size = size.tiny)
+    0
+
+if showStatus and barstate.islast
+    if na(st)
+        st := table.new(position.top_right, 2, 51, border_width = 1)
+    f_fillStatus()
 
 // ---- D-029 diagnostic table: per-class funnel breakdown ----------------------
 // Answers "how much of the penetration count is which level class". Rendered as a
@@ -2069,9 +2094,10 @@ if showStatus and barstate.islast
 var string[] CLS_NM = array.from("PDH","PDL","PDC","ONH","ONL","IBH","IBL","ORH","ORL","RTHo","SwH","SwL","Rnd+","Rnd-")
 
 var table dt = na
-if sweepDebug and barstate.islast
-    if na(dt)
-        dt := table.new(position.bottom_right, 7, 26, border_width = 1)
+
+// Wrapped in a function: Pine caps the number of statements in the MAIN
+// body, and these renderers were ~400 of them at global scope (D-048).
+f_fillClassTable() =>
     table.cell(dt, 0, 0, "M6 BY CLASS", text_size = size.tiny)
     table.cell(dt, 1, 0, "pen",   text_size = size.tiny)
     table.cell(dt, 2, 0, "fire",  text_size = size.tiny)
@@ -2154,12 +2180,19 @@ if sweepDebug and barstate.islast
     table.cell(dt, 0, 20, "LEVELS NOW (" + str.tostring(array.size(lvlP)) + ")", text_size = size.tiny)
     table.cell(dt, 1, 20, lvlListStr, text_size = size.tiny)
     table.merge_cells(dt, 1, 20, 6, 20)
+    0
+
+if sweepDebug and barstate.islast
+    if na(dt)
+        dt := table.new(position.bottom_right, 7, 26, border_width = 1)
+    f_fillClassTable()
 
 // ---- D-037 gate funnel table -------------------------------------------------
 var table gt = na
-if sweepDebug and barstate.islast
-    if na(gt)
-        gt := table.new(position.bottom_left, 5, 80, border_width = 1)
+
+// Wrapped in a function: Pine caps the number of statements in the MAIN
+// body, and these renderers were ~400 of them at global scope (D-048).
+f_fillGateTable() =>
     bN = math.max(1, gfBars)
     table.cell(gt, 0, 0, "GATE FUNNEL", text_size = size.tiny)
     table.cell(gt, 1, 0, "bars", text_size = size.tiny)
@@ -2469,6 +2502,12 @@ if sweepDebug and barstate.islast
     table.cell(gt, 1, 21, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + "  stall " + str.tostring(m1StallRun) + "/" + str.tostring(m1StallBars), text_size = size.tiny)
     table.cell(gt, 2, 21, "peak |z|:", text_size = size.tiny)
     table.cell(gt, 3, 21, str.tostring(m1ExcPeak, "0.00"), text_size = size.tiny)
+    0
+
+if sweepDebug and barstate.islast
+    if na(gt)
+        gt := table.new(position.bottom_left, 5, 80, border_width = 1)
+    f_fillGateTable()
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.

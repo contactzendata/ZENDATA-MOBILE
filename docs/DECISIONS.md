@@ -1895,3 +1895,53 @@ without E for the first time.
 **Wrong if:** the regime gate turns out to suppress M7 on most bars where L+Q
 coincide, which would put C in the same position E is in and mean the gate itself
 is the constraint. `m7State` bucket 2 measures exactly that.
+
+---
+
+## D-048 — The main body hit a hard Pine limit; renderers and pure-mutation blocks move into functions
+**Status:** Accepted · 2026-08-29
+
+`CE10295: The main body of the script is too long. Try wrapping code in functions.`
+Pine caps the number of statements in the **global scope** specifically, and the
+project had been written almost entirely at global scope. Nothing was wrong with
+the logic — it simply outgrew a limit I was not tracking.
+
+**The renderers were the bulk:** 399 `table.cell` calls across three diagnostic
+tables, plus their local derivations. That is what the diagnostic discipline of the
+last several rounds cost, and it was worth it — but it belonged in functions.
+
+### What moved, and the rule that decided it
+
+Pine functions **may mutate** a global array (`array.set` / `array.push` — a method
+call on a reference) but **may not assign** to a global scalar (`x := …`). That
+distinction determined what could be lifted:
+
+| block | statements | why it was safe |
+|---|---|---|
+| `f_fillStatus` / `f_fillClassTable` / `f_fillGateTable` | 522 | render only; read globals, write nothing |
+| `f_buildLevels` | 85 | `array.push` only |
+| `f_pushModules` | 35 | `array.push` only |
+| `f_telemetryClassify` | 65 | `array.set` only; the scalar counters stayed behind |
+
+**~730 statements moved; the main body fell from ~1,770 to ~1,050.** The scalar
+`gf*` counters could not move, because incrementing them is assignment.
+
+### A real defect the mechanical extraction introduced
+
+`f_buildLevels` swallowed the `CLS_TYP` declaration that sat between the registry
+and the M6 engine, making a global constant **function-local**. It is read by M1's
+barrier check and by the class-breakdown table, so this would have compiled as an
+undeclared-identifier error far from its cause — or worse, in a language with
+looser scoping, silently.
+
+**The checker could not see it.** `tools/pinecheck.py` tracked declaration *order*,
+not *scope*. It now detects **declared-inside-a-function-but-referenced-outside**,
+which is exactly this class. Found once by a throwaway audit, now permanent —
+the same correction made after the block-local use-before-declare miss.
+
+### If the limit is still exceeded
+
+The next lift is mechanical but larger: convert the scalar `gf*` counters into a
+single `gfCnt` array so the whole telemetry block becomes array mutation and can
+move wholesale. That is also the D-041 shape — one source, derived views — so it is
+a change worth making on its own terms rather than only to satisfy a compiler.

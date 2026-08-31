@@ -68,6 +68,28 @@ for i,l in enumerate(code):
             bad.append((i+1, tok, first[tok]))
 print("USE-BEFORE-DECLARE (any scope):", bad[:12] if bad else "none")
 
+# --- scope leak: declared inside a function body but referenced outside it.
+# Pine functions cannot export locals, and a wrapped block that swallows a global
+# declaration compiles as "undeclared identifier" far from the real cause.
+fnspans=[]
+for i,l in enumerate(code):
+    if re.match(r'^[A-Za-z_]\w*\s*\(.*\)\s*=>', l):
+        nm=re.match(r'^([A-Za-z_]\w*)',l).group(1)
+        j=i+1
+        while j<len(code) and (code[j].startswith(' ') or code[j].strip()==''):
+            j+=1
+        fnspans.append((nm,i,j))
+leaks=[]
+for nm,a,b in fnspans:
+    for l in code[a+1:b]:
+        m=re.match(r'^\s{4}(?:var\s+)?(?:float|int|bool|string|table|label|line|array<[^>]+>)?\s*([A-Za-z_]\w*)\s*=(?!=)', l)
+        if not m: continue
+        v=m.group(1)
+        if len(v)<3: continue
+        out=[k+1 for k,x in enumerate(code) if not (a<=k<b) and re.search(r'\b'+re.escape(v)+r'\b', re.sub(r'"[^"]*"','""',x))]
+        if out: leaks.append((nm,v,out[:3]))
+print("SCOPE LEAKS (declared in fn, used outside):", leaks[:8] if leaks else "none")
+
 for tb in ('st','dt','gt'):
     cs=re.findall(r'table\.cell\('+tb+r',\s*(\d+),\s*(\d+),',raw)
     if cs:
