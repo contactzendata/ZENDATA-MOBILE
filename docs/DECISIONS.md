@@ -1742,3 +1742,76 @@ contradicting itself.
 **renormalises** to ADR-only rather than dropping M5. Losing expected-move should
 not cost the whole E contribution — a different failure mode from M4's
 all-or-nothing self-disable, and deliberately so.
+
+---
+
+## D-046 — A second module in a category cannot move a category count
+**Status:** Accepted · 2026-08-29
+
+M5 is active on 1,405 bars and `+3rd cat` did not move by one. **This is not the
+D-039 signature.** It is a category-versus-module confusion, and the confusion was
+mine to prevent.
+
+### M5 is genuinely reaching the composite
+
+Verified from the source, not inferred: M5 is pushed with `CAT_E`, all four
+parallel arrays (`mods`/`wts`/`cats`/`prec`) carry exactly 7 pushes, and
+`f_sideEval` receives the `facs` built in the same bar from `prec`. There is no
+stale category set and no missing push.
+
+### Why the number could not move
+
+`+3rd cat` counts **distinct categories**, and M1 already fills E. A second module
+in the same category adds evidence to the *score* and nothing at all to the *count*.
+M5 can only move the gate on bars where **all** of the following hold:
+
+1. L and (Q or F) already present on that side, **and**
+2. M1 is **not** active or does not agree with the side, **and**
+3. M5 is active and does agree.
+
+`M5 active = 1,405` is the wrong denominator for that question — it counts bars
+across the whole chart, most of which have no L+Q at all.
+
+**The diagnostic that settles it** (D-046, added): on the `L+(Q|F)` bars only,
+classify who fills E — *neither / M1 only / M5 only / both* — as one
+mutually-exclusive array summing to the L+Q count. **Bucket 2, "M5 only", is
+exactly the number of bars M5 could have added.** If it is 0, M5 cannot help the
+gate and no tuning of M5 will change that.
+
+### The structural reason to expect bucket 2 to be small
+
+M6 fires on the **reclaim**, which moves price *back toward the middle* of the
+range. M1 requires price extended from VWAP; M5 requires the block range spent
+**and price at a block extreme**. Both E modules want price *away* from the middle
+at the moment M6 wants it *returning* to the middle.
+
+This is Finding C from D-037 — M1/M6 anti-correlated in time — and it applies to
+M5 for the same reason, because it comes from what category Q *is*, not from how
+either E module is built. **The whole E category is anti-correlated with Q by
+construction**, so adding E modules cannot fix an E∩Q coincidence problem.
+
+If bucket 2 is near zero, the constraint was never E-availability, and the honest
+options are: relax the timing coupling (M6's hold window is the only lever that
+already exists), or accept that L+Q+E simultaneity is rare and the gate's third
+category should come from C — the one category with no timing relationship to the
+reclaim. That is a D-019 change and needs the measurement first.
+
+### M5 state, reconciled and now labelled
+
+The reported buckets summed 1,000 short of bars while the in-Pine check said OK;
+`s6 = 1177` (not 177) satisfies all three reported facts simultaneously — the sum,
+the active count of 1,405, and the 16.2% ADR-only share. Per D-042 the row was
+still packing three counts per cell; it is now **one bucket per row with its name**.
+
+| state | bars | share |
+|---|---|---|
+| outside block | 1,722 | 14.9% |
+| baseline warming | 462 | **4.0%** |
+| **in ramp, range unspent** | **7,398** | **64.1%** |
+| mid-range, no direction | 557 | 4.8% |
+| ACTIVE adr-only | 228 | 2.0% |
+| ACTIVE adr+em | 1,177 | 10.2% |
+
+**Warm-up is not the problem — it is 4%.** The dominant state is *the block range
+has not been spent*, which is M5 working correctly and rarely, exactly as intended.
+The `m5AdrWarm` hypothesis is refuted.
