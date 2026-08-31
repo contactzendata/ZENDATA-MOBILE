@@ -2158,3 +2158,73 @@ Two changes:
 This is the retirement policy D-049 anticipated, applied for the first time: when
 the instrument competes with legibility, retire the questions that are **answered**
 rather than thinning the engine or asking the reader to be more careful.
+
+---
+
+## D-053 — `catFillMin` set to 0.15 on measurement; NQ preset audit
+**Status:** Accepted · 2026-08-29
+
+### The threshold, chosen against the fill-rate table (GC 5m, 11,552 bars)
+
+| | 0.00 | 0.15 | change |
+|---|---|---|---|
+| **L (M2)** | 178 | 178 | **0.0%** |
+| E (M1/M5) | 2318 | 1880 | −18.9% |
+| Q (M6) | 1515 | 1459 | −3.7% |
+| **C (M7)** | 3879 | 1653 | **−57.4%** |
+| GATE pass | 19 | 7 | −63.2% |
+
+**L does not move at all.** The proximity window already filters, so M2's missing
+score condition was not the exposure it appeared to be — the concern was right to
+raise and wrong on the facts. C absorbs nearly the whole cost, which is exactly
+where the score distribution said the noise was (24% of its active bars under
+0.05). 0.30 and 0.45 cut into E and Q, which are already scarce.
+
+**The gate gets rarer, and that is the correct direction.** Nineteen passes
+containing modules scoring 0.001 are worth less than seven that mean something.
+Recording this explicitly because the opposite pressure — tuning until grades
+appear — is the standing failure mode of this kind of work.
+
+### NQ preset audit — what differs, and one thing that should but does not
+
+**Already instrument-conditional:** RTH and overnight sessions, reversal windows,
+VWAP auction blocks, round-number step (25 index points vs $10), IV symbol
+(VIX vs GVZ), all four context symbols and their polarity, and the gamma path.
+
+**Correctly instrument-agnostic:** everything expressed as a ratio or a duration —
+VWAP sigma bands, ADR exhaustion ratios, RVOL, ADX, and M6's ATR-fractional
+penetration and re-arm bands (D-023).
+
+**The gap: `structProx` is still 8 TICKS.**
+
+| | 8 ticks | as % of daily range |
+|---|---|---|
+| NQ | 2.00 index pts | 0.571% of ~350 pts |
+| GC | $0.80/oz | 1.778% of ~$45 |
+
+**The same tick count is ~3.1× wider on GC than on NQ relative to volatility.**
+This is precisely the mistake D-023 identified and fixed in M6 — ticks normalise
+the price *increment* across instruments but not the *volatility* — and M2 was
+never brought along.
+
+**Consequence for the NQ run:** L will be measured through a window roughly three
+times tighter, relative to how far NQ moves, than the GC baseline. **L is
+mandatory**, so if NQ's L fill rate comes back far below GC's 178, the tick unit
+is a candidate explanation and not a finding about NQ.
+
+**Deliberately not changed before the run.** Altering it now would mean the NQ
+funnel measures a different engine than the GC baseline it is being compared
+against. The fix — `structProx` as an ATR fraction, mirroring `sweepMinAtr` — is
+one input and should follow the measurement, not precede it.
+
+### The NQ unknown that gates everything else
+
+`USI:TICK` / `USI:ADD` / `USI:VOLD` / `USI:TRIN` are not on every TradingView plan.
+If they do not resolve, `ctxNavail == 0`, M7 sits in state 1 (`NO CONTEXT DATA`),
+**C never fills on NQ**, and the category added specifically to escape the E∩Q
+anti-correlation is unavailable on that instrument.
+
+`CTX SYMBOLS OK` answers this in one row and should be read before anything else
+in the NQ funnel. If it comes back 0-symbol dominant, the contingency is a macro
+context path for NQ (DXY / yields as risk-on-risk-off proxies, or VIX) rather than
+breadth internals — the same four slots, different symbols, no structural change.
