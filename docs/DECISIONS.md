@@ -2228,3 +2228,187 @@ anti-correlation is unavailable on that instrument.
 in the NQ funnel. If it comes back 0-symbol dominant, the contingency is a macro
 context path for NQ (DXY / yields as risk-on-risk-off proxies, or VIX) rather than
 breadth internals — the same four slots, different symbols, no structural change.
+
+---
+
+## D-054 — `structProx` becomes a fraction of DAILY ATR; and the sign of the artefact runs the other way
+
+**Status:** implemented. `structProxAtr = 0.010` (was `structProx = 8` ticks).
+
+### The unit
+
+D-053 recorded that 8 ticks is not a unit: it is 2.00 index points on NQ and
+$0.80 on GC, which against ~350 pt and ~$45 daily ATRs is 0.0057 and 0.0178 of
+daily volatility. `proxDistPx` is now `structProxAtr × atrDaily`, floored at one
+tick — a window narrower than a tick admits only an exact match, which is not
+proximity. When the daily ATR has not resolved the window is `na` and M2 is
+INACTIVE; it does **not** fall back to a tick count, because a fallback in the
+other unit reintroduces exactly the incomparability this replaces, and does it
+on the early bars nobody inspects.
+
+### Daily ATR, not the chart-TF reference M6 uses
+
+M6 measures an **event inside a bar** — a penetration — so its bands should scale
+with the bar, which is why `sweepAtrRef` defaults to Chart TF (D-023). M2 asks a
+**location** question: is price *at* the level. That answer must not change when
+you switch the chart from 5m to 15m. So M2 takes `atrDaily` directly rather than
+following `sweepAtrRef`, and the two modules deliberately do not share a
+volatility reference. `atrDaily` already existed for M6; no new `request` call.
+
+### Why 0.010
+
+Two independent arguments land in the same place:
+
+1. **Geometric midpoint** of what 8 ticks actually resolved to (0.0057, 0.0178).
+   It widens NQ ×1.76 and narrows GC ×0.57. Anchoring on either instrument's
+   current value would preserve one arbitrary tick count as the reference; the
+   midpoint preserves neither, which is the point.
+2. **Bar-range cross-check.** A 5m bar's range is roughly 1/20th–1/25th of daily
+   ATR on both instruments, so 0.010 dATR is about a quarter of a bar's range —
+   "at the level". 0.018 would be nearer 40% of a bar, which is "near it".
+
+Resolved equivalents, published in the status table alongside the fraction:
+**NQ ≈ 3.5 pts (14 ticks); GC ≈ $0.45 (4.5 ticks).** Read those before trusting
+the fraction.
+
+### The correction: the artefact does not explain the L gap
+
+The working hypothesis for the re-run was that NQ's L fill of 698 against GC's
+178 was mostly a units artefact. **The sign runs the other way.** D-053 measured
+the window as ~3.1× looser on **GC**, not on NQ:
+
+| | 8 ticks as fraction of daily ATR | L fill @0.15 |
+|---|---|---|
+| NQ | 0.0057 | 698 |
+| GC | 0.0178 | 178 |
+
+NQ fills L **3.9× more often through a window 3.1× tighter** relative to its own
+volatility. Normalising both to 0.010 therefore **widens** the gap rather than
+closing it — NQ's L should rise above 698 and GC's should fall below 178. If the
+re-run is read expecting convergence, a growing gap will look like a regression
+when it is the predicted result.
+
+**So the L gap is not a units artefact and needs another explanation.** The
+leading candidate is **round-number density**, which is instrument-conditional by
+design: the NQ step is 25 points against a ~350 pt range (~14 round levels per
+day); the GC step is $10 against a ~$45 range (~4.5 per day). That ratio, ~3.1,
+is close to the observed L ratio of 3.9 — near enough that the level *registry*,
+not the proximity *window*, is where the difference most likely lives. Not
+measured: confirming it needs an L-fill breakdown by level class, which is not
+built and is not being built pre-emptively.
+
+### Risk being accepted
+
+GC's sample is the thinner of the two (L 178, gate 7 at `catFillMin` 0.15).
+Narrowing its window ×0.57 may take the GC gate close to zero and make that
+funnel unreadable. That is accepted for one run because the unit has to be fixed
+before either funnel means anything. If GC's gate does collapse, the response is
+to raise the fraction **as a measured decision on the instrument that
+constrains** — not to average the two.
+
+---
+
+## D-055 — Context availability is intermittent, and "not `na`" was never the same as "live"
+
+**Status:** instrument built and wired. Measures only; changes no engine
+behaviour. The suspected defect below is deliberately **not** fixed ahead of the
+measurement.
+
+### What the NQ run showed
+
+`CTX SYMBOLS OK` on NQ1! 5m, 11558 bars:
+
+| symbols resolving | bars | share |
+|---|---|---|
+| 0 | 1975 | 17.1% |
+| 1 | 3701 | 32.0% |
+| 2 | 1782 | 15.4% |
+| 3 | 432 | 3.7% |
+| 4 | 3668 | 31.7% |
+
+**The standing conditional does not fire.** It was written for the case where
+`CTX SYMBOLS OK` came back 0-symbol dominant, i.e. `USI:TICK/ADD/VOLD/TRIN`
+unavailable to this account. They resolve — on 82.9% of bars at least one does,
+and on 31.7% all four do. So the finding is *not* that NQ's context path is
+structurally weaker than GC's for want of data, and no entry claiming that is
+warranted. A DXY/VIX substitute is not needed and would not be justified here.
+
+### Why the shape matters more than the totals
+
+3668 bars with all four resolving is close to what the RTH block alone
+contributes: blk3 is 0930–1600, 78 bars per session, and 11558 bars over ~44
+sessions gives ~3400 RTH bars. That much fits the RTH-only reading.
+
+What does **not** fit it is the middle. Clean session gating produces a *bimodal*
+distribution — four symbols inside RTH, zero outside, with the intermediate
+buckets near-empty. Instead buckets 1–3 hold **5915 bars, 51% of the sample**.
+A gradient of that size is the signature of sources going unavailable *one at a
+time and at different rates*, not of a session boundary.
+
+### The mechanism this points at, and why it is worse than absence
+
+`request.security()` with `gaps_off` **holds the last known value forward**. A
+symbol that has stopped printing keeps returning a number, so `not na(ctxV)` is
+true long after the source went quiet. The z-score is what actually goes `na`,
+and it does so only once `ta.stdev` over the lookback reaches zero — which
+happens at a different bar for each series depending on how much variance its
+window still holds. That produces precisely the observed 4→3→2→1→0 gradient.
+
+If that is what is happening, then during the decay window the engine is not
+short of data — it is computing a z-score over a series that is **partly real and
+partly a stale repeat of the last RTH print**, and scoring it as live evidence.
+That violates the module contract stated in the file itself: *a module that
+cannot source its data returns `active = false`, never a fabricated value.* The
+composite cannot distinguish fabricated evidence from real evidence, which is the
+same class of fault as D-039, arriving through a different door.
+
+This would be the **third appearance of the D-038 dead-zone pattern**, in a third
+module — but with a sharper edge than the first two. M1's and M5's dead zones
+were *absence*: the module knew it had nothing. This one is *stale presence*: the
+module cannot tell.
+
+### The instrument
+
+Four extra `request.security` calls fetch each context symbol's own bar **time**
+(budget: 10 of ~40 used). A source is LIVE on a bar if its bar time advanced;
+otherwise the value is held forward. The test is "advanced" rather than "equals
+the chart bar time" so it stays correct when `ctxTF` is below the chart TF; it
+under-reports if `ctxTF` is above it, which the 5m default on a 5m chart is not.
+
+New table `ct`, top-left, six columns by eighteen rows — its own table rather
+than nineteen more rows on `gt`, which is at 88 of 95 and which D-052 already
+recorded as a source of transcription error in its own right. Three counts per
+(slot, auction block), because the **gaps between them are the diagnosis**:
+
+| | meaning | what it isolates |
+|---|---|---|
+| RAW | the series returned a number, hold-forward included | whether the symbol resolves for this account at all |
+| LIVE | the source's own bar time advanced | whether it actually printed here |
+| Z | the z-score resolved — what the engine consumes | whether the lookback, not the data, is the constraint |
+
+Reading it:
+
+- **RAW 0 in every block** → the symbol is unavailable. This is the case the
+  standing conditional was written for, per-symbol rather than in aggregate.
+- **RAW high, LIVE low** → session-bound symbol, and the engine has been reading
+  staleness as evidence. Confirms the mechanism above.
+- **LIVE high, Z low** → the data is there and `ctxZlookMin` is the constraint.
+  A different problem with a different fix.
+
+Blocks are the existing M1 auction blocks (`m1BlkId`), so context availability is
+reported on the same partition M1's dead-zone fix used — the two are directly
+comparable, which is the point of reusing it. Block 0 is "outside every block".
+
+### Two observations recorded but not acted on
+
+1. **M7 is regime-gated on ~72% of NQ bars** (state 2 ≈ 8351 of 11558). Whatever
+   the availability finding turns out to be, the regime gate suppresses M7 on far
+   more bars than missing data does. Not touched — `ctxSeparate` and `adxTrend`
+   are unmeasured placeholders and tuning them now would confound the
+   availability measurement.
+2. **The reported M7 state counts overshoot bars by 29** (1975 + 8351 + 0 + 1261
+   = 11587 vs 11558), while the engine's own sum-vs-bars cell read OK. So one
+   hand-copied figure is off by 29. It changes nothing — regime gating is ~72%
+   either way — and it is the fifth instance of the D-052 pattern, which is why
+   the OK/BAD cells exist and why `ct` carries its own `blk bars sum vs bars`
+   row.

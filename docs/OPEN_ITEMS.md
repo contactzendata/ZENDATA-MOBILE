@@ -124,6 +124,9 @@ weights rather than module logic.
 | **Round-number relocation** (D-034 note) | deferred | `ceil(close/step)*step` relocates when price crosses a step boundary — the D-032 swing defect again. Off by default; needs fixed anchoring, not just a type, if ever enabled. |
 | **D-013 settling test** | unrun | Build the session profile from chart symbol and full-size and compare POC/VAH/VAL placement. Only matters when charting MNQ/MGC; irrelevant while charting NQ/GC directly. |
 | **M4 re-specification trigger** | conditional | If the plan tier ever provides real footprint data, M4 is **re-specified, not re-tuned** (D-012). |
+| **D-055** context staleness | **suspected, measuring** | `request.security` hold-forward means M7 may be scoring a stale RTH print as live overnight evidence. Instrument built (`ct` table); the fix is deliberately **not** written ahead of the measurement. |
+| **M7 regime gate ~72% of NQ bars** | unmeasured | State 2 dominates M7 far more than missing data does. `ctxSeparate` / `adxTrend` are placeholders. Not touched while the availability measurement is running. |
+| **L-fill by level class** | not built | Would test the round-number-density hypothesis for the NQ/GC L gap (D-054). Not built pre-emptively. |
 
 ---
 
@@ -136,6 +139,9 @@ weights rather than module logic.
 | **D-031** re-arm gate | built; **`LEAK 0`**, mean margin 2.4× threshold / 31 bars of 9. Gate is tight; thresholds left alone |
 | **D-033** repeat-counter diagnosis | 48% repeat share is the *intended* double-top population, not a failure. The counter and the gate govern different populations |
 | **D-034** barrier vs reference | **BARRIER 3.64 vs REFERENCE 2.35** f/100 exposure-bars. Raw fires/session ordering was inverted by exposure. `sweepUseReference` stays ON |
+| **D-051/053** `catFillMin` | set to 0.15 on measurement. On GC it cut C's fill 3879 → 1653 while L moved 178 → 178 |
+| **D-054** `structProx` units | 8 ticks → 0.010 × daily ATR. Also settled the *direction*: the window was looser on **GC**, so normalising widens the NQ/GC L gap rather than closing it |
+| **NQ internals availability** | `USI:TICK/ADD/VOLD/TRIN` **do resolve**. The standing "structurally weaker context path" conditional does not fire; no macro substitute is warranted |
 
 ---
 

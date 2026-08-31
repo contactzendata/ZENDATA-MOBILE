@@ -68,6 +68,7 @@
 //   M4 delta .............. up to  1   intrabar tick-rule
 //   M5 expected move ...... up to  1   CBOE:VIX (NQ) or CBOE:GVZ (GC)
 //   M7 context ............ up to  4   NQ: TICK/ADD/VOLD/TRIN | GC: DXY/US10Y/US02Y
+//   M7 liveness (D-055) ... up to  4   same symbols, bar TIME rather than close
 //   M7 COT (optional) ..... up to  2   weekly CFTC series
 //   M6 sweep (daily ATR) .. up to  1   daily ATR reference for penetration bands
 //   M8 overnight prior .... up to  0   computed from chart bars only
@@ -339,7 +340,7 @@ roundStep   = input.float(0.0, "  Round-number step (0 = auto)", minval = 0.0, g
 // ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
 grpM2 = "M2 - Structural levels (L)"
 useStruct   = input.bool(true, "Enable structural levels", group = grpM2)
-structProx  = input.int(8, "Proximity window (ticks)", minval = 1, group = grpM2, tooltip = "In TICKS so it carries across NQ (0.25) and GC (0.10) without retuning. Outside this window M2 is INACTIVE regardless of stacking -- which is what preserves its role as the staleness check on an aging M6 hold (D-027).")
+structProxAtr = input.float(0.010, "Proximity window (x DAILY ATR)", minval = 0.001, maxval = 0.500, step = 0.001, group = grpM2, tooltip = "D-054. WAS 8 TICKS, which is not a unit. 8 ticks is 2.00 index points on NQ (~0.6% of a daily range) and $0.80 on GC (~1.8%), so the same number was roughly 3x looser on NQ and the two instruments' funnels were not comparable -- exactly the mistake D-023 found and fixed in M6, which M2 was never brought along for. Now a fraction of the DAILY ATR. DAILY, not the chart-TF reference M6 uses: M6 measures an EVENT inside a bar, so its bands should scale with the bar; M2 asks a LOCATION question -- is price AT the level -- and that answer must not change when you switch from 5m to 15m. Default 0.010 is the geometric midpoint of what 8 ticks resolved to on the two instruments, so it widens NQ ~1.75x and tightens GC ~1.75x rather than silently preserving either one as the reference. Floored at one tick. Read the resolved tick equivalent in the status table before trusting the fraction.")
 structProxW = input.float(0.5, "Score blend: proximity vs stacking", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM2, tooltip = "Proximity and stacking are scored and logged SEPARATELY and blended here. Proximity = how close price is now. Stacking = how many distinct level classes agree at that price. They answer different questions and only one of them is redundant with M6.")
 structStackFull = input.int(3, "Distinct classes for full stacking credit", minval = 2, maxval = 8, group = grpM2, tooltip = "1 class scores 0, this many scores 1.0, linear between. A lone PDH is not confluence; PDH + ONH + naked POC at one price is.")
 structSweptDamp = input.float(0.3, "Swept-level proximity damping", minval = 0.0, maxval = 1.0, step = 0.05, group = grpM2, tooltip = "CROSS-CATEGORY damping (D-027). When M6 has an active sweep on the nearest level, that level's PROXIMITY term is damped by this factor -- a reclaim IS a close back through the level, so proximity is mechanically forced and adds nothing given M6. Stacking is untouched: M6's score knows nothing about how many level classes sit at that price. 1.0 disables.")
@@ -1045,7 +1046,14 @@ if m6Active and not na(m6SweptPrice) and array.size(lvlP) > 0
 //
 // Only PROXIMITY is damped on a swept level (D-027).
 
-proxDistPx = structProx * tick
+// D-054. The window is a fraction of DAILY ATR, floored at one tick: a window
+// narrower than a tick admits only an exact match, which is not proximity.
+// When the daily ATR has not resolved the window is na and M2 is INACTIVE
+// rather than falling back to a tick count -- a fallback in the OTHER unit
+// would quietly reintroduce the incomparability this replaces, and would do
+// it precisely on the early bars where nobody looks.
+proxDistPx = na(atrDaily) or atrDaily <= 0.0 ? na : math.max(tick, structProxAtr * atrDaily)
+proxDistTk = na(proxDistPx) ? na : proxDistPx / tick
 
 m2NearIdx    = -1
 m2NearDistPx = 0.0
@@ -1058,11 +1066,11 @@ if useStruct and array.size(lvlP) > 0
         if d < bestD
             bestD := d
             m2NearIdx := i
-        if d <= proxDistPx
+        if not na(proxDistPx) and d <= proxDistPx
             m2StackN := m2StackN + 1
     m2NearDistPx := bestD
 
-m2InWindow  = m2NearIdx >= 0 and m2NearDistPx <= proxDistPx
+m2InWindow  = m2NearIdx >= 0 and not na(proxDistPx) and m2NearDistPx <= proxDistPx
 m2NearLvl   = m2NearIdx >= 0 ? array.get(lvlP, m2NearIdx) : na
 m2NearNm    = m2NearIdx >= 0 ? array.get(lvlN, m2NearIdx) : ""
 m2NearSwept = m2NearIdx >= 0 ? array.get(lvlSwept, m2NearIdx) : false
@@ -1369,6 +1377,27 @@ ctxV1 = f_sec(ctxS1, ctxTF, close)
 ctxV2 = f_sec(ctxS2, ctxTF, close)
 ctxV3 = f_sec(ctxS3, ctxTF, close)
 ctxV4 = f_sec(ctxS4, ctxTF, close)
+
+// ---- D-055 LIVENESS PROBE. Instrument only: nothing below reads these. ------
+// request.security() with gaps_off HOLDS the last known value forward, so a
+// symbol that has stopped printing keeps returning a number. "not na" therefore
+// does not mean "live", and the engine currently cannot tell the two apart --
+// which would make a held-forward RTH value look like overnight evidence. The
+// source bar's OWN opening time settles it: if it advanced with this chart bar
+// the source printed here, if it did not we are reading a stale repeat.
+//
+// The test is "advanced", not "equals the chart bar time", so it stays correct
+// when ctxTF is below the chart TF. It under-reports if ctxTF is ABOVE the chart
+// TF, where the source legitimately advances only once per HTF bar -- ctxTF is
+// 5m by default and the measurement runs on 5m, so they are aligned here.
+ctxT1 = f_sec(ctxS1, ctxTF, time * 1.0)
+ctxT2 = f_sec(ctxS2, ctxTF, time * 1.0)
+ctxT3 = f_sec(ctxS3, ctxTF, time * 1.0)
+ctxT4 = f_sec(ctxS4, ctxTF, time * 1.0)
+ctxL1 = not na(ctxT1) and ctxT1 > nz(ctxT1[1], 0.0)
+ctxL2 = not na(ctxT2) and ctxT2 > nz(ctxT2[1], 0.0)
+ctxL3 = not na(ctxT3) and ctxT3 > nz(ctxT3[1], 0.0)
+ctxL4 = not na(ctxT4) and ctxT4 > nz(ctxT4[1], 0.0)
 
 // Direction implied when the series is extreme HIGH.
 //   NQ  TICK/ADD/VOLD high = buying exhaustion -> SHORT (-1)
@@ -1747,6 +1776,27 @@ var array<int> eSrcHist = array.new<int>(4, 0)
 var array<int> m7State = array.new<int>(6, 0)
 // How many context symbols resolved, 0..4. Mutually exclusive, sums to bars.
 var array<int> ctxAvailHist = array.new<int>(5, 0)
+// D-055. Context availability by AUCTION BLOCK, per slot. Three metrics per
+// (slot, block), because they answer different questions and the GAPS between
+// them are the diagnosis:
+//   RAW   the series returned a number. Includes values HELD FORWARD from the
+//         source's last print, so RAW alone proves only that the symbol
+//         resolves for this account at all.
+//   LIVE  the source's own bar time advanced -- it actually printed here.
+//   Z     the z-score resolved. This is what the engine consumes. It needs a
+//         non-zero stdev over the lookback, so a series held flat long enough
+//         goes na while RAW is still a number.
+// Reading it:
+//   RAW 0 in every block          the symbol does not resolve. Unavailable.
+//   RAW high, LIVE low            session-bound symbol; we are reading staleness.
+//   LIVE high, Z low              the lookback is the constraint, not the data.
+// Index is slot * 4 + block, block 0 = outside every auction block.
+var array<int> ctxBlkBars = array.new<int>(4, 0)
+var array<int> ctxRawN    = array.new<int>(16, 0)
+var array<int> ctxLiveN   = array.new<int>(16, 0)
+var array<int> ctxZokN    = array.new<int>(16, 0)
+var array<int> ctxAnyN    = array.new<int>(4, 0)
+var array<int> ctxM7ActN  = array.new<int>(4, 0)
 // What the cap actually did, mutually exclusive, sums to bars.
 //   0 no grade  1 graded, uncapped  2 graded, reduced  3 graded, suppressed to none
 var array<int> capHist = array.new<int>(4, 0)
@@ -1781,6 +1831,40 @@ var int gfM6OutWin    = 0  // M6 live while it is CLOSED -- the dead zone (D-038
 
 f_thrOf(int ti) =>
     ti == 0 ? 0.0 : ti == 1 ? 0.15 : ti == 2 ? 0.30 : 0.45
+
+// D-055. Wrapped per D-048; every write is array.set on a global array.
+f_ctxAvailCount() =>
+    b = m1BlkId
+    array.set(ctxBlkBars, b, array.get(ctxBlkBars, b) + 1)
+    if not na(ctxV1)
+        array.set(ctxRawN, b, array.get(ctxRawN, b) + 1)
+    if ctxL1
+        array.set(ctxLiveN, b, array.get(ctxLiveN, b) + 1)
+    if not na(ctxZ1)
+        array.set(ctxZokN, b, array.get(ctxZokN, b) + 1)
+    if not na(ctxV2)
+        array.set(ctxRawN, 4 + b, array.get(ctxRawN, 4 + b) + 1)
+    if ctxL2
+        array.set(ctxLiveN, 4 + b, array.get(ctxLiveN, 4 + b) + 1)
+    if not na(ctxZ2)
+        array.set(ctxZokN, 4 + b, array.get(ctxZokN, 4 + b) + 1)
+    if not na(ctxV3)
+        array.set(ctxRawN, 8 + b, array.get(ctxRawN, 8 + b) + 1)
+    if ctxL3
+        array.set(ctxLiveN, 8 + b, array.get(ctxLiveN, 8 + b) + 1)
+    if not na(ctxZ3)
+        array.set(ctxZokN, 8 + b, array.get(ctxZokN, 8 + b) + 1)
+    if not na(ctxV4)
+        array.set(ctxRawN, 12 + b, array.get(ctxRawN, 12 + b) + 1)
+    if ctxL4
+        array.set(ctxLiveN, 12 + b, array.get(ctxLiveN, 12 + b) + 1)
+    if not na(ctxZ4)
+        array.set(ctxZokN, 12 + b, array.get(ctxZokN, 12 + b) + 1)
+    if ctxNavail > 0
+        array.set(ctxAnyN, b, array.get(ctxAnyN, b) + 1)
+    if m7Active
+        array.set(ctxM7ActN, b, array.get(ctxM7ActN, b) + 1)
+    0
 
 f_stgL(array<bool> ch) =>
     array.get(ch, CAT_L)
@@ -1913,6 +1997,7 @@ if confirmed and instOK and tfSupported
     if m1Active and m2Active and m6Active
         gfAll3 := gfAll3 + 1
     f_telemetryClassify()
+    f_ctxAvailCount()
 
     m1p = m1Active ? 1 : 0
     m2p = m2Active ? 2 : 0
@@ -2093,7 +2178,7 @@ f_stStruct() =>
     table.cell(st, 0, 23, "-- M2 --", text_size = size.tiny)
     table.cell(st, 1, 23, m2Active ? ("active dir " + str.tostring(m2Dir)) : (m2InWindow ? "in window, dir 0" : "out of window"), text_size = size.tiny)
     table.cell(st, 0, 24, "Nearest lvl", text_size = size.tiny)
-    table.cell(st, 1, 24, (m2NearNm == "" ? "-" : m2NearNm) + "  " + str.tostring(m2NearDistPx / tick, "#.#") + " tk of " + str.tostring(structProx), text_size = size.tiny)
+    table.cell(st, 1, 24, (m2NearNm == "" ? "-" : m2NearNm) + "  " + str.tostring(m2NearDistPx / tick, "#.#") + " tk of " + str.tostring(proxDistTk, "#.#") + " (" + str.tostring(structProxAtr, "0.000") + " dATR)", text_size = size.tiny)
     table.cell(st, 0, 25, "Prox raw/damp", text_size = size.tiny)
     table.cell(st, 1, 25, str.tostring(m2ProxRaw, "0.00") + " -> " + str.tostring(m2Prox, "0.00") + (m2NearSwept ? "  SWEPT" : ""), text_size = size.tiny)
     table.cell(st, 0, 26, "Stack", text_size = size.tiny)
@@ -2272,6 +2357,102 @@ if sweepDebug and barstate.islast
     f_fillClassTable()
 
 // ---- D-037 gate funnel table -------------------------------------------------
+var table ct = na
+
+// D-055. Its own table rather than more rows on gt: gt is at 88 of 95 rows and
+// D-052 already recorded that a 95-row block read by copying digits is itself a
+// source of error. Nineteen more rows there would be adding to the instrument
+// that was miscounted four times.
+f_ctA() =>
+    table.cell(ct, 0, 0, "-- CTX AVAIL BY BLOCK (D-055) --", text_size = size.tiny)
+    table.cell(ct, 1, 0, "outside", text_size = size.tiny)
+    table.cell(ct, 2, 0, "blk1", text_size = size.tiny)
+    table.cell(ct, 3, 0, "blk2", text_size = size.tiny)
+    table.cell(ct, 4, 0, "blk3", text_size = size.tiny)
+    table.cell(ct, 5, 0, "total", text_size = size.tiny)
+    table.cell(ct, 0, 1, "session", text_size = size.tiny)
+    table.cell(ct, 1, 1, "-", text_size = size.tiny)
+    table.cell(ct, 2, 1, vwapB1s, text_size = size.tiny)
+    table.cell(ct, 3, 1, vwapB2s, text_size = size.tiny)
+    table.cell(ct, 4, 1, vwapB3s, text_size = size.tiny)
+    table.cell(ct, 5, 1, tz, text_size = size.tiny)
+    table.cell(ct, 0, 2, "bars", text_size = size.tiny)
+    bs = 0
+    for b = 0 to 3
+        bv = array.get(ctxBlkBars, b)
+        bs := bs + bv
+        table.cell(ct, b + 1, 2, str.tostring(bv), text_size = size.tiny)
+    table.cell(ct, 5, 2, str.tostring(bs), text_size = size.tiny)
+    for s1 = 0 to 1
+        nm = s1 == 0 ? ctxS1 : ctxS2
+        r0 = 3 + s1 * 3
+        table.cell(ct, 0, r0,     "S" + str.tostring(s1 + 1) + " " + nm + "  raw", text_size = size.tiny)
+        table.cell(ct, 0, r0 + 1, "     live", text_size = size.tiny)
+        table.cell(ct, 0, r0 + 2, "     z-ok", text_size = size.tiny)
+        tR = 0
+        tL = 0
+        tZ = 0
+        for b = 0 to 3
+            vR = array.get(ctxRawN,  s1 * 4 + b)
+            vL = array.get(ctxLiveN, s1 * 4 + b)
+            vZ = array.get(ctxZokN,  s1 * 4 + b)
+            tR := tR + vR
+            tL := tL + vL
+            tZ := tZ + vZ
+            table.cell(ct, b + 1, r0,     str.tostring(vR), text_size = size.tiny)
+            table.cell(ct, b + 1, r0 + 1, str.tostring(vL), text_size = size.tiny)
+            table.cell(ct, b + 1, r0 + 2, str.tostring(vZ), text_size = size.tiny)
+        table.cell(ct, 5, r0,     str.tostring(tR), text_size = size.tiny)
+        table.cell(ct, 5, r0 + 1, str.tostring(tL), text_size = size.tiny)
+        table.cell(ct, 5, r0 + 2, str.tostring(tZ), text_size = size.tiny)
+    0
+
+f_ctB() =>
+    for s2 = 2 to 3
+        nm = s2 == 2 ? ctxS3 : ctxS4
+        r0 = 3 + s2 * 3
+        table.cell(ct, 0, r0,     "S" + str.tostring(s2 + 1) + " " + nm + "  raw", text_size = size.tiny)
+        table.cell(ct, 0, r0 + 1, "     live", text_size = size.tiny)
+        table.cell(ct, 0, r0 + 2, "     z-ok", text_size = size.tiny)
+        tR = 0
+        tL = 0
+        tZ = 0
+        for b = 0 to 3
+            vR = array.get(ctxRawN,  s2 * 4 + b)
+            vL = array.get(ctxLiveN, s2 * 4 + b)
+            vZ = array.get(ctxZokN,  s2 * 4 + b)
+            tR := tR + vR
+            tL := tL + vL
+            tZ := tZ + vZ
+            table.cell(ct, b + 1, r0,     str.tostring(vR), text_size = size.tiny)
+            table.cell(ct, b + 1, r0 + 1, str.tostring(vL), text_size = size.tiny)
+            table.cell(ct, b + 1, r0 + 2, str.tostring(vZ), text_size = size.tiny)
+        table.cell(ct, 5, r0,     str.tostring(tR), text_size = size.tiny)
+        table.cell(ct, 5, r0 + 1, str.tostring(tL), text_size = size.tiny)
+        table.cell(ct, 5, r0 + 2, str.tostring(tZ), text_size = size.tiny)
+    table.cell(ct, 0, 15, "ctxNavail > 0", text_size = size.tiny)
+    an = 0
+    for b1 = 0 to 3
+        av = array.get(ctxAnyN, b1)
+        an := an + av
+        table.cell(ct, b1 + 1, 15, str.tostring(av), text_size = size.tiny)
+    table.cell(ct, 5, 15, str.tostring(an), text_size = size.tiny)
+    table.cell(ct, 0, 16, "M7 ACTIVE", text_size = size.tiny)
+    mn = 0
+    for b2 = 0 to 3
+        mv = array.get(ctxM7ActN, b2)
+        mn := mn + mv
+        table.cell(ct, b2 + 1, 16, str.tostring(mv), text_size = size.tiny)
+    table.cell(ct, 5, 16, str.tostring(mn), text_size = size.tiny)
+    bs2 = 0
+    for b3 = 0 to 3
+        bs2 := bs2 + array.get(ctxBlkBars, b3)
+    table.cell(ct, 0, 17, "blk bars sum vs bars", text_size = size.tiny)
+    table.cell(ct, 1, 17, str.tostring(bs2), text_size = size.tiny)
+    table.cell(ct, 2, 17, str.tostring(gfBars), text_size = size.tiny)
+    table.cell(ct, 3, 17, bs2 == gfBars ? "OK" : "BAD", text_size = size.tiny)
+    0
+
 var table gt = na
 
 // Wrapped in a function: Pine caps the number of statements in the MAIN
@@ -2736,6 +2917,12 @@ if sweepDebug and barstate.islast
     f_gtRvol()
     f_gtESrc()
     f_gtM7()
+
+if sweepDebug and barstate.islast
+    if na(ct)
+        ct := table.new(position.top_left, 6, 18, border_width = 1)
+    f_ctA()
+    f_ctB()
 
 // Every module is a stub, so hasSetup is always false. These plots exist so the
 // grade series is chartable and alertable the moment the first module goes live.

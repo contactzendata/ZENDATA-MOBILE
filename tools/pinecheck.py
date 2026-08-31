@@ -133,8 +133,22 @@ for nm,a,b in fnspans:
         badret.append((nm,'duplicate trailing 0'))
 print("FUNCTION RETURN CONVENTION:", badret[:8] if badret else "ok")
 
-for tb in ('st','dt','gt'):
-    cs=re.findall(r'table\.cell\('+tb+r',\s*(\d+),\s*(\d+),',raw)
-    if cs:
-        sz=re.search(r'table\.new\([^,]+,\s*(\d+),\s*(\d+)',raw[raw.index(tb+' := table.new'):]) if tb+' := table.new' in raw else None
-        print(f"{tb}: dup={[k for k,v in Counter(cs).items() if v>1] or 'none'} maxrow={max(int(r) for c,r in cs)} maxcol={max(int(c) for c,r in cs)}")
+# Table names are discovered, not hardcoded: a table added later must not be
+# silently skipped. Cells whose column/row are computed (loop counters) cannot be
+# bounds-checked here, so they are REPORTED as unverified rather than ignored --
+# an instrument that quietly checks nothing is worse than no check.
+for tb in sorted(set(re.findall(r'^var table\s+([A-Za-z_]\w*)\s*=', raw, re.M))):
+    cs  = re.findall(r'table\.cell\('+tb+r',\s*(\d+),\s*(\d+),', raw)
+    dyn = len(re.findall(r'table\.cell\('+tb+r',(?!\s*\d+\s*,\s*\d+\s*,)', raw))
+    sz  = re.search(r'table\.new\([^,]+,\s*(\d+),\s*(\d+)', raw[raw.index(tb+' := table.new'):]) if tb+' := table.new' in raw else None
+    dec = f" declared={sz.group(1)}x{sz.group(2)}" if sz else " declared=?"
+    if not cs and not dyn:
+        print(f"{tb}: NO CELLS{dec}")
+        continue
+    dup = [k for k,v in Counter(cs).items() if v>1] or 'none'
+    mr  = max((int(r) for c,r in cs), default=-1)
+    mc  = max((int(c) for c,r in cs), default=-1)
+    oob = ''
+    if sz and cs and (mc >= int(sz.group(1)) or mr >= int(sz.group(2))):
+        oob = '  *** OUT OF BOUNDS ***'
+    print(f"{tb}: dup={dup} maxrow={mr} maxcol={mc}{dec} dynamic-cells={dyn}{oob}")
