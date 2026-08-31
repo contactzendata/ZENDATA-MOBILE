@@ -445,7 +445,7 @@ too narrow rather than that the rule is wrong.
 ---
 
 ## D-020 — Within-category damping for the second and subsequent modules
-**Status:** Accepted · 2026-08-29 · extends D-014
+**Status:** Accepted · 2026-08-29 · extends D-014 · **precedence mechanism superseded by D-043**
 
 The second and subsequent **enabled** modules in a category contribute at
 `catDamp` (default 0.5), applied to **both numerator and denominator**.
@@ -1658,3 +1658,87 @@ its arithmetic *plus how it is read*. A correct number in an unreadable layout h
 the same effect as a wrong number. Never pack multiple values into one cell in a
 diagnostic table, and never attach an aggregate pass/fail to a row that displays
 only part of what it covers.
+
+---
+
+## D-043 — Category precedence is an input and an explicit rank
+**Status:** Accepted · 2026-08-29 · supersedes D-020's precedence mechanism
+
+D-020 set within-category precedence by **declared push order**: the first enabled
+module in a category took factor 1.0, the rest `catDamp`. With M5 landing as a
+second Extension module that becomes a live decision, and push order is the wrong
+place to make it — it is invisible, and it would have silently decided the same
+question again when M3 arrives as a second Location module.
+
+Precedence is now an explicit **rank per module**, resolved in a second pass by
+finding the lowest rank present in each category. `ePrimary` is an input
+(`M1` / `M5`, default `M1`).
+
+**Why an input rather than a constant.** The evidence ledger (`SPEC.md` §4) rates
+VWAP-band reversion and ADR exhaustion **equally** — both "practitioner-supported,
+thin peer review". Hardcoding either as primary encodes a preference the evidence
+does not support. It is now testable the moment both modules exist.
+
+**Denominator either way:** M1 1.0 + M2 1.0 + M5 0.5 + M6 1.0 = **3.5**, with the
+damped module swapping. Max composite stays 1.000, since numerator and denominator
+carry the same factors (D-039).
+
+---
+
+## D-044 — RVOL multiplies the composite; it is not an E sub-score
+**Status:** Accepted · 2026-08-29
+
+RVOL does not contribute to M5's score. It produces a bounded **multiplier** on the
+composite, applied after the side is resolved and before M8's additive bias, with
+both ends clamped.
+
+**Rationale.** Relative volume is not evidence that a reversal is at hand. It says
+how much participation is behind whatever the other modules found — it amplifies or
+damps their reading. Scoring it inside category E would let heavy volume alone push
+a setup toward a grade, and would let it fill the E category on its own, which is
+the D-019 substitution problem in a new place.
+
+**Bounded by `rvolMaxAmp`** (default 0.25, so 0.75x–1.25x). Like M8's cap, it can
+move a setup across at most one grade boundary and cannot manufacture a grade from
+nothing: the gate resolves the side first, and a bar with no qualifying side gets no
+multiplier at all.
+
+**Time-of-day normalised, per D-005's spirit.** The baseline is an EWMA **per clock
+slot** (`rvolTodBucketMin`, default 30 min) over prior sessions of that same slot.
+Futures volume is strongly U-shaped — heavy at the open and close, thin midday — so
+a flat mean would read every open as permanently elevated RVOL. The baseline is read
+**before** the current bar is folded into it, or RVOL would be self-referential, and
+a slot is unusable until it has seen `rvolWarmN` prior sessions.
+
+---
+
+## D-045 — M5 measures the block's range, not the day's
+**Status:** Accepted · 2026-08-29
+
+Exhaustion is `block range / EWMA of that block's typical range`, using M1's auction
+blocks (D-038) rather than a 24-hour or RTH-only ADR.
+
+**Why.** A daily or RTH-only ADR would make M5 meaningful only inside RTH and dead
+elsewhere — **the exact defect D-038 fixed in M1**, reintroduced one module later
+and in the same category. Since M5 is the second E module, that would have left
+category E with the same dead zone the block anchoring was built to remove.
+
+The question M5 asks is *"has this auction spent its typical range"*, and under the
+block architecture the auction **is** the block.
+
+**Deviation from the source research, stated plainly:** the research says *daily*
+ADR. This is a per-block ADR. It is the right unit given a block-anchored engine,
+but it is not what the research measured, and a block ratio of 1.2x is not the same
+claim as a daily ratio of 1.2x.
+
+**Expected move stays daily**, anchored at the prior session close from the L0
+registry — the conventional reading, and it needs no block treatment because the
+IV-implied move is a daily magnitude. The EM term is counted only when its
+direction agrees with the block-position direction; a disagreement means the two
+are describing different moves, and it degrades to ADR-only rather than
+contradicting itself.
+
+**Degrade, do not disable.** When the IV symbol does not resolve, the blend
+**renormalises** to ADR-only rather than dropping M5. Losing expected-move should
+not cost the whole E contribution — a different failure mode from M4's
+all-or-nothing self-disable, and deliberately so.
