@@ -2026,3 +2026,76 @@ If either limit tightens again, the honest move is retiring diagnostics whose
 questions are **closed** — the derived-vs-independent cross-check has served its
 purpose, and the M6 class breakdown settled D-032 and D-034 — rather than thinning
 the engine to make room for instruments that are no longer asking anything.
+
+---
+
+## D-050 — `active` is a score>0 test, so a category fills on arbitrarily weak evidence
+**Status:** Open finding · 2026-08-29 · **no change applied**
+
+### 1. The cap is reachable; there were simply no grades
+
+`ctxHostile = regimeTrending or gammaHostile or inBlackout` — computed on a path
+that never touches M7's evidence score. `finalGrade` caps whenever `ctxHostile`
+**and** a grade exists. So the cap is **not** structurally unreachable.
+
+`CAP EFFECT` reading 0/0/0 means bucket 0 held every bar: **no grade has occurred
+yet**, so there was nothing to cap. The row now reads `-- CAP: NO GRADES YET --`
+when that is the case, and a `hostile bars` count is displayed beside it so the
+cap's *opportunity* is visible independently of its *effect*.
+
+**One asymmetry is by construction and worth stating:** with `ctxSeparate` on, C
+can only fill when the regime is **not** trending, and the cap only fires when it
+**is** (or on gamma/blackout). So the cap can never act on a grade whose third
+category was C. That is exactly D-047's intent — the cap only ever acts on grades
+that other categories enabled — and it is a designed property, not a gap.
+
+### 2. The bigger finding: activation is decoupled from score
+
+M7 active on 33.6% of bars is not a loose *threshold*. It is a loose *rule*, and
+the rule is shared by every module:
+
+| module | activation condition |
+|---|---|
+| M1 | `m1DistRaw > 0.0` |
+| M5 | `m5Score > 0.0` |
+| M6 | `m6Score > 0.0` |
+| M7 | `m7Score > 0.0` |
+| **M2** | `m2InWindow and m2Dir != 0` — **no score condition at all** |
+
+A single context series at `|z| = 1.51` among four gives
+`ctxEvid = 0.01/4 = 0.0025` — and `active = true`. For four independent normal
+series, "at least one beyond 1.5σ" is ~44% of bars; correlated macro series bring
+that down, and 33.6% is exactly what `ctxZstart = 1.5` predicts.
+
+**So the confluence gate counts categories, and a category fills at score → 0.**
+Three "categories" can be three modules scoring 0.001 each. M2 is worse: it fills
+the *mandatory* Location category anywhere inside the proximity window, including
+the far edge where proximity ≈ 0 and stacking = 0.
+
+The gate reads as strict — Location mandatory, plus an event, plus a third — but
+its unit of "filled" is the loosest available. This has been true since D-019 and
+was invisible while nothing was grading.
+
+### Proposed fix — not applied
+
+A single input, `catFillMin`, applied uniformly: **a module counts toward its
+category only if `score >= catFillMin`.** Keep `active` as-is for the composite, so
+D-002's weighting contract is untouched; test the stronger condition only where
+category hits are recorded in `f_sideEval`.
+
+That separates two things currently conflated: *contributing score* and *counting
+as a leg of the confluence*. Default 0.0 reproduces today's behaviour exactly, so
+it can be introduced with no change and raised against measurement.
+
+Raising `ctxZstart` alone would reduce M7's rate but leave the rule intact, and the
+same defect would remain in M1, M5, M6 and — most importantly — M2.
+
+### Diagnostics added
+
+- **Third-category source on L+Q bars** (`cSrcHist`): none / E only / **C only** /
+  both. Mirrors the E-source array so the two can be compared directly. `C only`
+  is the measure of whether C does what E could not.
+- **M7 evidence-score distribution** when active, six bands with bucket 0 as
+  "not active" so it sums to bars. If the mass sits in `<0.05`, the module is
+  active on noise.
+- **Hostile-bar count**, so cap opportunity is visible separately from cap effect.

@@ -1745,6 +1745,15 @@ var array<int> ctxAvailHist = array.new<int>(5, 0)
 // What the cap actually did, mutually exclusive, sums to bars.
 //   0 no grade  1 graded, uncapped  2 graded, reduced  3 graded, suppressed to none
 var array<int> capHist = array.new<int>(4, 0)
+// D-050: on L+(Q|F) bars, WHICH category supplies the third slot. Mirrors the
+// E-source array so E and C can be compared directly.
+//   0 neither  1 E only  2 C only  3 both
+var array<int> cSrcHist = array.new<int>(4, 0)
+// M7 evidence-score distribution. Bucket 0 is "not active", so it sums to bars.
+//   1 <0.05  2 <0.15  3 <0.30  4 <0.50  5 <0.75  6 >=0.75
+var array<int> m7EvidHist = array.new<int>(7, 0)
+// Was the GATE hostile at all, regardless of whether a grade existed to cap.
+var array<int> hostHist = array.new<int>(2, 0)
 var int gfStgL   = 0
 var int gfStgLQ  = 0
 var int gfStg3   = 0
@@ -1794,6 +1803,23 @@ f_telemetryClassify() =>
     else
         caps := 3
     array.set(capHist, caps, array.get(capHist, caps) + 1)
+    array.set(hostHist, ctxHostile ? 1 : 0, array.get(hostHist, ctxHostile ? 1 : 0) + 1)
+    ev = 0
+    if not m7Active
+        ev := 0
+    else if m7Score < 0.05
+        ev := 1
+    else if m7Score < 0.15
+        ev := 2
+    else if m7Score < 0.30
+        ev := 3
+    else if m7Score < 0.50
+        ev := 4
+    else if m7Score < 0.75
+        ev := 5
+    else
+        ev := 6
+    array.set(m7EvidHist, ev, array.get(m7EvidHist, ev) + 1)
 
     lqL = f_stgLQ(catHitL)
     lqS = f_stgLQ(catHitS)
@@ -1803,6 +1829,10 @@ f_telemetryClassify() =>
         e5ok = m5Active and (m5Dir == sdE or m5Dir == 0)
         esrc = (not e1ok and not e5ok) ? 0 : (e1ok and not e5ok) ? 1 : (e5ok and not e1ok) ? 2 : 3
         array.set(eSrcHist, esrc, array.get(eSrcHist, esrc) + 1)
+        cOk  = m7Active and (m7Dir == sdE or m7Dir == 0)
+        eAny = e1ok or e5ok
+        csrc = (not eAny and not cOk) ? 0 : (eAny and not cOk) ? 1 : (cOk and not eAny) ? 2 : 3
+        array.set(cSrcHist, csrc, array.get(cSrcHist, csrc) + 1)
 
     m5s = 0
     if not (useExhaust and M5_IMPL)
@@ -2502,6 +2532,19 @@ f_gtESrc() =>
     table.cell(gt, 1, 59, str.tostring(e2), text_size = size.tiny)
     table.cell(gt, 0, 60, "3 both", text_size = size.tiny)
     table.cell(gt, 1, 60, str.tostring(e3), text_size = size.tiny)
+    x0 = array.get(cSrcHist, 0)
+    x1 = array.get(cSrcHist, 1)
+    x2 = array.get(cSrcHist, 2)
+    x3 = array.get(cSrcHist, 3)
+    table.cell(gt, 2, 57, "3rd-cat: none", text_size = size.tiny)
+    table.cell(gt, 3, 57, str.tostring(x0), text_size = size.tiny)
+    table.cell(gt, 2, 58, "3rd-cat: E only", text_size = size.tiny)
+    table.cell(gt, 3, 58, str.tostring(x1), text_size = size.tiny)
+    table.cell(gt, 2, 59, "3rd-cat: C ONLY", text_size = size.tiny)
+    table.cell(gt, 3, 59, str.tostring(x2), text_size = size.tiny)
+    table.cell(gt, 2, 60, "3rd-cat: both", text_size = size.tiny)
+    table.cell(gt, 3, 60, str.tostring(x3), text_size = size.tiny)
+    table.cell(gt, 4, 61, "3rd sum " + str.tostring(x0 + x1 + x2 + x3), text_size = size.tiny)
     table.cell(gt, 0, 61, "E src sum vs L+Q", text_size = size.tiny)
     table.cell(gt, 1, 61, str.tostring(eSum), text_size = size.tiny)
     table.cell(gt, 2, 61, str.tostring(gfStgLQ), text_size = size.tiny)
@@ -2573,7 +2616,9 @@ f_gtM7() =>
     k2 = array.get(capHist, 2)
     k3 = array.get(capHist, 3)
     kSum = k0 + k1 + k2 + k3
-    table.cell(gt, 0, 78, "-- CAP EFFECT --", text_size = size.tiny)
+    h0 = array.get(hostHist, 0)
+    h1 = array.get(hostHist, 1)
+    table.cell(gt, 0, 78, k0 == gfBars ? "-- CAP: NO GRADES YET --" : "-- CAP EFFECT --", text_size = size.tiny)
     table.cell(gt, 1, 78, "uncapped " + str.tostring(k1), text_size = size.tiny)
     table.cell(gt, 2, 78, "reduced " + str.tostring(k2), text_size = size.tiny)
     table.cell(gt, 3, 78, "killed " + str.tostring(k3), text_size = size.tiny)
@@ -2581,11 +2626,37 @@ f_gtM7() =>
     table.cell(gt, 1, 79, str.tostring(kSum), text_size = size.tiny)
     table.cell(gt, 2, 79, str.tostring(gfBars), text_size = size.tiny)
     table.cell(gt, 3, 79, kSum == gfBars ? "OK" : "BAD", text_size = size.tiny)
+    table.cell(gt, 4, 78, "hostile bars " + str.tostring(h1) + " (cap reachable)", text_size = size.tiny)
+    v0 = array.get(m7EvidHist, 0)
+    v1 = array.get(m7EvidHist, 1)
+    v2 = array.get(m7EvidHist, 2)
+    v3 = array.get(m7EvidHist, 3)
+    v4 = array.get(m7EvidHist, 4)
+    v5 = array.get(m7EvidHist, 5)
+    v6 = array.get(m7EvidHist, 6)
+    table.cell(gt, 0, 80, "-- M7 SCORE (active) --", text_size = size.tiny)
+    table.cell(gt, 1, 80, "bars", text_size = size.tiny)
+    table.cell(gt, 0, 81, "1  < 0.05", text_size = size.tiny)
+    table.cell(gt, 1, 81, str.tostring(v1), text_size = size.tiny)
+    table.cell(gt, 0, 82, "2  < 0.15", text_size = size.tiny)
+    table.cell(gt, 1, 82, str.tostring(v2), text_size = size.tiny)
+    table.cell(gt, 0, 83, "3  < 0.30", text_size = size.tiny)
+    table.cell(gt, 1, 83, str.tostring(v3), text_size = size.tiny)
+    table.cell(gt, 0, 84, "4  < 0.50", text_size = size.tiny)
+    table.cell(gt, 1, 84, str.tostring(v4), text_size = size.tiny)
+    table.cell(gt, 0, 85, "5  < 0.75", text_size = size.tiny)
+    table.cell(gt, 1, 85, str.tostring(v5), text_size = size.tiny)
+    table.cell(gt, 0, 86, "6  >= 0.75", text_size = size.tiny)
+    table.cell(gt, 1, 86, str.tostring(v6), text_size = size.tiny)
+    table.cell(gt, 0, 87, "M7 evid sum vs bars", text_size = size.tiny)
+    table.cell(gt, 1, 87, str.tostring(v0 + v1 + v2 + v3 + v4 + v5 + v6), text_size = size.tiny)
+    table.cell(gt, 2, 87, str.tostring(gfBars), text_size = size.tiny)
+    table.cell(gt, 3, 87, (v0 + v1 + v2 + v3 + v4 + v5 + v6) == gfBars ? "OK" : "BAD", text_size = size.tiny)
     0
 
 if sweepDebug and barstate.islast
     if na(gt)
-        gt := table.new(position.bottom_left, 5, 80, border_width = 1)
+        gt := table.new(position.bottom_left, 5, 88, border_width = 1)
     f_gtFunnel()
     f_gtProbes()
     f_gtDerived()
