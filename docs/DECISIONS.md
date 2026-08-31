@@ -1532,3 +1532,62 @@ fixed and displayed.
 **`gradesNoM6` is a deliberate invariant, not a masked ceiling:** it is
 structurally 0 while M6 carries gate rule 2 alone, and only becomes informative
 when M4 lands. Recorded so it is not mistaken for a finding.
+
+---
+
+## D-041 — Single-source instruments after two impossible readings
+**Status:** Accepted · 2026-08-29
+
+Two diagnostics reported values the source cannot produce. Rather than continue
+re-reading code that says the outputs are impossible, both were rebuilt so that the
+displayed numbers are **derived from one array** and cannot contradict each other.
+
+### The two impossible readings
+
+**Grade-age buckets.** `0/0/0 (noM6 0 of 8)`. Every path through the telemetry
+increments `gradesTotal` **and exactly one** of `{noM6, fresh, mid, stale}`, so
+`0+0+0+0 = 8` cannot happen. The D-040 mismatch flag then did **not** fire, which
+means `gradesFresh + gradesMid + gradesStale + gradesNoM6 == gradesTotal` evaluated
+true — so the summed values and the displayed values disagreed with each other,
+inside one `table.cell` call built from the same variable names.
+
+**Module coincidence.** `ALL THREE` fell 79 → 41 while every individual and
+pairwise count held identical, on *more* bars (11,268 → 11,539). `gfAll3` reads
+`m1Active and m2Active and m6Active` on the same line-block as the pairwise
+counters — the flags are computed in the module engines, upstream of the push
+guards D-039 changed, so the counter is measuring what its name says. For the
+triple to halve while all three pairwise intersections hold fixed, M1 would have to
+have lost 38 triple-members and gained exactly 38 replacement M1∩M6 members outside
+M2, simultaneously preserving M1∩M2 — a coincidence across three counters at once.
+
+**Neither is explicable from the source.** The honest conclusion is not a mechanism
+but a method failure: independent counters that can drift from their own total are
+un-auditable, and I built several of them.
+
+### The fix: derive, don't accumulate
+
+- **Grade ages** are pushed to `gradeAgeLog`, one entry per grade onset (`-1` for no
+  M6 contribution). Fresh/mid/stale/noM6 and the total are all **derived from that
+  array at render**. The old counters are retained *only* as a cross-check, and the
+  row flips to **`!! COUNTER DISAGREE`** printing both sets when they differ. The
+  raw last-10 ages are printed, so the actual values are visible rather than
+  inferred from bucket counts.
+- **Module coincidence** is now a 3-bit pattern (`1=M1, 2=M2, 4=M6`) accumulated
+  into `comboHist[8]`. Every individual, pairwise and triple count is derived from
+  it — `M1∩M2 = c3+c7`, `ALL3 = c7` — so they are **arithmetically incapable** of
+  contradicting one another. The independent counters are displayed beside the
+  derived ones and flagged **`!! DERIVED DISAGREE`** on any mismatch. The row also
+  checks `sum(comboHist) == gfBars`, catching any bar counted zero or twice.
+
+### The generalisation
+
+D-039: an invariant number under a fix that should have moved it is evidence about
+the measurement. **D-041 extends it:** *a set of counters that can disagree with
+their own total is not an instrument, it is several instruments that happen to be
+printed together.* Where a quantity has an invariant — buckets summing to a total,
+pairwise counts implied by a joint distribution — accumulate the **joint
+distribution** and derive the views. Then a contradiction is impossible by
+construction rather than merely unexpected.
+
+Applies to every diagnostic added from here: prefer one source with derived views
+over several parallel counters, even when the parallel counters look simpler.

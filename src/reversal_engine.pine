@@ -1429,8 +1429,15 @@ var int gradesFresh   = 0
 var int gradesMid     = 0
 var int gradesStale   = 0
 var int gradesNoM6    = 0
+// D-041: a single source of truth. The four counters above are DERIVED views of
+// this log, and the render compares them against it. Four independent counters
+// can disagree with their own total; one array cannot disagree with itself.
+var array<int> gradeAgeLog = array.new<int>()   // -1 = no M6 contribution
 
 if confirmed and gradeOnset
+    array.push(gradeAgeLog, na(m6ContribAge) ? -1 : m6ContribAge)
+    if array.size(gradeAgeLog) > 500
+        array.shift(gradeAgeLog)
     gradesTotal := gradesTotal + 1
     lastGradeLvl := finalGrade
     if na(m6ContribAge)
@@ -1457,6 +1464,11 @@ var int gfM12    = 0
 var int gfM16    = 0
 var int gfM26    = 0
 var int gfAll3   = 0
+// D-041: 3-bit pattern of which modules were active (1=M1, 2=M2, 4=M6). Every
+// individual, pairwise and triple count is DERIVED from this one array, so they
+// are arithmetically incapable of contradicting each other. The independent
+// counters above are kept and cross-checked against it.
+var array<int> comboHist = array.new<int>(8, 0)
 var int gfStgL   = 0
 var int gfStgLQ  = 0
 var int gfStg3   = 0
@@ -1493,6 +1505,11 @@ if confirmed and instOK and tfSupported
         gfM26 := gfM26 + 1
     if m1Active and m2Active and m6Active
         gfAll3 := gfAll3 + 1
+    m1p = m1Active ? 1 : 0
+    m2p = m2Active ? 2 : 0
+    m6p = m6Active ? 4 : 0
+    cpat = m1p + m2p + m6p
+    array.set(comboHist, cpat, array.get(comboHist, cpat) + 1)
 
     if f_stgL(catHitL) or f_stgL(catHitS)
         gfStgL := gfStgL + 1
@@ -1628,10 +1645,31 @@ if showStatus and barstate.islast
         table.cell(st, 0, 20, "FIRE RATE", text_size = size.tiny)
         table.cell(st, 1, 20, str.tostring(m6TotFires / math.max(1, m6Sessions), "#.##") + " / session  (" + str.tostring(m6Sessions) + " sess, " + str.tostring(m6SessFires) + " today)", text_size = size.tiny)
         table.cell(st, 0, 21, "Grade age f/m/s", text_size = size.tiny)
-        table.cell(st, 1, 21, str.tostring(gradesFresh) + " / " + str.tostring(gradesMid) + " / " + str.tostring(gradesStale) + "  (noM6 " + str.tostring(gradesNoM6) + " of " + str.tostring(gradesTotal) + ")", text_size = size.tiny)
+        table.cell(st, 1, 21, str.tostring(dF) + " / " + str.tostring(dM) + " / " + str.tostring(dS) + "  (noM6 " + str.tostring(dN) + " of " + str.tostring(array.size(gradeAgeLog)) + ")", text_size = size.tiny)
+        dF = 0
+        dM = 0
+        dS = 0
+        dN = 0
+        if array.size(gradeAgeLog) > 0
+            for gi = 0 to array.size(gradeAgeLog) - 1
+                av = array.get(gradeAgeLog, gi)
+                if av < 0
+                    dN := dN + 1
+                else if av <= holdBars * 0.34
+                    dF := dF + 1
+                else if av <= holdBars * 0.67
+                    dM := dM + 1
+                else
+                    dS := dS + 1
+        agesRaw = ""
+        if array.size(gradeAgeLog) > 0
+            gStart = math.max(0, array.size(gradeAgeLog) - 10)
+            for gj = gStart to array.size(gradeAgeLog) - 1
+                agesRaw := agesRaw + str.tostring(array.get(gradeAgeLog, gj)) + " "
         gBucketSum = gradesFresh + gradesMid + gradesStale + gradesNoM6
-        table.cell(st, 0, 22, gBucketSum == gradesTotal ? "Last grade" : "!! BUCKET MISMATCH", text_size = size.tiny)
-        table.cell(st, 1, 22, gBucketSum == gradesTotal ? ((na(lastGradeLvl) ? "-" : (lastGradeLvl == 3 ? "A" : lastGradeLvl == 2 ? "B" : "C")) + " at m6 age " + (na(lastGradeAge) ? "-" : str.tostring(lastGradeAge) + "b of " + str.tostring(holdBars))) : ("sum " + str.tostring(gBucketSum) + " != total " + str.tostring(gradesTotal)), text_size = size.tiny)
+        gAgree = gBucketSum == gradesTotal and array.size(gradeAgeLog) == gradesTotal and dF == gradesFresh and dM == gradesMid and dS == gradesStale and dN == gradesNoM6
+        table.cell(st, 0, 22, gAgree ? "ages raw (last 10)" : "!! COUNTER DISAGREE", text_size = size.tiny)
+        table.cell(st, 1, 22, gAgree ? (agesRaw == "" ? "-" : agesRaw) : ("log " + str.tostring(array.size(gradeAgeLog)) + " ctr " + str.tostring(gradesTotal) + " | " + str.tostring(dF) + str.tostring(dM) + str.tostring(dS) + str.tostring(dN) + " vs " + str.tostring(gradesFresh) + str.tostring(gradesMid) + str.tostring(gradesStale) + str.tostring(gradesNoM6)), text_size = size.tiny)
     if structDebug
         table.cell(st, 0, 23, "-- M2 --", text_size = size.tiny)
         table.cell(st, 1, 23, m2Active ? ("active dir " + str.tostring(m2Dir)) : (m2InWindow ? "in window, dir 0" : "out of window"), text_size = size.tiny)
@@ -1755,7 +1793,7 @@ if sweepDebug and barstate.islast
 var table gt = na
 if sweepDebug and barstate.islast
     if na(gt)
-        gt := table.new(position.bottom_left, 4, 27, border_width = 1)
+        gt := table.new(position.bottom_left, 4, 32, border_width = 1)
     bN = math.max(1, gfBars)
     table.cell(gt, 0, 0, "GATE FUNNEL", text_size = size.tiny)
     table.cell(gt, 1, 0, "bars", text_size = size.tiny)
@@ -1842,6 +1880,42 @@ if sweepDebug and barstate.islast
     table.cell(gt, 1, 26, str.tostring(holdBars + 1) + " possible ages", text_size = size.tiny)
     table.cell(gt, 2, 26, "cuts:", text_size = size.tiny)
     table.cell(gt, 3, 26, str.tostring(holdBars * 0.34, "0.0") + " / " + str.tostring(holdBars * 0.67, "0.0"), text_size = size.tiny)
+    // D-041 derived-vs-independent cross-check. Every count below comes from the
+    // one comboHist array, so they cannot contradict each other; the independent
+    // counters are shown beside them and flagged when they disagree.
+    c0 = array.get(comboHist, 0)
+    c1 = array.get(comboHist, 1)
+    c2 = array.get(comboHist, 2)
+    c3 = array.get(comboHist, 3)
+    c4 = array.get(comboHist, 4)
+    c5 = array.get(comboHist, 5)
+    c6 = array.get(comboHist, 6)
+    c7 = array.get(comboHist, 7)
+    dM1 = c1 + c3 + c5 + c7
+    dM2 = c2 + c3 + c6 + c7
+    dM6 = c4 + c5 + c6 + c7
+    d12 = c3 + c7
+    d16 = c5 + c7
+    d26 = c6 + c7
+    okAll = dM1 == gfM1 and dM2 == gfM2 and dM6 == gfM6 and d12 == gfM12 and d16 == gfM16 and d26 == gfM26 and c7 == gfAll3
+    table.cell(gt, 0, 27, okAll ? "derived == indep" : "!! DERIVED DISAGREE", text_size = size.tiny)
+    table.cell(gt, 1, 27, str.tostring(dM1) + "/" + str.tostring(dM2) + "/" + str.tostring(dM6), text_size = size.tiny)
+    table.cell(gt, 2, 27, "indep:", text_size = size.tiny)
+    table.cell(gt, 3, 27, str.tostring(gfM1) + "/" + str.tostring(gfM2) + "/" + str.tostring(gfM6), text_size = size.tiny)
+    table.cell(gt, 0, 28, "derived pairs 12/16/26", text_size = size.tiny)
+    table.cell(gt, 1, 28, str.tostring(d12) + "/" + str.tostring(d16) + "/" + str.tostring(d26), text_size = size.tiny)
+    table.cell(gt, 2, 28, "indep:", text_size = size.tiny)
+    table.cell(gt, 3, 28, str.tostring(gfM12) + "/" + str.tostring(gfM16) + "/" + str.tostring(gfM26), text_size = size.tiny)
+    table.cell(gt, 0, 29, "derived ALL3", text_size = size.tiny)
+    table.cell(gt, 1, 29, str.tostring(c7), text_size = size.tiny)
+    table.cell(gt, 2, 29, "indep:", text_size = size.tiny)
+    table.cell(gt, 3, 29, str.tostring(gfAll3), text_size = size.tiny)
+    table.cell(gt, 0, 30, "combo hist 0..7", text_size = size.tiny)
+    table.cell(gt, 1, 30, str.tostring(c0) + "/" + str.tostring(c1) + "/" + str.tostring(c2) + "/" + str.tostring(c3) + "/" + str.tostring(c4) + "/" + str.tostring(c5) + "/" + str.tostring(c6) + "/" + str.tostring(c7), text_size = size.tiny)
+    table.merge_cells(gt, 1, 30, 3, 30)
+    table.cell(gt, 0, 31, "  bits 1=M1 2=M2 4=M6", text_size = size.tiny)
+    table.cell(gt, 1, 31, "sum " + str.tostring(c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7) + " vs bars " + str.tostring(gfBars), text_size = size.tiny)
+    table.merge_cells(gt, 1, 31, 3, 31)
     table.cell(gt, 0, 21, "walk: run/stall", text_size = size.tiny)
     table.cell(gt, 1, 21, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + "  stall " + str.tostring(m1StallRun) + "/" + str.tostring(m1StallBars), text_size = size.tiny)
     table.cell(gt, 2, 21, "peak |z|:", text_size = size.tiny)
