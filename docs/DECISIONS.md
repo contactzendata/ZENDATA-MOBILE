@@ -1473,3 +1473,62 @@ ignoring a number on screen.
 **Constants, not inputs, on purpose:** implementation state is a fact about the
 source, not a user preference, and must not be settable into a state that
 contradicts the code. Flipping the constant is part of implementing the module.
+
+---
+
+## D-040 — Retroactive ceiling audit, applied as a standing instrument
+**Status:** Accepted · 2026-08-29 · generalises D-039
+
+D-039's lesson — *an invariant number under a fix that should have moved it is
+evidence about the measurement, not the mechanism* — applied backwards over every
+diagnostic in the script. Three real findings.
+
+### 1. `minCats` can exceed the number of categories that can ever fill
+
+Only three categories are reachable with M1 (E), M2 (L) and M6 (Q) implemented.
+`minCats` accepts up to **5**. Setting it to 4 or 5 guarantees **zero output**, and
+that zero would look exactly like a behavioural result — the same failure mode as
+D-039, one level up.
+
+Now displayed: `cats reachable N of 5` against `minCats`, flagged **UNREACHABLE**
+when the demand exceeds the supply.
+
+### 2. `requireOF` is a guaranteed-zero setting while M4 is a stub
+
+Category F cannot fill, so turning `requireOF` on makes every grade impossible.
+The tooltip warned about weakness; it did not say the setting is currently
+*inert-to-zero*. Now displayed as `F fillable: NO`.
+
+### 3. The grade-age histogram is a near-binary instrument
+
+`holdBars = 3` on GC 5m, so `m6ContribAge` can only ever take **4 values (0–3)**,
+and the fresh/mid/stale cuts land at 1.02 and 2.01 — ages 0,1 → fresh; 2 → mid;
+3 → stale. The histogram cannot resolve the question D-026 asks it much better than
+a coin flip. **Not a ceiling but a resolution limit**, and one that argues the
+D-026 question needs a longer hold window or a continuous age readout rather than
+buckets. Now displayed: possible ages and the actual cut points.
+
+### Also added: a bucket self-check
+
+`gradesFresh + gradesMid + gradesStale + gradesNoM6` must equal `gradesTotal` —
+every path through the telemetry block increments exactly one of the four. The
+status table now displays **`!! BUCKET MISMATCH`** with both values when it does
+not, rather than showing a plausible-looking row.
+
+This was added because a reported reading of `0/0/0 (noM6 0 of 8)` is
+**arithmetically impossible from the source**, and no amount of re-reading the code
+resolves it. Rather than invent a mechanism, the invariant is now asserted on
+screen: the next run either shows the row consistent (the earlier reading was
+misread) or prints the mismatch (the counters really are wrong, and it is a Pine
+behaviour not visible in the source).
+
+### Diagnostics audited and found sound
+
+Fire rate and the M6 funnel, `m6RepeatFire`, exposure-normalised `f/100xb`,
+`m6ReArmedOK` / `m6Leak`, and `denomEff` all have no ceiling below their useful
+range. `gfMaxComp` and the top three `gfHist` buckets *did* — that was D-039, now
+fixed and displayed.
+
+**`gradesNoM6` is a deliberate invariant, not a masked ceiling:** it is
+structurally 0 while M6 carries gate rule 2 alone, and only becomes informative
+when M4 lands. Recorded so it is not mistaken for a finding.
