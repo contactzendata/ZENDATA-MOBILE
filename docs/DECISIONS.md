@@ -2491,3 +2491,59 @@ test. The score threshold and the window are not independent. `lNearHist` is
 immune to this, which is why it is the statistic to read rather than the ratio.
 
 87 is not a result and is not being read as one.
+
+---
+
+## D-057 — Load-bearing readings move to the Data Window
+
+**Status:** implemented. The `ct` table stays; the Data Window is authoritative.
+
+Chosen over widening the `ct` table because the two options are not equivalent in
+kind. A roomier table makes the instrument more forgiving of a misread; the Data
+Window emits exact values and **removes the reader from the measurement path**.
+Four transcription discrepancies are on record (D-052), each reconciled
+arithmetically rather than by assertion, and the staleness question is the one
+whose answer decides whether M7's entire contribution comes out of the record. It
+should not depend on reading compressed rows off a chart.
+
+The table is not removed. It stays as the visual cross-check and keeps its
+`blk bars sum vs bars` OK/BAD cell; where the two disagree, **the Data Window
+wins**.
+
+### The constraint that shaped the layout
+
+Pine caps a script at **64 plots**, with no parameter to raise it, and 34 were
+already committed. The 48 per-(slot, block) cells do not fit. The split:
+
+- **Per-symbol totals, all four slots** — `c1..c4 RAW / LIVE / Z`, 12 plots.
+  These answer the blocking question on their own: RAW high with LIVE low is
+  hold-forward staleness, whatever the block breakdown says.
+- **Per-block breakdown, one slot at a time** — `sel b0..b3 RAW / LIVE / Z`, 12
+  plots, driven by `dwCtxSlot`. This answers *when*, at the cost of four reads.
+- `00 BARS` and `00 selSLOT` — the denominator, and the selector echoed back so a
+  reading cannot be mis-attributed to the wrong symbol.
+
+Total 60 of 64. Documented in `PINE_LIMITS.md` §10, and `pinecheck.py` now counts
+plots and warns from 56 upward — the limit is the kind that arrives unannounced,
+because diagnostics are added one or two plots at a time.
+
+These are **cumulative counters**: the value at the **last bar** is the total, not
+the value at the cursor.
+
+### What the reading decides
+
+- **RAW ≈ bars, LIVE ≪ RAW** → the source is session-bound and the engine has been
+  computing z-scores over held-forward prints. M7's numbers are contaminated: the
+  1261 ACTIVE count, the whole C fill-rate column, and every gate reading that
+  depended on C come out of the record for both instruments. `lNearHist` would be
+  the only uncontaminated statistic in the build, because it touches nothing from
+  `request.security` beyond the daily ATR.
+- **RAW ≈ LIVE, Z ≪ LIVE** → the data is live and `ctxZlookMin` is the constraint.
+  A different defect, and M7's history stands.
+- **RAW = 0 for a slot** → that symbol is unavailable, per-symbol rather than in
+  the aggregate the `CTX SYMBOLS OK` bucket count gave.
+
+Nothing downstream is being read until this resolves. `lNearHist` and the NQ gate
+count of 87 are held, per the same reasoning: if M7 was scoring hold-forward data,
+the NQ gate numbers are contaminated through the C category and re-reading them
+now would only add a second layer on top of a suspect first.

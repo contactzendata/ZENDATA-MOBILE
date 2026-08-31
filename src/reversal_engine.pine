@@ -338,6 +338,10 @@ sRound      = input.bool(false, "Round numbers", group = grpL0)
 roundStep   = input.float(0.0, "  Round-number step (0 = auto)", minval = 0.0, group = grpL0, tooltip = "Auto: 25 index points for NQ, $10/oz for GC.")
 
 // ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
+// ---- Data Window readout (D-057) --------------------------------------------
+grpDW = "Data Window readout"
+dwCtxSlot = input.int(1, "Context slot for the per-block plots", minval = 1, maxval = 4, group = grpDW, tooltip = "D-057. Pine caps a script at 64 plots and 34 are already committed, so the per-block breakdown cannot be emitted for all four slots at once. The per-SYMBOL totals below are emitted for all four unconditionally and answer the RAW-vs-LIVE question on their own; this selector only chooses which slot gets its four blocks broken out. Slot order follows the family map: NQ 1=TICK 2=ADD 3=VOLD 4=TRIN, GC 1=DXY 2=US10Y 3=US02Y 4=GC4. selSLOT is plotted alongside so the reading cannot be mis-attributed.")
+
 grpM2 = "M2 - Structural levels (L)"
 useStruct   = input.bool(true, "Enable structural levels", group = grpM2)
 structProxAtr = input.float(0.010, "Proximity window (x DAILY ATR)", minval = 0.001, maxval = 0.500, step = 0.001, group = grpM2, tooltip = "D-054. WAS 8 TICKS, which is not a unit. 8 ticks is 2.00 index points on NQ (~0.6% of a daily range) and $0.80 on GC (~1.8%), so the same number was roughly 3x looser on NQ and the two instruments' funnels were not comparable -- exactly the mistake D-023 found and fixed in M6, which M2 was never brought along for. Now a fraction of the DAILY ATR. DAILY, not the chart-TF reference M6 uses: M6 measures an EVENT inside a bar, so its bands should scale with the bar; M2 asks a LOCATION question -- is price AT the level -- and that answer must not change when you switch from 5m to 15m. Default 0.010 is the geometric midpoint of what 8 ticks resolved to on the two instruments, so it widens NQ ~1.75x and tightens GC ~1.75x rather than silently preserving either one as the reference. Floored at one tick. Read the resolved tick equivalent in the status table before trusting the fraction.")
@@ -3069,6 +3073,62 @@ plot(ungatedGrade, "Grade ungated",        display = display.data_window)
 
 // VWAP and sigma bands. Drawn only when not blind (D-035).
 m1PlotOn = vwapShow and not blindMode
+// =============================================================================
+// D-057  DATA WINDOW READOUT -- the authoritative read for the ct table
+// =============================================================================
+// The ct table renders the same numbers, but reading them off the chart has
+// produced four transcription errors on record, and the staleness question is
+// load-bearing enough that the reader should not be the instrument. These plots
+// carry the identical counters as exact values in the Data Window.
+//
+// They are CUMULATIVE counters, so the value at the LAST BAR is the total. Read
+// them there, not at the cursor.
+//
+// PLOT BUDGET: Pine caps a script at 64 plots and 34 were already committed, so
+// 48 per-(slot, block) cells cannot all be emitted. The split is deliberate:
+// per-symbol TOTALS for all four slots -- which is what the RAW-vs-LIVE question
+// actually needs -- plus the per-block breakdown for one selected slot.
+ctxR1 = array.get(ctxRawN,  0) + array.get(ctxRawN,  1) + array.get(ctxRawN,  2) + array.get(ctxRawN,  3)
+ctxR2 = array.get(ctxRawN,  4) + array.get(ctxRawN,  5) + array.get(ctxRawN,  6) + array.get(ctxRawN,  7)
+ctxR3 = array.get(ctxRawN,  8) + array.get(ctxRawN,  9) + array.get(ctxRawN, 10) + array.get(ctxRawN, 11)
+ctxR4 = array.get(ctxRawN, 12) + array.get(ctxRawN, 13) + array.get(ctxRawN, 14) + array.get(ctxRawN, 15)
+ctxE1 = array.get(ctxLiveN, 0) + array.get(ctxLiveN, 1) + array.get(ctxLiveN, 2) + array.get(ctxLiveN, 3)
+ctxE2 = array.get(ctxLiveN, 4) + array.get(ctxLiveN, 5) + array.get(ctxLiveN, 6) + array.get(ctxLiveN, 7)
+ctxE3 = array.get(ctxLiveN, 8) + array.get(ctxLiveN, 9) + array.get(ctxLiveN,10) + array.get(ctxLiveN,11)
+ctxE4 = array.get(ctxLiveN,12) + array.get(ctxLiveN,13) + array.get(ctxLiveN,14) + array.get(ctxLiveN,15)
+ctxK1 = array.get(ctxZokN,  0) + array.get(ctxZokN,  1) + array.get(ctxZokN,  2) + array.get(ctxZokN,  3)
+ctxK2 = array.get(ctxZokN,  4) + array.get(ctxZokN,  5) + array.get(ctxZokN,  6) + array.get(ctxZokN,  7)
+ctxK3 = array.get(ctxZokN,  8) + array.get(ctxZokN,  9) + array.get(ctxZokN, 10) + array.get(ctxZokN, 11)
+ctxK4 = array.get(ctxZokN, 12) + array.get(ctxZokN, 13) + array.get(ctxZokN, 14) + array.get(ctxZokN, 15)
+dwSo  = (dwCtxSlot - 1) * 4
+
+plot(gfBars,     "00 BARS",   display = display.data_window)
+plot(dwCtxSlot,  "00 selSLOT", display = display.data_window)
+plot(ctxR1, "c1 RAW",  display = display.data_window)
+plot(ctxE1, "c1 LIVE", display = display.data_window)
+plot(ctxK1, "c1 Z",    display = display.data_window)
+plot(ctxR2, "c2 RAW",  display = display.data_window)
+plot(ctxE2, "c2 LIVE", display = display.data_window)
+plot(ctxK2, "c2 Z",    display = display.data_window)
+plot(ctxR3, "c3 RAW",  display = display.data_window)
+plot(ctxE3, "c3 LIVE", display = display.data_window)
+plot(ctxK3, "c3 Z",    display = display.data_window)
+plot(ctxR4, "c4 RAW",  display = display.data_window)
+plot(ctxE4, "c4 LIVE", display = display.data_window)
+plot(ctxK4, "c4 Z",    display = display.data_window)
+plot(array.get(ctxRawN,  dwSo + 0), "sel b0 RAW",  display = display.data_window)
+plot(array.get(ctxLiveN, dwSo + 0), "sel b0 LIVE", display = display.data_window)
+plot(array.get(ctxZokN,  dwSo + 0), "sel b0 Z",    display = display.data_window)
+plot(array.get(ctxRawN,  dwSo + 1), "sel b1 RAW",  display = display.data_window)
+plot(array.get(ctxLiveN, dwSo + 1), "sel b1 LIVE", display = display.data_window)
+plot(array.get(ctxZokN,  dwSo + 1), "sel b1 Z",    display = display.data_window)
+plot(array.get(ctxRawN,  dwSo + 2), "sel b2 RAW",  display = display.data_window)
+plot(array.get(ctxLiveN, dwSo + 2), "sel b2 LIVE", display = display.data_window)
+plot(array.get(ctxZokN,  dwSo + 2), "sel b2 Z",    display = display.data_window)
+plot(array.get(ctxRawN,  dwSo + 3), "sel b3 RAW",  display = display.data_window)
+plot(array.get(ctxLiveN, dwSo + 3), "sel b3 LIVE", display = display.data_window)
+plot(array.get(ctxZokN,  dwSo + 3), "sel b3 Z",    display = display.data_window)
+
 plot(m1PlotOn ? m1Vwap : na, "VWAP", color = color.new(color.blue, 0), linewidth = 2)
 plot(m1PlotOn and not na(m1Sigma) ? m1Vwap + vwapB1 * m1Sigma : na, "+1s", color = color.new(color.gray, 45))
 plot(m1PlotOn and not na(m1Sigma) ? m1Vwap - vwapB1 * m1Sigma : na, "-1s", color = color.new(color.gray, 45))

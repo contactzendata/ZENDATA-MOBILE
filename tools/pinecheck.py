@@ -133,6 +133,14 @@ for nm,a,b in fnspans:
         badret.append((nm,'duplicate trailing 0'))
 print("FUNCTION RETURN CONVENTION:", badret[:8] if badret else "ok")
 
+# Pine caps a script at 64 plot outputs and gives no parameter to raise it.
+# Exceeding it is a compile error, and plots are added one at a time in ones and
+# twos, so the ceiling arrives without warning. display=display.data_window
+# counts the same as a visible plot.
+PLOTS = re.compile(r'^\s*(?:plot|plotshape|plotchar|plotcandle|plotbar|plotarrow)\s*\(', re.M)
+np = len(PLOTS.findall(raw))
+print(f"PLOT BUDGET: {np} of 64" + ("  *** OVER ***" if np > 64 else f"  ({64-np} free)" if np > 55 else ""))
+
 # Table names are discovered, not hardcoded: a table added later must not be
 # silently skipped. Cells whose column/row are computed (loop counters) cannot be
 # bounds-checked here, so they are REPORTED as unverified rather than ignored --

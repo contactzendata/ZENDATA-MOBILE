@@ -218,3 +218,25 @@ Rules this project holds to:
   cannot see. By contract count MNQ actually trades more than NQ, so switching the
   volume source to the full-size contract is not automatically an upgrade
   (DECISIONS D-013).
+
+---
+
+## 10. Plot outputs — 64 per script, no override
+
+`plot()`, `plotshape()`, `plotchar()`, `plotcandle()`, `plotbar()` and
+`plotarrow()` share one budget of **64 per script**, and there is no
+`max_plots_count` to raise it the way there is for boxes, lines and labels.
+`display = display.data_window` does **not** exempt a plot: an invisible
+diagnostic output costs exactly as much as a drawn one.
+
+This binds harder than it first looks, because plots accumulate one or two at a
+time as diagnostics are added, so the ceiling is reached without warning during
+routine work rather than at a moment when anyone is thinking about it.
+
+**Current usage: 60 of 64.** The 48 per-(slot, block) context cells of D-055
+could not all be emitted; D-057 splits them into per-symbol totals for all four
+slots plus a selector-driven per-block breakdown for one, which is what fits.
+
+`pinecheck.py` counts them and warns from 56 upward. Beyond that, the way to
+make room is to retire the data-window plots of closed diagnostics — the same
+disposal that D-052 applied to table rows.
