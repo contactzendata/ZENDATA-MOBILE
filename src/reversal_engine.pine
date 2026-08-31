@@ -122,7 +122,7 @@ M3_IMPL = false
 M4_IMPL = false
 M5_IMPL = true
 M6_IMPL = true
-M7_IMPL = false
+M7_IMPL = true
 
 
 // =============================================================================
@@ -428,6 +428,14 @@ sweepDebug   = input.bool(true, "Show M6 diagnostics in status table", group = g
 grpM7 = "M7 - Context and regime (C)"
 useContext  = input.bool(true, "Enable context and regime", group = grpM7)
 ctxCapGrade = input.string("B", "Hostile-context grade cap", options = ["A", "B", "C", "None"], group = grpM7, tooltip = "GRADE CAP, not a veto. The setup is still published, capped, so you can audit what the gate rejected. 'None' suppresses entirely.")
+ctxSeparate = input.bool(true, "Regime GATES evidence (D-047)", group = grpM7, tooltip = "ON: a hostile regime suppresses M7's evidence entirely, so category C does not fill and there is no grade for the cap to act on. This keeps the two roles from fighting -- the cap can then only ever act on grades enabled by OTHER categories. OFF reverts to M7 filling C and capping independently, which lets one module both enable a grade and suppress it.")
+ctxZlookMin = input.int(120, "Context z-score lookback (minutes)", minval = 10, group = grpM7)
+ctxZstart   = input.float(1.5, "Context |z| ramp starts", minval = 0.1, step = 0.1, group = grpM7, tooltip = "How extreme a context reading must be before it counts as evidence.")
+ctxZsat     = input.float(2.5, "Context |z| saturates", minval = 0.2, step = 0.1, group = grpM7)
+regimeRangeX = input.float(1.20, "Regime: block range x ADR", minval = 0.2, step = 0.05, group = grpM7, tooltip = "Used when the regime method includes Range vs ADR. Reuses M5's block ratio.")
+gammaUnknownHostile = input.bool(false, "Treat Unknown gamma as hostile", group = grpM7, tooltip = "D-018 says Unknown must not be treated as FAVOURABLE. That does not make it hostile. Off by default; turning it on is a deliberately conservative stance, not a correction.")
+ctxDebug    = input.bool(true, "Show M7 diagnostics in status table", group = grpM7)
+ctxGC4      = input.string("", "GC - 4th context (optional)", group = grpM7, tooltip = "input.string so an empty default cannot fail symbol-picker validation. Left blank it simply reports unavailable.")
 ctxTF       = input.timeframe("5", "Context timeframe", group = grpM7, tooltip = "Held at >= 5m: internals are noisy at 1m and a gate that flickers is worse than no gate.")
 ctxTICK     = input.symbol("USI:TICK", "NQ - TICK", group = grpM7, tooltip = "Normal range +/-600; beyond +/-1000 marks breadth exhaustion. Context-dependent: in RANGE sessions extremes mark reversals, in TRENDS they confirm momentum.")
 ctxADD      = input.symbol("USI:ADD",  "NQ - advance/decline", group = grpM7)
@@ -1322,7 +1330,99 @@ if not na(rvolVal)
 rvolMult = (useRvolMult and not na(rvolVal)) ? 1.0 + m5RvolT * rvolMaxAmp : 1.0
 
 // =============================================================================
-// MODULE IMPLEMENTATIONS  --  M1 + M2 + M5 + M6 LIVE, REST ARE STUBS
+// M7 ENGINE  --  context evidence (category C) and the regime gate
+// =============================================================================
+// TWO ROLES, DELIBERATELY SEPARATED (D-047):
+//
+//   EVIDENCE  a point-in-time EXTREME in the internals (NQ) or macro (GC) that
+//             argues for a reversal right now. Fills category C.
+//   GATE      a session-level TREND reading that says fades are dangerous today.
+//             Caps the grade. Never fills a category.
+//
+// Same symbols can feed both, but never the same statistic: an extreme is not a
+// trend, and the two genuinely disagree -- the source research is explicit that in
+// RANGE sessions a TICK extreme marks a reversal while in TRENDS it confirms
+// momentum. So the regime does not merely sit beside the evidence, it CONDITIONS
+// how the evidence should be read.
+//
+// Under ctxSeparate a hostile regime suppresses the evidence, so C does not fill.
+// The cap can then only ever act on a grade that OTHER categories enabled, and the
+// pathological case -- M7 supplying the third category and then capping the grade
+// it just enabled -- cannot arise.
+
+// ---- data acquisition, four slots, family-mapped, each self-disabling ---------
+ctxS1 = isGC ? ctxDXY   : ctxTICK
+ctxS2 = isGC ? ctxUS10Y : ctxADD
+ctxS3 = isGC ? ctxUS02Y : ctxVOLD
+ctxS4 = isGC ? ctxGC4   : ctxTRIN
+
+ctxV1 = f_sec(ctxS1, ctxTF, close)
+ctxV2 = f_sec(ctxS2, ctxTF, close)
+ctxV3 = f_sec(ctxS3, ctxTF, close)
+ctxV4 = f_sec(ctxS4, ctxTF, close)
+
+// Direction implied when the series is extreme HIGH.
+//   NQ  TICK/ADD/VOLD high = buying exhaustion -> SHORT (-1)
+//       TRIN high          = capitulation selling -> LONG (+1)
+//   GC  DXY / yields high  = gold pressed down -> LONG gold reversal (+1)
+ctxD1 = isGC ?  1 : -1
+ctxD2 = isGC ?  1 : -1
+ctxD3 = isGC ?  1 : -1
+ctxD4 = isGC ?  1 :  1
+
+ctxZbars = f_bars(ctxZlookMin)
+
+f_ctxZ(float v, int n) =>
+    m  = ta.sma(v, n)
+    sd = ta.stdev(v, n)
+    (not na(v) and not na(sd) and sd > 0.0) ? (v - m) / sd : na
+
+ctxZ1 = f_ctxZ(ctxV1, ctxZbars)
+ctxZ2 = f_ctxZ(ctxV2, ctxZbars)
+ctxZ3 = f_ctxZ(ctxV3, ctxZbars)
+ctxZ4 = f_ctxZ(ctxV4, ctxZbars)
+
+f_ctxTerm(float z) =>
+    na(z) ? 0.0 : math.min(1.0, math.max(0.0, (math.abs(z) - ctxZstart) / math.max(0.01, ctxZsat - ctxZstart)))
+
+// ---- evidence: consensus across the slots that resolved ----------------------
+ctxSigned = 0.0
+ctxNavail = 0
+if not na(ctxZ1)
+    ctxNavail := ctxNavail + 1
+    ctxSigned := ctxSigned + f_ctxTerm(ctxZ1) * (ctxZ1 > 0 ? ctxD1 : -ctxD1)
+if not na(ctxZ2)
+    ctxNavail := ctxNavail + 1
+    ctxSigned := ctxSigned + f_ctxTerm(ctxZ2) * (ctxZ2 > 0 ? ctxD2 : -ctxD2)
+if not na(ctxZ3)
+    ctxNavail := ctxNavail + 1
+    ctxSigned := ctxSigned + f_ctxTerm(ctxZ3) * (ctxZ3 > 0 ? ctxD3 : -ctxD3)
+if not na(ctxZ4)
+    ctxNavail := ctxNavail + 1
+    ctxSigned := ctxSigned + f_ctxTerm(ctxZ4) * (ctxZ4 > 0 ? ctxD4 : -ctxD4)
+
+// Divided by the number of AVAILABLE slots, so a lone extreme among four sources
+// scores as weak consensus rather than strong evidence. Context is a claim about
+// agreement; one series disagreeing with three is not an extreme, it is noise.
+ctxEvid = ctxNavail > 0 ? math.min(1.0, math.abs(ctxSigned) / ctxNavail) : 0.0
+ctxEvDir = ctxSigned > 0.0 ? 1 : ctxSigned < 0.0 ? -1 : 0
+
+// ---- regime: session-level trend. Caps; never fills a category. --------------
+[ctxDiP, ctxDiM, ctxAdx] = ta.dmi(adxLen, adxLen)
+regimeAdx   = not na(ctxAdx) and ctxAdx >= adxTrend
+regimeRange = not na(m5Ratio) and m5Ratio >= regimeRangeX
+regimeTrending = regimeMethod == "ADX" ? regimeAdx : regimeMethod == "Range vs ADR" ? regimeRange : (regimeAdx or regimeRange)
+
+gammaHostile = isNQ and (gammaRegime == "Negative" or (gammaRegime == "Unknown" and gammaUnknownHostile))
+
+// ---- the two published outputs, on independent paths --------------------------
+m7Score  = ctxEvid
+m7Dir    = ctxEvDir
+m7Active = useContext and M7_IMPL and ctxNavail > 0 and m7Dir != 0 and m7Score > 0.0 and not (ctxSeparate and regimeTrending)
+m7Note   = ctxNavail == 0 ? "no context data" : (regimeTrending ? "REGIME TRENDING" : "z " + str.tostring(ctxSigned / ctxNavail, "0.00") + " x" + str.tostring(ctxNavail))
+
+// =============================================================================
+// MODULE IMPLEMENTATIONS  --  M1 + M2 + M5 + M6 + M7 LIVE, M3/M4 ARE STUBS
 // =============================================================================
 // Contract reminders that will quietly corrupt the composite if broken:
 //   - score must be 0..1 and must mean the same thing across modules.
@@ -1368,12 +1468,10 @@ f_mExhaust() =>
 f_mSweep() =>
     ModuleOut.new(m6Score, m6Active, m6Dir, m6Note)
 
-// ---- M7 [C] ------------------------------------------------------------------
-// TODO: family-appropriate context via f_sec at ctxTF; regime (ADX / range-vs-ADR);
-//       optional COT percentile. Must produce the sub-score and the hostile flag
-//       through INDEPENDENT paths (D-004).
+// ---- M7 [C] -- IMPLEMENTED ---------------------------------------------------
+// Evidence only. The regime gate is a separate path and does not pass through here.
 f_mContext() =>
-    ModuleOut.new(0.0, false, 0, "stub")
+    ModuleOut.new(m7Score, m7Active, m7Dir, m7Note)
 
 // ---- M8 [bias only, no category] ---------------------------------------------
 // TODO: overnight close-to-open displacement as a fraction of ADR, mapped
@@ -1382,10 +1480,9 @@ f_mContext() =>
 f_mOnRev() =>
     ModuleOut.new(0.0, false, 0, "stub")
 
-// Hostile-context flag. Independent of M7's sub-score by design.
-// TODO: set from regime (trending), gamma regime (Negative, or Unknown treated
-//       as not-favorable), macro trend against the fade, and blackout.
-ctxHostile = inBlackout
+// Hostile-context flag: the GATE path. Computed from the regime, the manual gamma
+// setting and the blackout -- never from M7's evidence score (D-004, D-047).
+ctxHostile = regimeTrending or gammaHostile or inBlackout
 
 // =============================================================================
 // EVALUATION
@@ -1548,7 +1645,8 @@ composite = math.max(0.0, math.min(1.0, compRvol + onRevAdj))
 rawGrade   = composite >= gradeAmin ? 3 : composite >= gradeBmin ? 2 : composite >= gradeCmin ? 1 : 0
 floored    = side != 0 ? rawGrade : 0
 capLevel   = ctxCapGrade == "A" ? 3 : ctxCapGrade == "B" ? 2 : ctxCapGrade == "C" ? 1 : 0
-finalGrade = (useContext and ctxHostile) ? math.min(floored, capLevel) : floored
+ungatedGrade = floored
+finalGrade   = (useContext and ctxHostile) ? math.min(floored, capLevel) : floored
 
 gradeStr = finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C" : ""
 sideStr  = side == 1 ? "LONG" : side == -1 ? "SHORT" : conflict ? "CONFLICT" : "-"
@@ -1626,6 +1724,15 @@ var array<int> m5RvolHist = array.new<int>(6, 0)
 // nothing. Mutually exclusive, sums to the L+(Q|F) count.
 //   0 neither  1 M1 only  2 M5 only  3 both
 var array<int> eSrcHist = array.new<int>(4, 0)
+// M7 state, mutually exclusive, sums to bars.
+//   0 disabled  1 no data  2 regime hostile (evidence gated)  3 no extreme
+//   4 extreme but dir 0    5 ACTIVE
+var array<int> m7State = array.new<int>(6, 0)
+// How many context symbols resolved, 0..4. Mutually exclusive, sums to bars.
+var array<int> ctxAvailHist = array.new<int>(5, 0)
+// What the cap actually did, mutually exclusive, sums to bars.
+//   0 no grade  1 graded, uncapped  2 graded, reduced  3 graded, suppressed to none
+var array<int> capHist = array.new<int>(4, 0)
 var int gfStgL   = 0
 var int gfStgLQ  = 0
 var int gfStg3   = 0
@@ -1662,6 +1769,33 @@ if confirmed and instOK and tfSupported
         gfM26 := gfM26 + 1
     if m1Active and m2Active and m6Active
         gfAll3 := gfAll3 + 1
+    m7s = 0
+    if not (useContext and M7_IMPL)
+        m7s := 0
+    else if ctxNavail == 0
+        m7s := 1
+    else if ctxSeparate and regimeTrending
+        m7s := 2
+    else if ctxEvid <= 0.0
+        m7s := 3
+    else if m7Dir == 0
+        m7s := 4
+    else
+        m7s := 5
+    array.set(m7State, m7s, array.get(m7State, m7s) + 1)
+    array.set(ctxAvailHist, ctxNavail, array.get(ctxAvailHist, ctxNavail) + 1)
+
+    caps = 0
+    if ungatedGrade == 0
+        caps := 0
+    else if finalGrade == ungatedGrade
+        caps := 1
+    else if finalGrade > 0
+        caps := 2
+    else
+        caps := 3
+    array.set(capHist, caps, array.get(capHist, caps) + 1)
+
     lqL = f_stgLQ(catHitL)
     lqS = f_stgLQ(catHitS)
     if lqL or lqS
@@ -1796,7 +1930,7 @@ if showGradeLbl and not blindMode and confirmed and gradeOnset and side != 0
 var table st = na
 if showStatus and barstate.islast
     if na(st)
-        st := table.new(position.top_right, 2, 43, border_width = 1)
+        st := table.new(position.top_right, 2, 51, border_width = 1)
     table.cell(st, 0, 0,  "REVERSAL ENGINE", text_size = size.small)
     table.cell(st, 1, 0,  blindMode ? "** BLIND **" : "SCAFFOLD", text_size = size.small)
     table.cell(st, 0, 1,  "Instrument", text_size = size.tiny)
@@ -1911,6 +2045,23 @@ if showStatus and barstate.islast
         table.cell(st, 1, 41, (na(rvolVal) ? "-" : str.tostring(rvolVal, "0.00") + "x") + "  slot " + str.tostring(rvolSlot) + " seen " + str.tostring(rvolSeen), text_size = size.tiny)
         table.cell(st, 0, 42, "  composite mult", text_size = size.tiny)
         table.cell(st, 1, 42, "x" + str.tostring(rvolMult, "0.000") + "   " + str.tostring(compRaw, "0.000") + " -> " + str.tostring(compRvol, "0.000"), text_size = size.tiny)
+    if ctxDebug
+        table.cell(st, 0, 43, "-- M7 --", text_size = size.tiny)
+        table.cell(st, 1, 43, m7Active ? ("active dir " + str.tostring(m7Dir)) : (ctxNavail == 0 ? "NO CONTEXT DATA" : (ctxSeparate and regimeTrending) ? "gated: regime" : ctxEvid <= 0.0 ? "no extreme" : "dir 0"), text_size = size.tiny)
+        table.cell(st, 0, 44, "symbols ok", text_size = size.tiny)
+        table.cell(st, 1, 44, str.tostring(ctxNavail) + " / 4   " + (na(ctxZ1) ? "-" : "1") + (na(ctxZ2) ? "-" : "2") + (na(ctxZ3) ? "-" : "3") + (na(ctxZ4) ? "-" : "4"), text_size = size.tiny)
+        table.cell(st, 0, 45, "evidence (consensus)", text_size = size.tiny)
+        table.cell(st, 1, 45, str.tostring(ctxEvid, "0.00") + "  signed " + str.tostring(ctxSigned, "0.00"), text_size = size.tiny)
+        table.cell(st, 0, 46, "regime", text_size = size.tiny)
+        table.cell(st, 1, 46, (regimeTrending ? "TRENDING" : "range") + "  adx " + (na(ctxAdx) ? "-" : str.tostring(ctxAdx, "0.0")), text_size = size.tiny)
+        table.cell(st, 0, 47, "gamma (manual)", text_size = size.tiny)
+        table.cell(st, 1, 47, isNQ ? (gammaRegime + (gammaHostile ? "  HOSTILE" : "")) : "n/a (GC)", text_size = size.tiny)
+        table.cell(st, 0, 48, "GATE hostile", text_size = size.tiny)
+        table.cell(st, 1, 48, ctxHostile ? ("YES -> cap " + ctxCapGrade) : "no", text_size = size.tiny)
+        table.cell(st, 0, 49, "grade ungated -> final", text_size = size.tiny)
+        table.cell(st, 1, 49, (ungatedGrade == 3 ? "A" : ungatedGrade == 2 ? "B" : ungatedGrade == 1 ? "C" : "-") + " -> " + (finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C" : "-"), text_size = size.tiny)
+        table.cell(st, 0, 50, "M7 score", text_size = size.tiny)
+        table.cell(st, 1, 50, str.tostring(m7Score, "0.000"), text_size = size.tiny)
 
 // ---- D-029 diagnostic table: per-class funnel breakdown ----------------------
 // Answers "how much of the penetration count is which level class". Rendered as a
@@ -2008,7 +2159,7 @@ if sweepDebug and barstate.islast
 var table gt = na
 if sweepDebug and barstate.islast
     if na(gt)
-        gt := table.new(position.bottom_left, 5, 64, border_width = 1)
+        gt := table.new(position.bottom_left, 5, 80, border_width = 1)
     bN = math.max(1, gfBars)
     table.cell(gt, 0, 0, "GATE FUNNEL", text_size = size.tiny)
     table.cell(gt, 1, 0, "bars", text_size = size.tiny)
@@ -2245,6 +2396,66 @@ if sweepDebug and barstate.islast
     table.cell(gt, 1, 61, str.tostring(eSum), text_size = size.tiny)
     table.cell(gt, 2, 61, str.tostring(gfStgLQ), text_size = size.tiny)
     table.cell(gt, 3, 61, eSum == gfStgLQ ? "OK" : "BAD", text_size = size.tiny)
+    t0 = array.get(m7State, 0)
+    t1 = array.get(m7State, 1)
+    t2 = array.get(m7State, 2)
+    t3 = array.get(m7State, 3)
+    t4 = array.get(m7State, 4)
+    t5 = array.get(m7State, 5)
+    m7Sum = t0 + t1 + t2 + t3 + t4 + t5
+    table.cell(gt, 0, 63, "-- M7 STATE --", text_size = size.tiny)
+    table.cell(gt, 1, 63, "bars", text_size = size.tiny)
+    table.cell(gt, 0, 64, "0 disabled", text_size = size.tiny)
+    table.cell(gt, 1, 64, str.tostring(t0), text_size = size.tiny)
+    table.cell(gt, 0, 65, "1 NO CONTEXT DATA", text_size = size.tiny)
+    table.cell(gt, 1, 65, str.tostring(t1), text_size = size.tiny)
+    table.cell(gt, 0, 66, "2 gated by regime", text_size = size.tiny)
+    table.cell(gt, 1, 66, str.tostring(t2), text_size = size.tiny)
+    table.cell(gt, 0, 67, "3 no extreme", text_size = size.tiny)
+    table.cell(gt, 1, 67, str.tostring(t3), text_size = size.tiny)
+    table.cell(gt, 0, 68, "4 extreme, dir 0", text_size = size.tiny)
+    table.cell(gt, 1, 68, str.tostring(t4), text_size = size.tiny)
+    table.cell(gt, 0, 69, "5 ACTIVE", text_size = size.tiny)
+    table.cell(gt, 1, 69, str.tostring(t5), text_size = size.tiny)
+    table.cell(gt, 0, 70, "M7 state sum vs bars", text_size = size.tiny)
+    table.cell(gt, 1, 70, str.tostring(m7Sum), text_size = size.tiny)
+    table.cell(gt, 2, 70, str.tostring(gfBars), text_size = size.tiny)
+    table.cell(gt, 3, 70, m7Sum == gfBars ? "OK" : "BAD", text_size = size.tiny)
+    a0 = array.get(ctxAvailHist, 0)
+    a1 = array.get(ctxAvailHist, 1)
+    a2 = array.get(ctxAvailHist, 2)
+    a3 = array.get(ctxAvailHist, 3)
+    a4 = array.get(ctxAvailHist, 4)
+    aSum = a0 + a1 + a2 + a3 + a4
+    table.cell(gt, 0, 71, "-- CTX SYMBOLS OK --", text_size = size.tiny)
+    table.cell(gt, 1, 71, "bars", text_size = size.tiny)
+    table.cell(gt, 0, 72, "0 symbols", text_size = size.tiny)
+    table.cell(gt, 1, 72, str.tostring(a0), text_size = size.tiny)
+    table.cell(gt, 0, 73, "1 symbol", text_size = size.tiny)
+    table.cell(gt, 1, 73, str.tostring(a1), text_size = size.tiny)
+    table.cell(gt, 0, 74, "2 symbols", text_size = size.tiny)
+    table.cell(gt, 1, 74, str.tostring(a2), text_size = size.tiny)
+    table.cell(gt, 0, 75, "3 symbols", text_size = size.tiny)
+    table.cell(gt, 1, 75, str.tostring(a3), text_size = size.tiny)
+    table.cell(gt, 0, 76, "4 symbols", text_size = size.tiny)
+    table.cell(gt, 1, 76, str.tostring(a4), text_size = size.tiny)
+    table.cell(gt, 0, 77, "ctx avail sum vs bars", text_size = size.tiny)
+    table.cell(gt, 1, 77, str.tostring(aSum), text_size = size.tiny)
+    table.cell(gt, 2, 77, str.tostring(gfBars), text_size = size.tiny)
+    table.cell(gt, 3, 77, aSum == gfBars ? "OK" : "BAD", text_size = size.tiny)
+    k0 = array.get(capHist, 0)
+    k1 = array.get(capHist, 1)
+    k2 = array.get(capHist, 2)
+    k3 = array.get(capHist, 3)
+    kSum = k0 + k1 + k2 + k3
+    table.cell(gt, 0, 78, "-- CAP EFFECT --", text_size = size.tiny)
+    table.cell(gt, 1, 78, "uncapped " + str.tostring(k1), text_size = size.tiny)
+    table.cell(gt, 2, 78, "reduced " + str.tostring(k2), text_size = size.tiny)
+    table.cell(gt, 3, 78, "killed " + str.tostring(k3), text_size = size.tiny)
+    table.cell(gt, 0, 79, "cap sum vs bars", text_size = size.tiny)
+    table.cell(gt, 1, 79, str.tostring(kSum), text_size = size.tiny)
+    table.cell(gt, 2, 79, str.tostring(gfBars), text_size = size.tiny)
+    table.cell(gt, 3, 79, kSum == gfBars ? "OK" : "BAD", text_size = size.tiny)
     table.cell(gt, 0, 62, "E primary", text_size = size.tiny)
     table.cell(gt, 1, 62, ePrimary, text_size = size.tiny)
     table.cell(gt, 2, 62, "denom", text_size = size.tiny)
@@ -2284,6 +2495,10 @@ plot(rvolVal,    "RVOL (slot-normalised)", display = display.data_window)
 plot(rvolMult,   "RVOL composite mult",    display = display.data_window)
 plot(compRaw,    "Composite pre-RVOL",     display = display.data_window)
 plot(compRvol,   "Composite post-RVOL",    display = display.data_window)
+plot(ctxEvid,    "M7 evidence",            display = display.data_window)
+plot(ctxSigned,  "M7 signed consensus",    display = display.data_window)
+plot(ctxAdx,     "M7 ADX",                 display = display.data_window)
+plot(ungatedGrade, "Grade ungated",        display = display.data_window)
 
 // VWAP and sigma bands. Drawn only when not blind (D-035).
 m1PlotOn = vwapShow and not blindMode

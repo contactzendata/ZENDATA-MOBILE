@@ -16,8 +16,8 @@ Full reasoning for every `D-nnn` lives in `DECISIONS.md`; this is the index.
 | M8 overnight prior (bias) | **stub** |
 | M3 volume/market profile (L) | **stub** |
 | M4 delta/CVD (F) | **stub** |
-| M5 exhaustion & RVOL (E) | **stub** |
-| M7 context & regime (C) | **stub** |
+| **M5 exhaustion & RVOL** (E) | built — block exhaustion + EM, RVOL multiplies (D-044/045) |
+| **M7 context & regime** (C) | built — evidence fills C, regime gates it (D-047) |
 | Composite / gate / grading | built — **D-039 fixed a 0.600 ceiling** caused by four stubs sitting in the denominator; re-measuring |
 
 `request.*` budget: **2 call sites**, both wrapped. 1 live (M6 daily ATR, only when

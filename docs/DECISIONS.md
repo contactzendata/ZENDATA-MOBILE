@@ -1815,3 +1815,83 @@ still packing three counts per cell; it is now **one bucket per row with its nam
 **Warm-up is not the problem — it is 4%.** The dominant state is *the block range
 has not been spent*, which is M5 working correctly and rarely, exactly as intended.
 The `m5AdrWarm` hypothesis is refuted.
+
+---
+
+## D-047 — M7's gate role and evidence role are separated by conditioning, not by splitting
+**Status:** Accepted · 2026-08-29 · answers the "two jobs" question · refines D-004
+
+**The question:** if M7 both fills category C (enabling a grade) and drives the
+hostile-context cap (suppressing one), is that coherent?
+
+**The concern is real**, and D-004 makes it sharper rather than softer: D-004
+*requires* the sub-score and the hostile flag to be computed independently. Two
+independent channels from one module can disagree — so M7 could supply the third
+category that enables a grade and then cap the grade it just enabled.
+
+### The resolution is not "split into two modules"
+
+An evidence reading and a regime reading are not two opinions to be arbitrated.
+The source research is explicit that **the regime determines how the evidence
+should be read**: in range sessions a TICK extreme marks a reversal point, in
+trends it confirms momentum. The same number means opposite things in the two
+regimes.
+
+So the regime does not sit *beside* the evidence competing with it — it
+**conditions** it.
+
+### What was built
+
+| role | statistic | horizon | fills a category? |
+|---|---|---|---|
+| **Evidence** | point-in-time **extreme** (z-score of internals / macro) | this bar | yes — category C |
+| **Gate** | session-level **trend** (ADX, block range vs ADR) | the session | **never** |
+
+**Same symbols may feed both, but never the same statistic.** An extreme is not a
+trend, and the two are permitted to disagree — that disagreement is information,
+not a contradiction.
+
+**`ctxSeparate` (default on):** a hostile regime **suppresses M7's evidence
+entirely**, so C does not fill. The consequence is the point:
+
+> The cap can then only ever act on a grade that **other** categories enabled. The
+> pathological case — M7 supplying the third category and then capping the grade it
+> just created — cannot arise.
+
+Turning `ctxSeparate` off restores the independent behaviour, for comparison.
+
+### The narrower reading of the {F,C} question
+
+This is **not** a reversal of the earlier objection to routing the third category
+into {F, C}. That objection was against *requiring* the third leg to come from the
+weakest module (F) or a gate (C) as a matter of preference, and it stands. What the
+E-source measurement showed is narrower: on 88% of L+Q bars **no E module is active
+at all**, because E is anti-correlated with Q by construction. C is not preferred —
+it is the only category with no timing relationship to the reclaim, and therefore
+the only one that *can* fill at the fire bar.
+
+### Other requirements, as specified
+
+- **Every `request.security` self-disables.** Four family-mapped slots through
+  `f_sec` (`ignore_invalid_symbol`); an unresolved symbol yields `na`, is counted,
+  and is reported. `ctxNavail == 0` puts M7 in state 1 (`NO CONTEXT DATA`) rather
+  than killing anything. GC's optional fourth slot is an `input.string` so an empty
+  default cannot fail picker validation.
+- **Consensus, not any-one-source.** Evidence divides by the number of slots that
+  *resolved*, so a lone extreme among four sources scores as weak. Context is a
+  claim about agreement.
+- **The ungated grade is recorded** beside the capped one, in the status table, the
+  Data Window, and a mutually-exclusive `capHist` (no grade / uncapped / reduced /
+  suppressed) that sums to bars — so what the cap actually costs is measurable
+  rather than assumed.
+- **D-041 from the start:** `m7State` (6), `ctxAvailHist` (5) and `capHist` (4) are
+  each mutually exclusive with their own sum-vs-bars check, displayed one bucket
+  per row per D-042.
+
+**Denominator is now 4.0** with M7 at weight 0.5 taking factor 1.0 as the only C
+module. Four categories reachable — L, E, Q, C — so `minCats = 3` is satisfiable
+without E for the first time.
+
+**Wrong if:** the regime gate turns out to suppress M7 on most bars where L+Q
+coincide, which would put C in the same position E is in and mean the gate itself
+is the constraint. `m7State` bucket 2 measures exactly that.
