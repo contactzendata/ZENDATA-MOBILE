@@ -2099,3 +2099,62 @@ same defect would remain in M1, M5, M6 and — most importantly — M2.
   "not active" so it sums to bars. If the mass sits in `<0.05`, the module is
   active on noise.
 - **Hostile-bar count**, so cap opportunity is visible separately from cap effect.
+
+---
+
+## D-051 — `catFillMin`: filling a category is separated from contributing score
+**Status:** Accepted · 2026-08-29 · implements the D-050 proposal
+
+A module counts toward its **category** only if `score >= catFillMin`. It still
+contributes to the composite either way, so D-002's weighting contract is
+untouched. The test is applied in exactly one place — where category hits are
+recorded inside `f_sideEval`.
+
+**At the default 0.0 this is provably a no-op.** Every module clamps its score with
+`math.max(0.0, …)`, so `score >= 0.0` is true for every reachable value including
+exactly 0. Same category hits, same numerator, same denominator. If the numbers
+move at 0.0, the implementation changed something else and should be reverted
+rather than explained.
+
+**Measured before it is set.** A `FILL RATE vs catFillMin` block reports, per
+category, how many bars would fill at **0.00 / 0.15 / 0.30 / 0.45**, plus what the
+whole gate would pass at each. The specific question is whether a threshold that
+makes C meaningful also starves L — M2 has no score condition at all today and is
+the module most exposed. **L is mandatory, so if its fill rate collapses faster
+than C's improves, the threshold is wrong regardless of what it does for context.**
+
+The readout carries a **monotonicity assertion**: fill counts must be
+non-increasing as the threshold rises. Violating that would mean the probe is
+measuring something other than what it claims (D-041's habit applied to a
+projection rather than a count).
+
+---
+
+## D-052 — A 95-row diagnostic table is itself a source of error
+**Status:** Accepted · 2026-08-29
+
+Two rows incremented **inside the same `if` block**, four lines apart, were
+reported with sums of 16 and 4. That is arithmetically impossible: lines 1831 and
+1835 of `f_telemetryClassify` sit in one gated block, so `eSrcHist` and `cSrcHist`
+must always sum identically, and both must equal `gfStgLQ`.
+
+**This is the fourth transcription discrepancy**, and blaming the reading would be
+the wrong conclusion. The instrument grew to 95 rows across three tables while the
+only way to read it is a human copying digits off a screen. D-042 established that
+an instrument is its arithmetic *plus how it is read*; a table too tall to align a
+row against its label fails that test no matter how correct the arithmetic is.
+
+Two changes:
+
+1. **An explicit agreement cell.** The `E src sum vs L+Q` row now prints
+   **`AGREE`** when `eSum == cSum == gfStgLQ`, and otherwise prints all three
+   values together. One cell replaces three separate readings that had to be
+   cross-checked by hand.
+2. **Closed diagnostics are retired from view.** The derived-vs-independent
+   cross-check (D-042) confirmed the counters sound and its question is closed; it
+   is now behind `showCrossCheck`, **default off**, removing 11 rows. The code
+   stays for the day a counter is suspected again.
+
+This is the retirement policy D-049 anticipated, applied for the first time: when
+the instrument competes with legibility, retire the questions that are **answered**
+rather than thinning the engine or asking the reader to be more careful.

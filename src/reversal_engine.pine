@@ -272,6 +272,7 @@ wContext = input.float(0.5, "Weight - M7 Context and regime",    minval = 0.0, m
 // order sets precedence: M2 is primary Location (M3 secondary), M1 is primary
 // Extension (M5 secondary). Applied to numerator AND denominator so a damped
 // module cannot drag the composite down merely by existing.
+catFillMin = input.float(0.0, "Minimum score to FILL a category (D-051)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpScore, tooltip = "A module counts toward its CATEGORY only if its score reaches this. It still contributes to the composite either way, so D-002's weighting contract is untouched -- this separates 'contributing score' from 'counting as a leg of the confluence'. Every module currently activates at score > 0 (M2 has no score condition at all), so a category can fill on evidence of 0.001. Default 0.0 reproduces the previous behaviour EXACTLY, since every module clamps its score to >= 0.")
 ePrimary = input.string("M1", "EXTENSION category primary (D-043)", options = ["M1", "M5"], group = grpScore, tooltip = "Which module takes full weight in category E; the other is damped by catDamp. An INPUT rather than the declared push order (the old D-020 rule), because the evidence ledger rates VWAP-band reversion and ADR exhaustion equally and hardcoding either as primary encodes a preference we cannot justify. Testable once both exist.")
 catDamp = input.float(0.5, "Within-category damping (2nd+ module)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpScore, tooltip = "The second and subsequent ENABLED modules in the same category contribute at this rate. 1.0 disables damping. Precedence is declared push order, not score, so the denominator stays stable and an idle module's weight stays well-defined.")
 
@@ -435,6 +436,7 @@ ctxZsat     = input.float(2.5, "Context |z| saturates", minval = 0.2, step = 0.1
 regimeRangeX = input.float(1.20, "Regime: block range x ADR", minval = 0.2, step = 0.05, group = grpM7, tooltip = "Used when the regime method includes Range vs ADR. Reuses M5's block ratio.")
 gammaUnknownHostile = input.bool(false, "Treat Unknown gamma as hostile", group = grpM7, tooltip = "D-018 says Unknown must not be treated as FAVOURABLE. That does not make it hostile. Off by default; turning it on is a deliberately conservative stance, not a correction.")
 ctxDebug    = input.bool(true, "Show M7 diagnostics in status table", group = grpM7)
+showCrossCheck = input.bool(false, "Show derived-vs-independent cross-check", group = grpM7, tooltip = "D-042's instrument. It confirmed the counters sound and its question is CLOSED, so it is off by default -- an 88-row diagnostic table is itself a source of misreadings (D-052). Turn it on only if a counter is suspected again.")
 ctxGC4      = input.string("", "GC - 4th context (optional)", group = grpM7, tooltip = "input.string so an empty default cannot fail symbol-picker validation. Left blank it simply reports unavailable.")
 ctxTF       = input.timeframe("5", "Context timeframe", group = grpM7, tooltip = "Held at >= 5m: internals are noisy at 1m and a gate that flickers is worse than no gate.")
 ctxTICK     = input.symbol("USI:TICK", "NQ - TICK", group = grpM7, tooltip = "Normal range +/-600; beyond +/-1000 marks breadth exhaustion. Context-dependent: in RANGE sessions extremes mark reversals, in TRENDS they confirm momentum.")
@@ -1612,7 +1614,10 @@ f_sideEval(array<ModuleOut> m, array<float> w, array<int> c, array<float> f, int
             if mo.active and (mo.dir == sd or mo.dir == 0)
                 num  := num + mo.score * ew
                 nAct := nAct + 1
-                array.set(outCat, array.get(c, i), true)
+                // D-051: the composite takes the score regardless; only the
+                // CATEGORY hit is gated. At catFillMin = 0.0 this is a no-op.
+                if mo.score >= catFillMin
+                    array.set(outCat, array.get(c, i), true)
     nc = 0
     for b = 0 to N_CAT - 1
         nc := nc + (array.get(outCat, b) ? 1 : 0)
@@ -1754,6 +1759,11 @@ var array<int> cSrcHist = array.new<int>(4, 0)
 var array<int> m7EvidHist = array.new<int>(7, 0)
 // Was the GATE hostile at all, regardless of whether a grade existed to cap.
 var array<int> hostHist = array.new<int>(2, 0)
+// D-051 probe: what would each CATEGORY's fill rate be at candidate thresholds,
+// and what would the whole gate produce? Index = cat*4 + thrIdx.
+//   cat 0=L 1=E 2=F 3=Q 4=C   thr 0=0.00 1=0.15 2=0.30 3=0.45
+var array<int> fillHist    = array.new<int>(20, 0)
+var array<int> gateThrHist = array.new<int>(4, 0)
 var int gfStgL   = 0
 var int gfStgLQ  = 0
 var int gfStg3   = 0
@@ -1768,6 +1778,9 @@ var int gfWalkBlk    = 0   // M1 suppressed by band-walk while otherwise eligibl
 var int gfM6AndWalk  = 0   // ...on a bar where M6 was live: mutual exclusion
 var int gfM6InWin    = 0   // M6 live while M1's accumulation window is OPEN
 var int gfM6OutWin    = 0  // M6 live while it is CLOSED -- the dead zone (D-038 fix B)
+
+f_thrOf(int ti) =>
+    ti == 0 ? 0.0 : ti == 1 ? 0.15 : ti == 2 ? 0.30 : 0.45
 
 f_stgL(array<bool> ch) =>
     array.get(ch, CAT_L)
@@ -1820,6 +1833,24 @@ f_telemetryClassify() =>
     else
         ev := 6
     array.set(m7EvidHist, ev, array.get(m7EvidHist, ev) + 1)
+
+    for ti = 0 to 3
+        thr = f_thrOf(ti)
+        lF = (m2Active and m2Score >= thr)
+        eF = (m1Active and m1Score >= thr) or (m5Active and m5Score >= thr)
+        qF = (m6Active and m6Score >= thr)
+        cF = (m7Active and m7Score >= thr)
+        if lF
+            array.set(fillHist, 0 * 4 + ti, array.get(fillHist, 0 * 4 + ti) + 1)
+        if eF
+            array.set(fillHist, 1 * 4 + ti, array.get(fillHist, 1 * 4 + ti) + 1)
+        if qF
+            array.set(fillHist, 3 * 4 + ti, array.get(fillHist, 3 * 4 + ti) + 1)
+        if cF
+            array.set(fillHist, 4 * 4 + ti, array.get(fillHist, 4 * 4 + ti) + 1)
+        nCatT = (lF ? 1 : 0) + (eF ? 1 : 0) + (qF ? 1 : 0) + (cF ? 1 : 0)
+        if lF and qF and nCatT >= minCats
+            array.set(gateThrHist, ti, array.get(gateThrHist, ti) + 1)
 
     lqL = f_stgLQ(catHitL)
     lqS = f_stgLQ(catHitS)
@@ -2544,7 +2575,8 @@ f_gtESrc() =>
     table.cell(gt, 3, 59, str.tostring(x2), text_size = size.tiny)
     table.cell(gt, 2, 60, "3rd-cat: both", text_size = size.tiny)
     table.cell(gt, 3, 60, str.tostring(x3), text_size = size.tiny)
-    table.cell(gt, 4, 61, "3rd sum " + str.tostring(x0 + x1 + x2 + x3), text_size = size.tiny)
+    cSum = x0 + x1 + x2 + x3
+    table.cell(gt, 4, 61, (eSum == cSum and eSum == gfStgLQ) ? "AGREE" : ("eSrc " + str.tostring(eSum) + " cSrc " + str.tostring(cSum) + " LQ " + str.tostring(gfStgLQ)), text_size = size.tiny)
     table.cell(gt, 0, 61, "E src sum vs L+Q", text_size = size.tiny)
     table.cell(gt, 1, 61, str.tostring(eSum), text_size = size.tiny)
     table.cell(gt, 2, 61, str.tostring(gfStgLQ), text_size = size.tiny)
@@ -2634,6 +2666,45 @@ f_gtM7() =>
     v4 = array.get(m7EvidHist, 4)
     v5 = array.get(m7EvidHist, 5)
     v6 = array.get(m7EvidHist, 6)
+    table.cell(gt, 0, 88, "-- FILL RATE vs catFillMin --", text_size = size.tiny)
+    table.cell(gt, 1, 88, "0.00", text_size = size.tiny)
+    table.cell(gt, 2, 88, "0.15", text_size = size.tiny)
+    table.cell(gt, 3, 88, "0.30", text_size = size.tiny)
+    table.cell(gt, 4, 88, "0.45", text_size = size.tiny)
+    table.cell(gt, 0, 89, "L (M2)", text_size = size.tiny)
+    table.cell(gt, 1, 89, str.tostring(array.get(fillHist, 0)), text_size = size.tiny)
+    table.cell(gt, 2, 89, str.tostring(array.get(fillHist, 1)), text_size = size.tiny)
+    table.cell(gt, 3, 89, str.tostring(array.get(fillHist, 2)), text_size = size.tiny)
+    table.cell(gt, 4, 89, str.tostring(array.get(fillHist, 3)), text_size = size.tiny)
+    table.cell(gt, 0, 90, "E (M1|M5)", text_size = size.tiny)
+    table.cell(gt, 1, 90, str.tostring(array.get(fillHist, 4)), text_size = size.tiny)
+    table.cell(gt, 2, 90, str.tostring(array.get(fillHist, 5)), text_size = size.tiny)
+    table.cell(gt, 3, 90, str.tostring(array.get(fillHist, 6)), text_size = size.tiny)
+    table.cell(gt, 4, 90, str.tostring(array.get(fillHist, 7)), text_size = size.tiny)
+    table.cell(gt, 0, 91, "Q (M6)", text_size = size.tiny)
+    table.cell(gt, 1, 91, str.tostring(array.get(fillHist, 12)), text_size = size.tiny)
+    table.cell(gt, 2, 91, str.tostring(array.get(fillHist, 13)), text_size = size.tiny)
+    table.cell(gt, 3, 91, str.tostring(array.get(fillHist, 14)), text_size = size.tiny)
+    table.cell(gt, 4, 91, str.tostring(array.get(fillHist, 15)), text_size = size.tiny)
+    table.cell(gt, 0, 92, "C (M7)", text_size = size.tiny)
+    table.cell(gt, 1, 92, str.tostring(array.get(fillHist, 16)), text_size = size.tiny)
+    table.cell(gt, 2, 92, str.tostring(array.get(fillHist, 17)), text_size = size.tiny)
+    table.cell(gt, 3, 92, str.tostring(array.get(fillHist, 18)), text_size = size.tiny)
+    table.cell(gt, 4, 92, str.tostring(array.get(fillHist, 19)), text_size = size.tiny)
+    table.cell(gt, 0, 93, "GATE would pass", text_size = size.tiny)
+    table.cell(gt, 1, 93, str.tostring(array.get(gateThrHist, 0)), text_size = size.tiny)
+    table.cell(gt, 2, 93, str.tostring(array.get(gateThrHist, 1)), text_size = size.tiny)
+    table.cell(gt, 3, 93, str.tostring(array.get(gateThrHist, 2)), text_size = size.tiny)
+    table.cell(gt, 4, 93, str.tostring(array.get(gateThrHist, 3)), text_size = size.tiny)
+    monoOK = true
+    for mi = 0 to 4
+        for mj = 0 to 2
+            if array.get(fillHist, mi * 4 + mj) < array.get(fillHist, mi * 4 + mj + 1)
+                monoOK := false
+    table.cell(gt, 0, 94, "monotonic in threshold", text_size = size.tiny)
+    table.cell(gt, 1, 94, monoOK ? "OK" : "BAD", text_size = size.tiny)
+    table.cell(gt, 2, 94, "catFillMin now:", text_size = size.tiny)
+    table.cell(gt, 3, 94, str.tostring(catFillMin, "0.00"), text_size = size.tiny)
     table.cell(gt, 0, 80, "-- M7 SCORE (active) --", text_size = size.tiny)
     table.cell(gt, 1, 80, "bars", text_size = size.tiny)
     table.cell(gt, 0, 81, "1  < 0.05", text_size = size.tiny)
@@ -2656,10 +2727,11 @@ f_gtM7() =>
 
 if sweepDebug and barstate.islast
     if na(gt)
-        gt := table.new(position.bottom_left, 5, 88, border_width = 1)
+        gt := table.new(position.bottom_left, 5, 95, border_width = 1)
     f_gtFunnel()
     f_gtProbes()
-    f_gtDerived()
+    if showCrossCheck
+        f_gtDerived()
     f_gtM5()
     f_gtRvol()
     f_gtESrc()
