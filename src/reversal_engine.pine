@@ -1644,8 +1644,8 @@ if showStatus and barstate.islast
         table.cell(st, 1, 19, str.tostring(m6PenSeen) + " / " + str.tostring(m6InBand) + " -> " + str.tostring(m6TotFires) + " fired", text_size = size.tiny)
         table.cell(st, 0, 20, "FIRE RATE", text_size = size.tiny)
         table.cell(st, 1, 20, str.tostring(m6TotFires / math.max(1, m6Sessions), "#.##") + " / session  (" + str.tostring(m6Sessions) + " sess, " + str.tostring(m6SessFires) + " today)", text_size = size.tiny)
-        table.cell(st, 0, 21, "Grade age f/m/s", text_size = size.tiny)
-        table.cell(st, 1, 21, str.tostring(dF) + " / " + str.tostring(dM) + " / " + str.tostring(dS) + "  (noM6 " + str.tostring(dN) + " of " + str.tostring(array.size(gradeAgeLog)) + ")", text_size = size.tiny)
+        // Derive first, render second. Pine has no hoisting: a value used in a
+        // table.cell must be declared on an earlier line than the call.
         dF = 0
         dM = 0
         dS = 0
@@ -1668,6 +1668,8 @@ if showStatus and barstate.islast
                 agesRaw := agesRaw + str.tostring(array.get(gradeAgeLog, gj)) + " "
         gBucketSum = gradesFresh + gradesMid + gradesStale + gradesNoM6
         gAgree = gBucketSum == gradesTotal and array.size(gradeAgeLog) == gradesTotal and dF == gradesFresh and dM == gradesMid and dS == gradesStale and dN == gradesNoM6
+        table.cell(st, 0, 21, "Grade age f/m/s", text_size = size.tiny)
+        table.cell(st, 1, 21, str.tostring(dF) + " / " + str.tostring(dM) + " / " + str.tostring(dS) + "  (noM6 " + str.tostring(dN) + " of " + str.tostring(array.size(gradeAgeLog)) + ")", text_size = size.tiny)
         table.cell(st, 0, 22, gAgree ? "ages raw (last 10)" : "!! COUNTER DISAGREE", text_size = size.tiny)
         table.cell(st, 1, 22, gAgree ? (agesRaw == "" ? "-" : agesRaw) : ("log " + str.tostring(array.size(gradeAgeLog)) + " ctr " + str.tostring(gradesTotal) + " | " + str.tostring(dF) + str.tostring(dM) + str.tostring(dS) + str.tostring(dN) + " vs " + str.tostring(gradesFresh) + str.tostring(gradesMid) + str.tostring(gradesStale) + str.tostring(gradesNoM6)), text_size = size.tiny)
     if structDebug

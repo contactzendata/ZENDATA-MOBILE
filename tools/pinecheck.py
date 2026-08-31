@@ -1,0 +1,75 @@
+import re, sys
+from collections import Counter
+path = sys.argv[1] if len(sys.argv) > 1 else 'src/reversal_engine.pine'
+raw = open(path).read()
+lines = raw.split('\n')
+
+def strip(l):
+    o=[];ins=False;i=0
+    while i<len(l):
+        c=l[i]
+        if c=='"': ins=not ins
+        if not ins and c=='/' and i+1<len(l) and l[i+1]=='/': break
+        o.append(c);i+=1
+    return ''.join(o)
+code=[strip(l) for l in lines]
+
+print("NON-ASCII:", [i+1 for i,l in enumerate(lines) if any(ord(c)>127 for c in l)] or "none")
+print("bare-colon continuation:", [i+1 for i,l in enumerate(lines) if re.match(r'^\s*:',l)] or "none")
+tot=0
+for l in code:
+    t=re.sub(r'"[^"]*"','""',l); tot+=t.count('(')-t.count(')')
+print("paren balance:", tot)
+
+# --- NEW: use-before-declare at ANY scope, tracking first assignment line per name
+DECL = re.compile(r'^\s*(?:var\s+|varip\s+)?(?:float|int|bool|string|color|table|label|line|box|array<[^>]+>|[a-zA-Z_]\w*\[\])?\s*([A-Za-z_]\w*)\s*(?::=|=)(?!=)')
+FN   = re.compile(r'^\s*([A-Za-z_]\w*)\s*\([^)]*\)\s*=>')
+TUP  = re.compile(r'^\s*\[([^\]]+)\]\s*=')
+first={}
+for i,l in enumerate(code):
+    m=FN.match(l)
+    if m:
+        first.setdefault(m.group(1), i+1)
+        # register the parameters too -- they are in scope from this line onward
+        mp=re.match(r'^\s*[A-Za-z_]\w*\s*\((.*)\)\s*=>', l)
+        if mp:
+            for prm in mp.group(1).split(','):
+                nm=prm.strip().split(' ')[-1].strip()
+                if nm: first.setdefault(nm, i+1)
+        continue
+    m=TUP.match(l)
+    if m:
+        for n in m.group(1).split(','): first.setdefault(n.strip(), i+1)
+        continue
+    m=DECL.match(l)
+    if m: first.setdefault(m.group(1), i+1)
+    # for-loop induction vars
+    m2=re.match(r'^\s*for\s+([A-Za-z_]\w*)\s*=', l)
+    if m2: first.setdefault(m2.group(1), i+1)
+    # function params
+    mf=re.match(r'^\s*[A-Za-z_]\w*\s*\(([^)]*)\)\s*=>', l)
+    if mf:
+        for prm in mf.group(1).split(','):
+            nm=prm.strip().split(' ')[-1]
+            if nm: first.setdefault(nm, i+1)
+
+KW={'var','varip','float','int','bool','string','color','table','label','line','box','array','matrix','map',
+    'if','else','for','to','by','while','switch','and','or','not','true','false','na','import','export','type','method','continue','break'}
+bad=[]
+for i,l in enumerate(code):
+    if not l.strip(): continue
+    body=re.sub(r'"[^"]*"','""',l)
+    lhs=DECL.match(l)
+    lhsname=lhs.group(1) if lhs else None
+    for tok in re.findall(r'\b([A-Za-z_]\w*)\b', body):
+        if tok in KW or tok not in first: continue
+        if tok==lhsname: continue
+        if first[tok] > i+1:
+            bad.append((i+1, tok, first[tok]))
+print("USE-BEFORE-DECLARE (any scope):", bad[:12] if bad else "none")
+
+for tb in ('st','dt','gt'):
+    cs=re.findall(r'table\.cell\('+tb+r',\s*(\d+),\s*(\d+),',raw)
+    if cs:
+        sz=re.search(r'table\.new\([^,]+,\s*(\d+),\s*(\d+)',raw[raw.index(tb+' := table.new'):]) if tb+' := table.new' in raw else None
+        print(f"{tb}: dup={[k for k,v in Counter(cs).items() if v>1] or 'none'} maxrow={max(int(r) for c,r in cs)} maxcol={max(int(c) for c,r in cs)}")

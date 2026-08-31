@@ -1591,3 +1591,13 @@ construction rather than merely unexpected.
 
 Applies to every diagnostic added from here: prefer one source with derived views
 over several parallel counters, even when the parallel counters look simpler.
+
+**Follow-up, and an admission.** The first build of this fix did not compile:
+the derivation block was inserted *after* the `table.cell` call that used it, and
+Pine has no hoisting. My static checker missed it because it only tracked
+**top-level** declarations, not block-local ones — so it had been blind to an
+entire class of error the whole project. The checker now tracks first-assignment
+line at **any scope**, including for-loop induction variables and function
+parameters, and lives in `tools/pinecheck.py` so it is run rather than
+reconstructed. Two prior compile errors (the wrapped ternary, this one) would both
+have been caught by it.
