@@ -2094,7 +2094,6 @@ f_stCtx() =>
     table.cell(st, 1, 49, (ungatedGrade == 3 ? "A" : ungatedGrade == 2 ? "B" : ungatedGrade == 1 ? "C" : "-") + " -> " + (finalGrade == 3 ? "A" : finalGrade == 2 ? "B" : finalGrade == 1 ? "C" : "-"), text_size = size.tiny)
     table.cell(st, 0, 50, "M7 score", text_size = size.tiny)
     table.cell(st, 1, 50, str.tostring(m7Score, "0.000"), text_size = size.tiny)
-0
     0
 
 if showStatus and barstate.islast
@@ -2318,7 +2317,6 @@ f_gtProbes() =>
     table.cell(gt, 1, 21, str.tostring(m1OutRun) + "/" + str.tostring(bandWalkBars) + "  stall " + str.tostring(m1StallRun) + "/" + str.tostring(m1StallBars), text_size = size.tiny)
     table.cell(gt, 2, 21, "peak |z|:", text_size = size.tiny)
     table.cell(gt, 3, 21, str.tostring(m1ExcPeak, "0.00"), text_size = size.tiny)
-    0
     0
 
 f_gtDerived() =>

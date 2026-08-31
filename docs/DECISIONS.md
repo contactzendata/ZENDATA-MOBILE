@@ -1991,6 +1991,31 @@ Two checker corrections came out of it:
 2. Dead locals left behind by the split (`f_gtProbes` was computing fourteen values
    it no longer displayed) are now removed rather than tolerated.
 
+### Two artefacts the split left behind
+
+Dedenting a flagged segment by four also dedented the **function's own trailing
+`0`**, dropping a bare `0` to column zero — which terminates the function and turns
+the next indented line into an orphan (`CE10009`). A second function ended with two
+`0` lines for the same reason. Both were mechanical consequences of the extraction,
+invisible to every check I had.
+
+`tools/pinecheck.py` now covers both, and this is the third checker gap found the
+same way — by a compiler error my static pass should have caught first:
+
+- **Orphaned indentation**: an indented line must follow another indented line or a
+  block opener (`if`/`else`/`for`/`while`/`switch`/`type`/`=>`). This is what
+  `CE10009` looks like in the source, and it is precisely what a mechanical
+  function extraction leaves behind.
+- **Return convention**: a function ending on a *void* call (`table.cell`,
+  `array.push`, `array.set`, …) needs an explicit trailing `0`; duplicates are
+  flagged too.
+
+Both were written to fire on real defects only. The first drafts raised false
+positives — the `type` block body, and every value-returning helper that
+legitimately ends on an expression — and were narrowed before being kept, for the
+reason recorded in D-049: a checker that cries wolf gets ignored, which is how the
+original blind spots survived in the first place.
+
 ### The standing tension, stated plainly
 
 The diagnostics have earned their place — D-039, D-046 and D-047 were each settled

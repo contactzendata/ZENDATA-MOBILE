@@ -100,6 +100,39 @@ for nm,a,b in fnspans:
         if out: leaks.append((nm,v,out[:3]))
 print("SCOPE LEAKS (declared in fn, used outside):", leaks[:8] if leaks else "none")
 
+# --- orphaned indentation: an indented line must follow another indented line or
+# a block opener. This is what CE10009 ("extraneous input ... expecting end of line
+# without line continuation") looks like in the source, and it is exactly the
+# artefact a mechanical function-extraction leaves behind.
+OPENER = re.compile(r'(=>|^\s*(if|else|else\s+if|for|while|switch|type)\b.*)$')
+orphans=[]
+prev_indent=0
+prev_opener=False
+for i,l in enumerate(code):
+    if not l.strip():
+        continue
+    ind=len(l)-len(l.lstrip(' '))
+    if ind>prev_indent and not prev_opener:
+        orphans.append((i+1, l.strip()[:60]))
+    prev_indent=ind
+    prev_opener=bool(OPENER.search(l))
+print("ORPHANED INDENTATION:", orphans[:8] if orphans else "none")
+
+# --- function return convention: every f_* body ends with a single bare "0"
+# Only functions whose last statement is a VOID call need an explicit return; the
+# value-returning helpers legitimately end on an expression.
+VOIDCALL = re.compile(r'^\s*(table\.(cell|merge_cells|clear)|array\.(push|set|clear|shift)|line\.delete|label\.delete)\s*\(')
+badret=[]
+for nm,a,b in fnspans:
+    if not nm.startswith('f_'): continue
+    body=[x for x in code[a+1:b] if x.strip()]
+    if not body: continue
+    if VOIDCALL.match(body[-1]):
+        badret.append((nm, 'ends on a void call, needs a trailing 0'))
+    if len(body)>1 and body[-1].strip()=='0' and body[-2].strip()=='0':
+        badret.append((nm,'duplicate trailing 0'))
+print("FUNCTION RETURN CONVENTION:", badret[:8] if badret else "ok")
+
 for tb in ('st','dt','gt'):
     cs=re.findall(r'table\.cell\('+tb+r',\s*(\d+),\s*(\d+),',raw)
     if cs:
