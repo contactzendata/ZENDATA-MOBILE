@@ -2412,3 +2412,82 @@ comparable, which is the point of reusing it. Block 0 is "outside every block".
    either way — and it is the fifth instance of the D-052 pattern, which is why
    the OK/BAD cells exist and why `ct` carries its own `blk bars sum vs bars`
    row.
+
+---
+
+## D-056 — The registries were comparable all along, and the round-number hypothesis was never live
+
+**Status:** verified in code; instrument built for what remains.
+
+### The verification
+
+`sRound = input.bool(false, "Round numbers", group = grpL0)`
+
+It is a **single global input**, it defaults to **false**, and there is no
+instrument branch anywhere — `isGC` never touches it. The only gate on the push is
+`if sRound` at the registry build. Round numbers are therefore **absent from the
+registry on both instruments at defaults**, and both runs used defaults.
+
+So the registries *were* comparable. On both NQ and GC the registry is the same
+twelve classes — PDH/PDL, PDC, ONH/ONL, IBH/IBL, ORH/ORL, RTHo, SwH/SwL — with
+identical composition and identical count. The suspected asymmetry does not exist.
+
+### What this costs D-054
+
+**It kills the round-number-density hypothesis outright, and the fault is mine.**
+D-054 offered "NQ has ~14 round levels per day against GC's ~4.5" as the leading
+explanation for the L gap while those levels were not in the registry at all on
+either instrument. The predicted ratio of 3.1 against an observed 3.9 was a
+coincidence between two numbers that were never connected. This is the same shape
+as D-039: reasoning in detail about a component that was not in play, and finding
+the arithmetic agreeable enough not to check whether it was switched on.
+
+The check cost one `grep` and required no chart run. It should have preceded the
+hypothesis, not followed it.
+
+### The instrument gap that made this readable in two ways
+
+The M6 class table renders a disabled class and an enabled-but-never-penetrated
+class **identically** — a row of zeros. Its only annotation, `[no-sw]`, is about
+*sweepability*, not registry membership. So "Rnd+ / Rnd- show as off with zero
+counts" and "Rnd+ / Rnd- are enabled but nothing has happened at them" were
+indistinguishable from the table, on either instrument.
+
+Fixed: classes absent from the registry now render `(NOT IN REG)`, and the new L
+table carries an explicit `in reg` column. **Expect Rnd+ / Rnd- to read
+`(NOT IN REG)` on NQ as well as GC** — that is the confirmation, and if NQ instead
+reads `yes`, `sRound` was changed from default and the comparison genuinely was
+unequal.
+
+### So what is left to explain
+
+Registry composition is identical and round numbers are out on both. The window is
+now a common fraction of each instrument's own volatility. The remaining candidate
+is **how tightly those twelve levels sit around price, relative to daily ATR** —
+a property of the instrument's structure, not of the registry or of the window.
+
+`lNearHist` measures exactly that: the distance from close to the nearest level of
+any class, in daily-ATR units, bucketed. It is **window-invariant** — it describes
+the registry's geometry and survives any future change to `structProxAtr`, which
+neither the fill counts nor the exposure counts do. If NQ's distribution is shifted
+left of GC's, the L gap is explained and quantified in a unit that does not depend
+on the choice being tested.
+
+Alongside it, per class: `win bars` (exposure — counted once per class per bar, so
+duplicate levels at one price cannot inflate it) and `L fills` (attribution — the
+class of the *nearest* level on bars where L actually fills). Exposure and
+attribution are kept apart for the D-034 reason: a class that is near price
+constantly gets more chances, and raw fill counts do not distinguish that from a
+class that earns its hits.
+
+### A caution on the post-D-054 NQ numbers
+
+L fill went 698 → 2189 (×3.14) and gate 23 → 87 (×3.78) while the window widened
+×1.76. **The superlinearity is not evidence of level clustering.** Widening the
+window also raises `m2Prox` for every bar already inside it — `prox = 1 − d/window`
+— and raises `m2Stack` by admitting more classes, so a widened window lifts scores
+above `catFillMin` on bars that were already in the window and failing the score
+test. The score threshold and the window are not independent. `lNearHist` is
+immune to this, which is why it is the statistic to read rather than the ratio.
+
+87 is not a result and is not being read as one.
