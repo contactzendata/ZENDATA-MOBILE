@@ -36,7 +36,7 @@ back to a single sourcing path.
 ---
 
 ## D-002 — Composite weighting: off = excluded, inactive = 0.0
-**Status:** Accepted · 2026-08-29
+**Status:** Accepted · 2026-08-29 · **refined by D-039 — an unimplemented module is OFF, not inactive**
 
 A module toggled **off** is removed from both numerator and denominator. A module
 that is **on but not active at this bar** contributes 0.0 while its weight stays
@@ -1402,3 +1402,74 @@ that number would be fitted to two defects. Re-measure first.
 London/NY overlap is one move on gold, and the `0820` boundary cuts through it. If
 the NY block's VWAP looks wrong in the first hour, the London block should extend
 through the overlap rather than the boundary being moved.
+
+---
+
+## D-039 — An unimplemented module is OFF, not idle
+**Status:** Accepted · 2026-08-29 · refines D-002 · **fixes a ceiling that masked every result since the gate first opened**
+
+Module implementation state is now a compile-time constant (`M1_IMPL` … `M7_IMPL`)
+ANDed into the push. Stubs are excluded from the composite entirely.
+
+### The bug
+
+All seven `use*` toggles default **true**, so all seven modules were pushed —
+including four stubs. D-002 reads an enabled-but-idle module as *"measured, nothing
+there"* and correctly retains its weight in the denominator.
+
+**But nothing was measured.** A stub is semantically **OFF** — *"not measured"* —
+which D-002 assigns to the excluded state. The four stubs were miscategorised, and
+the composite was arithmetically correct over a denominator that was wrong.
+
+### The arithmetic
+
+| Module | cat | weight | category factor | effective |
+|---|---|---|---|---|
+| M1 | E | 1.0 | 1.0 (first E) | 1.0 |
+| M2 | L | 1.0 | 1.0 (first L) | 1.0 |
+| **M3** | L | 1.0 | 0.5 (second L) | **0.5** |
+| **M4** | F | 0.5 | 1.0 | **0.5** |
+| **M5** | E | 1.0 | 0.5 (second E) | **0.5** |
+| M6 | Q | 1.0 | 1.0 | 1.0 |
+| **M7** | C | 0.5 | 1.0 | **0.5** |
+| | | | **denominator** | **5.0** |
+
+Maximum numerator from the three live modules is **3.0**, so:
+
+> **the composite was capped at 0.600** — with the A threshold at 0.75, **grade A
+> was unreachable by construction**, and C at 0.45 required all three live modules
+> to average **0.75 simultaneously**.
+
+Observed peak was 0.432 = a numerator of 2.160, i.e. a mean of 0.720 across the
+three. **The floor was not structurally unreachable — it was missed by 0.03 of mean
+module score**, which is why it looked like a behavioural problem for two rounds.
+
+### After the fix
+
+Denominator **3.0**, maximum composite **1.000**, scale factor **×1.667**. The
+observed peak bar re-scores at **0.720 — a B grade**. `catDamp` also goes inert,
+correctly: each live category now holds exactly one module, so there is nothing to
+damp until M3 or M5 lands.
+
+### Why this hid for so long
+
+It produced no error and no anomaly. Every diagnostic reported real numbers about
+a system whose ceiling sat below its own threshold, and each round the shortfall
+looked like the module under investigation. Two genuine M1 defects (D-038) were
+found and fixed underneath it — both real, neither the binding constraint. Removing
+a constraint that suppressed M1 on 68% of M6-live bars moved the max composite by
+**0.000**, and that invariance was the tell.
+
+**The lesson, and it generalises:** when a fix that should have moved a number
+moves it by nothing, stop fixing and check whether the number *can* move. A ceiling
+is invisible to every instrument pointed below it.
+
+### Guard
+
+The denominator and the theoretical max are now displayed in both the status table
+and the gate funnel. A structural ceiling cannot hide again without someone
+ignoring a number on screen.
+
+**Constants, not inputs, on purpose:** implementation state is a fact about the
+source, not a user preference, and must not be settable into a state that
+contradicts the code. Flipping the constant is part of implementing the module.

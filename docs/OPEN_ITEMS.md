@@ -18,7 +18,7 @@ Full reasoning for every `D-nnn` lives in `DECISIONS.md`; this is the index.
 | M4 delta/CVD (F) | **stub** |
 | M5 exhaustion & RVOL (E) | **stub** |
 | M7 context & regime (C) | **stub** |
-| Composite / gate / grading | built — gate opened 17x on GC 5m but **max composite 0.432 < 0.45 floor**; re-measuring after D-038 |
+| Composite / gate / grading | built — **D-039 fixed a 0.600 ceiling** caused by four stubs sitting in the denominator; re-measuring |
 
 `request.*` budget: **2 call sites**, both wrapped. 1 live (M6 daily ATR, only when
 selected). Compile risk from `ta.pivothigh` with a computed length: **cleared**.
