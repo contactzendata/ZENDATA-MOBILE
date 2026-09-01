@@ -83,11 +83,53 @@ implementation can be verified even though the engine's *output* cannot yet be.
 
 **Immediate consequence:** the composite parameters — thresholds, weights,
 `catDamp`, `minCats` composition, M8's cap — stop being unmeasurable the moment
-grades start appearing. §4 below is expected to shrink sharply next round.
+grades start appearing. §5 below is expected to shrink sharply next round.
 
 ---
 
-## 3. Open — blocked on modules that do not exist yet
+## 3. FIRST-CLASS — the engine has no third category overnight on NQ
+
+**This is the most consequential finding of the D-054…D-058 sequence, and it is a
+structural fact rather than a defect to be tuned.**
+
+Measured (D-058): NQ's internals print on **2809 of 10014 bars, 28.0%**, and
+essentially all of it is the cash session. So category **C is unavailable outside
+RTH**.
+
+Why that is load-bearing rather than a limitation to note in passing:
+
+- D-019 requires **Location + at least one of {Liquidity, Order-flow} + ≥ minCats
+  distinct categories**. Overnight the reachable set is L, E, Q.
+- **E is anti-correlated with Q by construction** — M6 fires on the *reclaim*,
+  when price is returning to the middle, while E modules need price *away* from
+  it. Measured: **88% of L+Q bars have no E module active.**
+- C was built specifically to escape that. **The escape does not exist overnight.**
+- M6 fires overnight at a substantial rate, so this is not a small slice of the
+  problem. Those are exactly the setups the engine currently cannot grade.
+
+Earlier readings did not show this because the overnight gap was being filled with
+held-forward prints, and those inflated C (D-058). The problem was always there;
+the instrument was hiding it.
+
+### Three real answers. We do not have the data to choose.
+
+| Option | What it claims | What it would cost |
+|---|---|---|
+| **M3 as a second Location module** | Volume-profile levels (naked POC, VAH/VAL, poor highs) give L a second, independent source, so L+Q+profile reaches three categories overnight | Does **not** actually add a category — D-046: a second module in a category cannot move a category count. It would need M3 assigned to a *different* category, or D-019 relaxed. That is a spec change, not a module build |
+| **M4 as the F path** | Approximated delta/CVD fills Order-flow, which is in the {Q,F} clause *and* counts as a distinct category, so L+Q+F reaches three without C | Depends on intrabar data quality at the plan tier; D-012 already says M4 is **re-specified, not re-tuned** if real footprint data ever arrives |
+| **Accept it** | The engine is a cash-session tool on NQ; overnight NQ is out of scope, and GC carries the overnight book | Honest and cheap, but it discards a large share of NQ's M6 fires and makes the instrument asymmetric between the two products in a way the original spec did not intend |
+
+**The M3 option has a trap worth stating now**, because it is the intuitive choice
+and D-046 already refutes the naive form of it: adding a second Location module
+does not add a third category. Anyone reaching for M3 here must first say which
+category it fills and why.
+
+Nothing is being built against this until `00 zGTlive` is confirmed at 0 and GC has
+been re-read.
+
+---
+
+## 4. Open — blocked on modules that do not exist yet
 
 | Item | What it is | Waiting on |
 |---|---|---|
@@ -99,7 +141,7 @@ grades start appearing. §4 below is expected to shrink sharply next round.
 
 ---
 
-## 4. Open — measurable as soon as grades appear
+## 5. Open — measurable as soon as grades appear
 
 **This section unblocks with M1.** The gate can now be satisfied by L + Q + E, so
 these stop being unmeasurable — expect the next round to be about thresholds and
@@ -116,7 +158,7 @@ weights rather than module logic.
 
 ---
 
-## 5. Open — conventions and deferred defects
+## 6. Open — conventions and deferred defects
 
 | Item | Status | Note |
 |---|---|---|
@@ -127,13 +169,14 @@ weights rather than module logic.
 | **D-055/058** context staleness | **CONFIRMED and fixed** | `request.security` hold-forward means M7 may be scoring a stale RTH print as live overnight evidence. NQ: RAW 10014/10014, LIVE 2809, Z up to 5495. Z now computed over live samples only. All prior M7 readings withdrawn. |
 | **M7 regime gate ~72% of NQ bars** | unmeasured | State 2 dominates M7 far more than missing data does. `ctxSeparate` / `adxTrend` are placeholders. Not touched while the availability measurement is running. |
 | **GC context liveness** | **unmeasured, blocking** | `TVC:DXY` / `US10Y` / `US02Y` have not been checked for the same session-bound behaviour. Not assumed either way. GC's C column is suspect until the Data Window readout comes back from a GC run. |
-| **`ctxZreset`** | unmeasured, off | Continuous live window spans the overnight gap (a D-038 tension); resetting it blanks the cash open. A measurement, not a preference. |
+| **`ctxZreset`** (D-060) | **deliberately undecided**, off | Bounded decaying contamination vs an unconditional per-session cost. An argument, not a measurement; queues behind uncontaminated grades. |
+| **D-059** consensus divisor | **recorded, not fixed** | GC runs 3 slots to NQ's 4, so a lone extreme scores 33% higher on GC and needs a quarter less extremity to fill C. Also varies bar-to-bar now that availability is honest. Four options, none taken; the choice depends on GC's liveness numbers. |
 | **Category C is RTH-only on NQ** | **structural, not fixable** | Internals print on 28.0% of bars. The escape from the E∩Q anti-correlation does not exist outside the cash session. |
 | **L-fill by level class** | not built | Would test the round-number-density hypothesis for the NQ/GC L gap (D-054). Not built pre-emptively. |
 
 ---
 
-## 6. Closed since the last reconciliation
+## 7. Closed since the last reconciliation
 
 | Item | Outcome |
 |---|---|
@@ -148,7 +191,7 @@ weights rather than module logic.
 
 ---
 
-## 7. Standing constraints — not open items
+## 8. Standing constraints — not open items
 
 These are properties of the platform, recorded so they are not periodically
 rediscovered as problems. Full detail in `PINE_LIMITS.md`.

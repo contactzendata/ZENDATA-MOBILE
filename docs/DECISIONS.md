@@ -2686,3 +2686,95 @@ that. **The escape is unavailable outside the cash session**, which is where a
 large share of NQ bars sit. The E∩Q problem is therefore unsolved overnight rather
 than solved, and the earlier readings only looked otherwise because the gap was
 being filled with repeated prints.
+
+---
+
+## D-059 — The consensus divisor is not comparable, between instruments or between bars
+
+**Status:** recorded, not fixed. Nothing built until D-058's invariant is confirmed
+and GC has been re-read.
+
+`ctxEvid = min(1, |ctxSigned| / ctxNavail)` — divided by the number of slots that
+resolved. The intent, stated in the code, is that *"a lone extreme among four
+sources scores as weak consensus rather than strong evidence."* Two things break
+that intent, and neither was visible until the slot asymmetry was raised.
+
+### Between instruments: GC runs three slots, NQ runs four
+
+`ctxGC4` defaults to an empty string, so GC's fourth slot never resolves. The
+divisor is 3 on GC and 4 on NQ, and the same evidence therefore does not mean the
+same thing:
+
+| | lone extreme (term 1.0) | term a lone slot needs to reach `catFillMin` 0.15 | one slot dissenting, rest at 1.0 |
+|---|---|---|---|
+| NQ, 4 slots | 0.250 | 0.60 | 0.500 |
+| GC, 3 slots | 0.333 | 0.45 | 0.333 |
+
+**A lone extreme scores 33% higher on GC**, and needs a quarter less raw extremity
+to fill category C. Dissent is also weighted differently: one disagreeing slot
+costs a third of the signal on GC against a quarter on NQ, so GC is simultaneously
+*easier to fill* and *easier to veto*.
+
+This is the same class of fault as `structProx` in ticks (D-054): a quantity that
+looks instrument-neutral because the formula is identical, while an arbitrary
+configuration difference — there a tick size, here an empty input — makes the same
+number mean different things on the two products. It was not caused by the D-058
+fix; it has been true since M7 shipped, and every cross-instrument C comparison
+made so far inherits it.
+
+### Between bars: the D-058 fix made the divisor vary within an instrument
+
+This one **is** a consequence of the fix, and it should be on the record as such
+rather than discovered later.
+
+`ctxNavail` now counts slots with a *live* z-score. Liveness is per-symbol and the
+buffers fill independently, so within one session the divisor can be 1, 2, 3 or 4
+as slots come online — and identical breadth readings score differently depending
+on how many of their neighbours happened to be warm. The old code had the same
+divisor logic, but the divisor was near-constant because held-forward values kept
+every slot permanently "available". **Removing the fabricated availability exposed
+a variance the fix did not create but did make visible.**
+
+The first bars after each cash open are where this bites hardest, since that is
+when buffers are refilling — and it is also the highest-value reversal window.
+
+### Options, none taken
+
+1. **Fill GC's fourth slot** with a real symbol, so both instruments run four.
+   Cheapest, but it is a symbol choice that needs its own justification and the
+   research does not obviously supply a fourth for gold.
+2. **Fixed divisor of 4** regardless of what resolved. Makes the scale identical
+   everywhere, at the cost that GC can never reach `ctxEvid = 1.0` and that a
+   partially-warm NQ is scored as if the missing slots dissented — which is not
+   what a missing slot means.
+3. **Require a minimum slot count** before M7 activates at all, so the divisor is
+   at least stable above a floor. Costs the warm-up window entirely.
+4. **Accept and document**, treating `ctxEvid` as within-instrument only and never
+   comparing C fill rates across products.
+
+Recommending none of them here. The choice depends on the GC liveness numbers,
+which have not been read: if GC's macro series turn out to be session-bound too,
+option 1 changes character completely, because a fourth GC slot would be dark for
+the same hours as the other three.
+
+---
+
+## D-060 — `ctxZreset` stays off, and the reasoning is recorded rather than settled
+
+**Status:** deliberately undecided. Default off.
+
+The tradeoff is in D-058. What is added here is the reasoning for leaving it, so
+that the choice is not silently re-litigated later:
+
+> Blanking the cash open is a **certain** cost. The overnight-gap contamination is
+> **bounded by the lookback window** rather than structural — it affects the first
+> `ctxZlookMin` worth of live bars after a gap, and decays out, whereas a reset
+> removes the same window from *every* session unconditionally.
+
+A bounded, decaying cost against an unbounded, recurring one. That is the argument
+for the current default, and it is an argument rather than a measurement — which
+is precisely why the input exists and why this entry does not close.
+
+What would settle it: M7's contribution to graded setups in the first
+`ctxZlookMin` of the session, with the flag off and on. That measurement needs
+grades that are not contaminated, so it queues behind the re-runs.
