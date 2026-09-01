@@ -436,6 +436,8 @@ useContext  = input.bool(true, "Enable context and regime", group = grpM7)
 ctxCapGrade = input.string("B", "Hostile-context grade cap", options = ["A", "B", "C", "None"], group = grpM7, tooltip = "GRADE CAP, not a veto. The setup is still published, capped, so you can audit what the gate rejected. 'None' suppresses entirely.")
 ctxSeparate = input.bool(true, "Regime GATES evidence (D-047)", group = grpM7, tooltip = "ON: a hostile regime suppresses M7's evidence entirely, so category C does not fill and there is no grade for the cap to act on. This keeps the two roles from fighting -- the cap can then only ever act on grades enabled by OTHER categories. OFF reverts to M7 filling C and capping independently, which lets one module both enable a grade and suppress it.")
 ctxZlookMin = input.int(120, "Context z-score lookback (minutes)", minval = 10, group = grpM7)
+ctxZreset   = input.bool(false, "Reset the z-window when the source resumes after a gap", group = grpM7, tooltip = "D-058. The live-only window is continuous by default, so at the RTH open the z-score is measured against the last 120 minutes the source ACTUALLY PRINTED -- which is the tail of the previous session. That spans the overnight gap, which is the thing D-038 refused to do for VWAP. Turned ON, the window is cleared whenever the source resumes after a gap, so every z-score is within one continuous printing session. The cost is that the first `lookback` live bars of each session produce NO z-score, which blanks the cash open -- the single highest-value reversal window on NQ. Left OFF by default because blanking the open is a certain cost against a speculative one; this is a MEASUREMENT to run, not a setting to reason about.")
+ctxGapMin   = input.int(60, "  Gap that counts as a break (minutes)", minval = 5, group = grpM7, tooltip = "Only used when the reset above is on. A single missed print inside an active session is thin data, not a session break, and must not clear a full window.")
 ctxZstart   = input.float(1.5, "Context |z| ramp starts", minval = 0.1, step = 0.1, group = grpM7, tooltip = "How extreme a context reading must be before it counts as evidence.")
 ctxZsat     = input.float(2.5, "Context |z| saturates", minval = 0.2, step = 0.1, group = grpM7)
 regimeRangeX = input.float(1.20, "Regime: block range x ADR", minval = 0.2, step = 0.05, group = grpM7, tooltip = "Used when the regime method includes Range vs ADR. Reuses M5's block ratio.")
@@ -1424,15 +1426,65 @@ ctxD4 = isGC ?  1 :  1
 
 ctxZbars = f_bars(ctxZlookMin)
 
-f_ctxZ(float v, int n) =>
-    m  = ta.sma(v, n)
-    sd = ta.stdev(v, n)
-    (not na(v) and not na(sd) and sd > 0.0) ? (v - m) / sd : na
+// ---- D-058. The z-score is computed over LIVE observations only --------------
+// The previous implementation ran ta.sma / ta.stdev over the raw series. Because
+// request.security() holds the last value forward, that series is a mixture of
+// real prints and stale repeats, and the mixture was measured: on NQ 5m the four
+// slots returned a number on 10014 of 10014 bars while printing on 2809, and
+// produced z-scores on 3599 to 5495. Outside the auction blocks entirely, 432
+// bars with ZERO live prints produced 432 z-scores.
+//
+// Gating only the current bar is not enough, and this is the part that is easy to
+// get wrong: the LOOKBACK is contaminated too. A z-score taken at 10:00 against a
+// window reaching back into the overnight hold is measured against a distribution
+// that is mostly one repeated number, which inflates every extreme by collapsing
+// the standard deviation. So the statistics are accumulated from live samples
+// only, in an explicit buffer, and a bar that did not print contributes nothing
+// and receives nothing.
+//
+// The buffer is pushed only on barstate.isconfirmed. Pine re-executes the script
+// on every tick of the forming bar, and an unguarded push would add the same bar
+// many times and quietly weight the newest observation by tick count.
+var array<float> ctxBuf1 = array.new<float>()
+var array<float> ctxBuf2 = array.new<float>()
+var array<float> ctxBuf3 = array.new<float>()
+var array<float> ctxBuf4 = array.new<float>()
 
-ctxZ1 = f_ctxZ(ctxV1, ctxZbars)
-ctxZ2 = f_ctxZ(ctxV2, ctxZbars)
-ctxZ3 = f_ctxZ(ctxV3, ctxZbars)
-ctxZ4 = f_ctxZ(ctxV4, ctxZbars)
+f_liveZ(array<float> buf, float v, bool live, int n, bool rst) =>
+    if rst
+        array.clear(buf)
+    if live and not na(v) and barstate.isconfirmed
+        array.push(buf, v)
+        if array.size(buf) > n
+            array.shift(buf)
+    zz = float(na)
+    // A full window of LIVE samples is required. A z-score over a part-filled
+    // window is exactly the fabricated-confidence failure this replaces.
+    if live and not na(v) and n >= 2 and array.size(buf) >= n
+        sum = 0.0
+        for i = 0 to array.size(buf) - 1
+            sum := sum + array.get(buf, i)
+        mu = sum / array.size(buf)
+        ss = 0.0
+        for j = 0 to array.size(buf) - 1
+            d = array.get(buf, j) - mu
+            ss := ss + d * d
+        sd = math.sqrt(ss / array.size(buf))
+        if sd > 0.0
+            zz := (v - mu) / sd
+    zz
+
+// Gap length ending at this bar: barssince(live) read one bar back.
+ctxGapBars = f_bars(ctxGapMin)
+ctxRst1 = ctxZreset and ctxL1 and nz(ta.barssince(ctxL1)[1], 0) >= ctxGapBars
+ctxRst2 = ctxZreset and ctxL2 and nz(ta.barssince(ctxL2)[1], 0) >= ctxGapBars
+ctxRst3 = ctxZreset and ctxL3 and nz(ta.barssince(ctxL3)[1], 0) >= ctxGapBars
+ctxRst4 = ctxZreset and ctxL4 and nz(ta.barssince(ctxL4)[1], 0) >= ctxGapBars
+
+ctxZ1 = f_liveZ(ctxBuf1, ctxV1, ctxL1, ctxZbars, ctxRst1)
+ctxZ2 = f_liveZ(ctxBuf2, ctxV2, ctxL2, ctxZbars, ctxRst2)
+ctxZ3 = f_liveZ(ctxBuf3, ctxV3, ctxL3, ctxZbars, ctxRst3)
+ctxZ4 = f_liveZ(ctxBuf4, ctxV4, ctxL4, ctxZbars, ctxRst4)
 
 f_ctxTerm(float z) =>
     na(z) ? 0.0 : math.min(1.0, math.max(0.0, (math.abs(z) - ctxZstart) / math.max(0.01, ctxZsat - ctxZstart)))
@@ -1471,7 +1523,7 @@ gammaHostile = isNQ and (gammaRegime == "Negative" or (gammaRegime == "Unknown" 
 m7Score  = ctxEvid
 m7Dir    = ctxEvDir
 m7Active = useContext and M7_IMPL and ctxNavail > 0 and m7Dir != 0 and m7Score > 0.0 and not (ctxSeparate and regimeTrending)
-m7Note   = ctxNavail == 0 ? "no context data" : (regimeTrending ? "REGIME TRENDING" : "z " + str.tostring(ctxSigned / ctxNavail, "0.00") + " x" + str.tostring(ctxNavail))
+m7Note   = ctxNavail == 0 ? "no LIVE context data" : (regimeTrending ? "REGIME TRENDING" : "z " + str.tostring(ctxSigned / ctxNavail, "0.00") + " x" + str.tostring(ctxNavail))
 
 // =============================================================================
 // MODULE IMPLEMENTATIONS  --  M1 + M2 + M5 + M6 + M7 LIVE, M3/M4 ARE STUBS
@@ -2562,6 +2614,17 @@ f_ctB() =>
     table.cell(ct, 1, 17, str.tostring(bs2), text_size = size.tiny)
     table.cell(ct, 2, 17, str.tostring(gfBars), text_size = size.tiny)
     table.cell(ct, 3, 17, bs2 == gfBars ? "OK" : "BAD", text_size = size.tiny)
+    // D-058 invariant. A z-score on a bar the source did not print is exactly the
+    // defect this build fixed, so Z can never exceed LIVE in any cell. This is the
+    // check that would have caught it without a four-round investigation.
+    zgt = 0
+    for k = 0 to 15
+        if array.get(ctxZokN, k) > array.get(ctxLiveN, k)
+            zgt := zgt + 1
+    table.cell(ct, 0, 18, "cells with Z > LIVE", text_size = size.tiny)
+    table.cell(ct, 1, 18, str.tostring(zgt), text_size = size.tiny)
+    table.cell(ct, 2, 18, "of 16", text_size = size.tiny)
+    table.cell(ct, 3, 18, zgt == 0 ? "OK" : "BAD", text_size = size.tiny)
     0
 
 var table gt = na
@@ -3031,7 +3094,7 @@ if sweepDebug and barstate.islast
 
 if sweepDebug and barstate.islast
     if na(ct)
-        ct := table.new(position.top_left, 6, 18, border_width = 1)
+        ct := table.new(position.top_left, 6, 19, border_width = 1)
     f_ctA()
     f_ctB()
 
@@ -3103,6 +3166,7 @@ ctxK4 = array.get(ctxZokN, 12) + array.get(ctxZokN, 13) + array.get(ctxZokN, 14)
 dwSo  = (dwCtxSlot - 1) * 4
 
 plot(gfBars,     "00 BARS",   display = display.data_window)
+plot((ctxK1 > ctxE1 ? 1 : 0) + (ctxK2 > ctxE2 ? 1 : 0) + (ctxK3 > ctxE3 ? 1 : 0) + (ctxK4 > ctxE4 ? 1 : 0), "00 zGTlive BADif>0", display = display.data_window)
 plot(dwCtxSlot,  "00 selSLOT", display = display.data_window)
 plot(ctxR1, "c1 RAW",  display = display.data_window)
 plot(ctxE1, "c1 LIVE", display = display.data_window)

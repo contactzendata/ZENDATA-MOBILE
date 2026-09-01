@@ -124,8 +124,11 @@ weights rather than module logic.
 | **Round-number relocation** (D-034 note) | deferred | `ceil(close/step)*step` relocates when price crosses a step boundary — the D-032 swing defect again. Off by default; needs fixed anchoring, not just a type, if ever enabled. |
 | **D-013 settling test** | unrun | Build the session profile from chart symbol and full-size and compare POC/VAH/VAL placement. Only matters when charting MNQ/MGC; irrelevant while charting NQ/GC directly. |
 | **M4 re-specification trigger** | conditional | If the plan tier ever provides real footprint data, M4 is **re-specified, not re-tuned** (D-012). |
-| **D-055** context staleness | **suspected, measuring** | `request.security` hold-forward means M7 may be scoring a stale RTH print as live overnight evidence. Instrument built (`ct` table); the fix is deliberately **not** written ahead of the measurement. |
+| **D-055/058** context staleness | **CONFIRMED and fixed** | `request.security` hold-forward means M7 may be scoring a stale RTH print as live overnight evidence. NQ: RAW 10014/10014, LIVE 2809, Z up to 5495. Z now computed over live samples only. All prior M7 readings withdrawn. |
 | **M7 regime gate ~72% of NQ bars** | unmeasured | State 2 dominates M7 far more than missing data does. `ctxSeparate` / `adxTrend` are placeholders. Not touched while the availability measurement is running. |
+| **GC context liveness** | **unmeasured, blocking** | `TVC:DXY` / `US10Y` / `US02Y` have not been checked for the same session-bound behaviour. Not assumed either way. GC's C column is suspect until the Data Window readout comes back from a GC run. |
+| **`ctxZreset`** | unmeasured, off | Continuous live window spans the overnight gap (a D-038 tension); resetting it blanks the cash open. A measurement, not a preference. |
+| **Category C is RTH-only on NQ** | **structural, not fixable** | Internals print on 28.0% of bars. The escape from the E∩Q anti-correlation does not exist outside the cash session. |
 | **L-fill by level class** | not built | Would test the round-number-density hypothesis for the NQ/GC L gap (D-054). Not built pre-emptively. |
 
 ---

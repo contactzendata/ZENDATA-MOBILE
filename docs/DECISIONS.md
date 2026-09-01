@@ -2547,3 +2547,142 @@ Nothing downstream is being read until this resolves. `lNearHist` and the NQ gat
 count of 87 are held, per the same reasoning: if M7 was scoring hold-forward data,
 the NQ gate numbers are contaminated through the C category and re-reading them
 now would only add a second layer on top of a suspect first.
+
+---
+
+## D-058 — M7 was scoring held-forward prints. Its numbers are withdrawn, and the z-score is rebuilt on live samples only
+
+**Status:** confirmed by measurement; fixed at the source. All prior M7 readings
+are withdrawn from the record.
+
+### The measurement
+
+NQ1! 5m, 10014 bars, Data Window at the last bar:
+
+| slot | RAW | LIVE | Z |
+|---|---|---|---|
+| c1 TICK | 10014 | 2809 | 3599 |
+| c2 ADD | 10014 | 2809 | 3599 |
+| c3 VOLD | 10014 | 2809 | 5495 |
+| c4 TRIN | 10014 | 2808 | 5263 |
+
+Slot 1 by auction block:
+
+| block | RAW | LIVE | Z |
+|---|---|---|---|
+| b0 outside | 432 | **0** | **432** |
+| b1 Asia | 4398 | **1** | **360** |
+| b2 Europe/pre | 2376 | **0** | 0 |
+| b3 RTH | 2808 | 2808 | 2807 |
+
+The blocks reconcile exactly with the slot totals — RAW 432+4398+2376+2808 =
+10014, LIVE 0+1+0+2808 = 2809, Z 432+360+0+2807 = 3599 — so the instrument itself
+is sound and the numbers are the data, not an artefact of the counting.
+
+**RAW equals the bar count on every slot while LIVE is 28.0%.** The internals are
+session-bound and everything outside RTH was a repeated print. Worse, **Z exceeds
+LIVE on every slot**: 790 excess z-scores on TICK and ADD, 2686 on VOLD — between
+28% and 95% more evidence than there were live observations to support it. The
+cleanest single indictment is b0: **432 bars, zero live prints, 432 z-scores.**
+
+### Why the z-score inflated rather than merely persisted
+
+Holding a value forward does not just repeat the last reading, it **collapses the
+standard deviation** of the window it sits in. `ta.stdev` over a window that is
+mostly one repeated number returns a small σ, and every subsequent deviation
+divided by that small σ reads as an extreme. So the stale window did not produce
+neutral evidence — it produced *systematically overstated* evidence, and M7's
+`ctxEvid` is a function of `|z|`. The direction of the bias is toward more
+context, more C fills, more third categories, more gates.
+
+### Withdrawn
+
+Every M7 figure in this build and the previous one comes out of the record:
+
+- the **1261 ACTIVE** count and the M7 state distribution
+- the entire **C fill-rate column** at every threshold, on which `catFillMin`
+  0.15 was partly chosen (D-053)
+- the **third-category source** split (`cSrcHist`) wherever C supplied it
+- **every gate reading downstream of C** on NQ, including `GATE would pass` 23 and
+  the post-D-054 87
+- the M7 evidence-score distribution and the cap-effect counts
+
+Not withdrawn: anything that never touched `request.security` at intraday TF —
+M1, M2, M5's ADR term, M6, the level registry, `lNearHist`. The D-054 units
+finding stands, since it is arithmetic about ticks and ATR.
+
+### GC is suspect, not clean
+
+GC's context path is `TVC:DXY`, `TVC:US10Y`, `TVC:US02Y` (slot 4 is empty by
+default, so GC ran on three slots, not four). Whether those are session-bound the
+same way **has not been measured, and is not being assumed in either direction** —
+asserting that a macro series trades 24 hours would be exactly the reasoning that
+produced the round-number error in D-056. The same Data Window readout answers it
+on the GC re-run. Until then GC's C column is **suspect**, and if LIVE comes back
+below RAW there it comes out too.
+
+`m5IV` also comes through `request.security`, but at **daily** timeframe, where
+holding one value across the day is the intended semantics rather than a defect.
+The fault requires an intraday TF, where holding forward misrepresents intraday
+variation. M5 is unaffected.
+
+### The fix
+
+`ta.sma` / `ta.stdev` over the raw series are gone. Statistics are now accumulated
+from **live samples only** into an explicit per-slot buffer; a bar that did not
+print contributes nothing to the window and receives no z-score.
+
+Gating only the current bar would not have been enough, and this is the part that
+is easy to get wrong: **the lookback is contaminated too.** A z-score taken at
+10:00 against a window reaching back into the overnight hold is measured against a
+distribution that is mostly one repeated number. Both ends had to move.
+
+Two implementation points that would otherwise bite:
+
+- The buffer is pushed only on `barstate.isconfirmed`. Pine re-executes on every
+  tick of the forming bar, and an unguarded push would insert the same bar
+  repeatedly and weight the newest observation by tick count.
+- A **full** window of live samples is required before any z is emitted. A
+  z-score over a part-filled window is the same fabricated-confidence failure in
+  a smaller form.
+
+### The residual choice, surfaced rather than decided
+
+A continuous live-only window means the z-score at the cash open is measured
+against the last 120 printing minutes — the tail of the *previous* session. That
+spans the overnight gap, which is what D-038 refused to do for VWAP.
+
+The alternative clears the window whenever the source resumes after a gap, making
+every z-score within one continuous printing session — at the cost of blanking the
+first `lookback` live bars of every session, which is the cash open, the highest-
+value reversal window on NQ.
+
+Exposed as `ctxZreset`, **default off**, because blanking the open is a certain
+cost against a speculative one. This is a measurement to run, not a preference to
+reason about, and hardcoding either side would encode a judgement that has not
+been earned.
+
+### The invariant that should have caught this
+
+**Z can never exceed LIVE in any cell.** It is one comparison, it holds by
+construction after the fix, and it would have surfaced this without a four-round
+investigation. Added to the `ct` table (`cells with Z > LIVE`, OK/BAD over all 16)
+and to the Data Window as `00 zGTlive`.
+
+The general form is worth stating: **every counter derived from
+`request.security` at an intraday timeframe needs a liveness denominator**, and
+the check is that the derived count cannot exceed it.
+
+### The constraint this establishes — already measured, not predicted
+
+NQ's internals print on **2809 of 10014 bars, 28.0%**, and essentially all of it is
+the cash session. So **category C is structurally available on roughly a quarter of
+NQ bars, and only during RTH.** That is not a defect and cannot be tuned away.
+
+It bears directly on why C was built. C was added because E is anti-correlated
+with Q by construction — M6 fires on the reclaim, while E needs price away from the
+middle — leaving 88% of L+Q bars with no E module active. C was the escape from
+that. **The escape is unavailable outside the cash session**, which is where a
+large share of NQ bars sit. The E∩Q problem is therefore unsolved overnight rather
+than solved, and the earlier readings only looked otherwise because the gap was
+being filled with repeated prints.
