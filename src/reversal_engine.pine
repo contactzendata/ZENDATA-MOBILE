@@ -339,6 +339,14 @@ roundStep   = input.float(0.0, "  Round-number step (0 = auto)", minval = 0.0, g
 
 // ---- M2 - Structural levels  [category L, PRIMARY] ---------------------------
 // ---- Data Window readout (D-057) --------------------------------------------
+// D-063. Build marker. There is no build step, so this is bumped by hand on
+// every CODE change and the mapping to commits lives in DECISIONS. Published to
+// the Data Window because "which version is on the chart" was, for one round, an
+// unanswerable question that made a working guard indistinguishable from a
+// broken one. ABSENCE of the 00 BUILD plot is itself the answer: the build that
+// preceded this one had no marker at all.
+ENGINE_BUILD = 1
+
 grpDW = "Data Window readout"
 dwCtxSlot = input.int(1, "Context slot for the per-block plots", minval = 1, maxval = 4, group = grpDW, tooltip = "D-057. Pine caps a script at 64 plots and 34 are already committed, so the per-block breakdown cannot be emitted for all four slots at once. The per-SYMBOL totals below are emitted for all four unconditionally and answer the RAW-vs-LIVE question on their own; this selector only chooses which slot gets its four blocks broken out. Slot order follows the family map: NQ 1=TICK 2=ADD 3=VOLD 4=TRIN, GC 1=DXY 2=US10Y 3=US02Y 4=GC4. selSLOT is plotted alongside so the reading cannot be mis-attributed.")
 
@@ -1401,7 +1409,11 @@ ctxS4 = isGC ? ctxGC4   : ctxTRIN
 // will miss "GC1!" typed against a tickerid of "COMEX:GC1!" -- it is a backstop
 // for the obvious case, not a substitute for reading the RAW/LIVE row.
 f_ctxSlotOK(string sym) =>
-    str.length(str.replace_all(sym, " ", "")) > 0 and sym != syminfo.tickerid
+    c = str.replace_all(sym, " ", "")
+    // D-063: also compare against the BARE ticker. syminfo.tickerid carries the
+    // exchange ("COMEX:GC1!") and a hand-typed "GC1!" would not match it, which is
+    // the exact hole the first version of this guard left open.
+    str.length(c) > 0 and c != syminfo.tickerid and c != syminfo.ticker
 
 ctxOK1 = f_ctxSlotOK(ctxS1)
 ctxOK2 = f_ctxSlotOK(ctxS2)
@@ -2592,6 +2604,32 @@ f_ctA() =>
         table.cell(ct, 5, r0 + 2, str.tostring(tZ), text_size = size.tiny)
     0
 
+// D-063. Applies D-062 to the guard itself. "Is the slot disabled" was verified
+// by reading source, and reading source is the method with a 0-for-3 record on
+// this class of problem. A disabled slot has a derivable expected value -- RAW
+// must be exactly 0 -- so that is published as an assertion instead. The resolved
+// SYMBOL STRING is published beside it, because "enabled" does not say what the
+// slot is pointed at, and a slot pointed at the chart's own instrument was the
+// defect in the first place.
+f_ctC() =>
+    table.cell(ct, 0, 19, "-- SLOT SOURCES (D-063) --", text_size = size.tiny)
+    table.cell(ct, 1, 19, "symbol", text_size = size.tiny)
+    table.cell(ct, 2, 19, "on", text_size = size.tiny)
+    table.cell(ct, 3, 19, "RAW", text_size = size.tiny)
+    table.cell(ct, 4, 19, "assert", text_size = size.tiny)
+    table.cell(ct, 5, 19, "chart = " + syminfo.tickerid, text_size = size.tiny)
+    for q = 0 to 3
+        ssym = q == 0 ? ctxS1 : q == 1 ? ctxS2 : q == 2 ? ctxS3 : ctxS4
+        on  = q == 0 ? ctxOK1 : q == 1 ? ctxOK2 : q == 2 ? ctxOK3 : ctxOK4
+        rw  = array.get(ctxRawN, q * 4) + array.get(ctxRawN, q * 4 + 1) + array.get(ctxRawN, q * 4 + 2) + array.get(ctxRawN, q * 4 + 3)
+        table.cell(ct, 0, q + 20, "S" + str.tostring(q + 1), text_size = size.tiny)
+        table.cell(ct, 1, q + 20, ssym == "" ? "(empty)" : ssym, text_size = size.tiny)
+        table.cell(ct, 2, q + 20, on ? "1" : "0", text_size = size.tiny)
+        table.cell(ct, 3, q + 20, str.tostring(rw), text_size = size.tiny)
+        // The whole assertion: off must mean nothing came back. On says nothing.
+        table.cell(ct, 4, q + 20, on ? "-" : (rw == 0 ? "OK" : "BAD"), text_size = size.tiny)
+    0
+
 f_ctB() =>
     for s2 = 2 to 3
         nm = s2 == 2 ? ctxS3 : ctxS4
@@ -3116,9 +3154,10 @@ if sweepDebug and barstate.islast
 
 if sweepDebug and barstate.islast
     if na(ct)
-        ct := table.new(position.top_left, 6, 19, border_width = 1)
+        ct := table.new(position.top_left, 6, 24, border_width = 1)
     f_ctA()
     f_ctB()
+    f_ctC()
 
 if sweepDebug and barstate.islast
     if na(lt)
@@ -3187,7 +3226,9 @@ ctxK3 = array.get(ctxZokN,  8) + array.get(ctxZokN,  9) + array.get(ctxZokN, 10)
 ctxK4 = array.get(ctxZokN, 12) + array.get(ctxZokN, 13) + array.get(ctxZokN, 14) + array.get(ctxZokN, 15)
 dwSo  = (dwCtxSlot - 1) * 4
 
+plot(ENGINE_BUILD, "00 BUILD", display = display.data_window)
 plot(gfBars,     "00 BARS",   display = display.data_window)
+plot((ctxOK1 or ctxR1 == 0 ? 0 : 1) + (ctxOK2 or ctxR2 == 0 ? 0 : 1) + (ctxOK3 or ctxR3 == 0 ? 0 : 1) + (ctxOK4 or ctxR4 == 0 ? 0 : 1), "00 slotBAD if>0", display = display.data_window)
 plot((ctxK1 > ctxE1 ? 1 : 0) + (ctxK2 > ctxE2 ? 1 : 0) + (ctxK3 > ctxE3 ? 1 : 0) + (ctxK4 > ctxE4 ? 1 : 0), "00 zGTlive BADif>0", display = display.data_window)
 plot(dwCtxSlot,  "00 selSLOT", display = display.data_window)
 plot(ctxR1, "c1 RAW",  display = display.data_window)

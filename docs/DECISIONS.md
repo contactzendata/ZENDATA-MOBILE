@@ -2958,3 +2958,73 @@ one value across the day is the intended semantics rather than a defect, so a
 liveness denominator would be measuring nothing — noted so the exemption is
 explicit rather than an oversight. The M3/M4 intrabar calls are unbuilt and
 inherit this rule when they are written.
+
+---
+
+## D-063 — A build marker, and the guard made falsifiable rather than readable
+
+**Status:** implemented. `ENGINE_BUILD = 1`, mapped to commits in the table below.
+
+### The gap this closes
+
+GC's `c4` came back live *after* the D-061 guard shipped. Two explanations fit
+equally well — the chart was on a stale build, or the guard does not work — and
+**there was no way to tell them apart from the numbers.** That is a worse failure
+than either explanation, because it makes a working fix and a broken one look
+identical, and the obvious next move (debug the guard) is a coin flip on whether
+there is anything to debug.
+
+`ENGINE_BUILD` is published to the Data Window as `00 BUILD`. There is no build
+step, so it is bumped by hand on every **code** change; documentation-only commits
+do not move it. **Absence of the `00 BUILD` plot is itself the answer** — every
+build before this one had no marker, so if the row is missing the chart is stale.
+
+| build | commit | change |
+|---|---|---|
+| — | `d2d578a` | D-061 slot guard (no marker) |
+| 1 | this commit | marker, slot-source publication, RAW assertion |
+
+### The guard, rewritten as an assertion
+
+D-062 says a `request.security` result carries a companion counter with an
+independently derivable expected value. The D-061 guard did not comply with the
+rule written one entry earlier: whether a slot was disabled was verified **by
+reading source**, which is the method with a **0-for-3 record** on exactly this
+class of problem.
+
+A disabled slot has a derivable expected value: **RAW must be exactly 0.** That is
+now published per slot and asserted, in the `ct` table and as `00 slotBAD` in the
+Data Window.
+
+Published alongside it, and more useful than the assertion: **the resolved symbol
+string for each slot**, next to `syminfo.tickerid`. "Enabled" does not say what a
+slot is *pointed at*, and a slot pointed at the chart's own instrument was the
+original defect. Four short strings read off a table is a transcription risk worth
+taking here, because no numeric encoding of a symbol name would be checkable.
+
+### A hole the first guard genuinely left
+
+Independent of the stale-build question, the D-061 self-reference test compared
+only against `syminfo.tickerid`, which carries the exchange — `COMEX:GC1!`. A
+hand-typed `GC1!` would not have matched, and the slot would have been enabled and
+self-referential exactly as before. The test now also compares the bare
+`syminfo.ticker`.
+
+**This is a real defect in the guard, found by re-reading it rather than by the
+run** — and it is only reachable if `ctxGC4` is non-empty, which the published
+symbol string will now show directly. Whether it is what happened on this chart is
+not being guessed at; the table answers it.
+
+### What the next GC read distinguishes
+
+| `00 BUILD` | `S4` symbol | `S4 on` | reading |
+|---|---|---|---|
+| absent | — | — | stale chart. The guard was never tested |
+| 1 | `(empty)` | 0 | guard works; RAW must be 0 and `assert` must read OK |
+| 1 | anything else | 1 | the input is **not** empty. The guard was correct and the premise was wrong |
+| 1 | `(empty)` | 0, RAW > 0 | `assert` reads BAD and the guard genuinely fails. Only then is there something to debug |
+
+The third row is the one worth stating plainly: if `S4` shows a symbol, then
+nothing was ever broken except the assumption that an untouched input holds its
+default. TradingView persists input values per indicator instance, so a value set
+once survives a script update.
