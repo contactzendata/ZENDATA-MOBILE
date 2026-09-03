@@ -129,6 +129,53 @@ been re-read.
 
 ---
 
+## 3b. QUEUED — is NQ's context path worth keeping?
+
+**Not to be acted on until GC's `c4` is confirmed at 0/0/0.** Recorded now so the
+decision has its arithmetic ready.
+
+Three distinct failure modes have now been measured on the same module, on the
+same instrument:
+
+| | mode | effect on NQ |
+|---|---|---|
+| D-055/058 | **session-bound** — the internals only print during the cash session | context exists on **2965 of 10546 bars, 28.1%** |
+| D-062 (new) | **flat-print** — `USI:VOLD` repeats a value rather than not printing | VOLD yields a usable z on **2221 of 2965 live bars, 74.9%** |
+| D-059 | **unstable divisor** — consensus divides by resolved slots | the two above make the divisor move between 3 and 4 *within* the live window |
+
+### Read the compounding correctly
+
+The 744 VOLD-dark bars are **not** dark for the context path. The other three
+slots are live there, so those bars run on **three slots instead of four** — they
+are degraded, not lost. Precisely:
+
+- **All four slots usable at once: 2221 bars, 21.1% of the sample.**
+- At least three usable: 2942 bars, 27.9%.
+
+So NQ context is available on 28% of bars and *undegraded* on 21%. And the
+744-bar difference between those two figures is not a separate problem — **it is
+D-059's divisor instability, measured.** The divisor is 4 on ~2221 bars and 3 on
+~744, inside a single session, for reasons that have nothing to do with the
+market.
+
+### The question this queues
+
+Whether a context path that is absent on 72% of bars, degraded on a further 7%,
+and running an unstable divisor across the remainder earns its place — or whether
+NQ should be treated as having **no C category at all**, which would make §3 above
+(no third category overnight) a statement about NQ as a whole rather than about
+overnight.
+
+That is a larger claim than the overnight one and it should not be reached by
+accumulating small concessions. It needs the post-fix NQ numbers, and GC's `c4`
+confirmation first.
+
+**VOLD is not being fixed yet.** Whether to repair a source is a different
+question from whether to keep the module that consumes it, and repairing it first
+would foreclose the second question by making the first answer look adequate.
+
+---
+
 ## 4. Open — blocked on modules that do not exist yet
 
 | Item | What it is | Waiting on |
@@ -172,7 +219,6 @@ weights rather than module logic.
 | **`ctxZreset`** (D-060) | **deliberately undecided**, off | Bounded decaying contamination vs an unconditional per-session cost. An argument, not a measurement; queues behind uncontaminated grades. |
 | **D-059** consensus divisor | **open, now with data** | Corrected by D-061: both instruments ran a divisor of 4, not 3 vs 4. Prospectively GC is 3 and NQ 4, but GC's three slots are live 94/86/79%, so neither divisor is stable. Four options recorded, none taken. |
 | **D-061** GC slot 4 self-reference | **fixed; GC C values withdrawn** | `request.security("")` resolves to the chart symbol, so gold's own price was a wrong-signed fourth vote in gold's own context. GC's C availability stands; its C scores do not. |
-| **`USI:VOLD` flat periods** | observed, not acted on | 744 live NQ bars produced no z because the last 24 live samples were identical. A live source with no usable z on ~25% of its live bars. |
 | **Category C is RTH-only on NQ** | **structural, not fixable** | Internals print on 28.0% of bars. The escape from the E∩Q anti-correlation does not exist outside the cash session. |
 | **L-fill by level class** | not built | Would test the round-number-density hypothesis for the NQ/GC L gap (D-054). Not built pre-emptively. |
 

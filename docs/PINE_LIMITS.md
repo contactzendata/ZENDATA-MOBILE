@@ -240,3 +240,31 @@ slots plus a selector-driven per-block breakdown for one, which is what fits.
 `pinecheck.py` counts them and warns from 56 upward. Beyond that, the way to
 make room is to retire the data-window plots of closed diagnostics — the same
 disposal that D-052 applied to table rows.
+
+---
+
+## 11. `request.security` fails silently, three ways
+
+None of these raise an error. All of them return plausible numbers. Reading the
+call site did not catch any of them; a counter with a derivable expected value
+caught all three.
+
+| symptom | cause | detection |
+|---|---|---|
+| historical bars know the future | `lookahead` default | pin `barmerge.lookahead_off` at the wrapper, never per call site |
+| a quiet source still returns a value | `gaps_off` holds the last print forward | fetch the source's own bar **time**; LIVE = did it advance |
+| a slot resolves to the chart itself | **an empty symbol string means "current symbol"** | RAW = LIVE = bar count, with a warm-up offset only the chart symbol can produce |
+
+The third is the least documented and the most dangerous, because a
+self-referential slot is *always live and always plausible* — it looks like the
+healthiest source in the table.
+
+**The rule that follows is D-062:** every `request.security` result carries a
+companion counter whose expected value is computable independently of the result.
+A counter derived from the same call inherits the same fault and will agree with
+it.
+
+Daily-timeframe requests are exempt from the liveness denominator specifically —
+holding one value across the day is the intended semantics there, not staleness —
+but not from the identity check.
+

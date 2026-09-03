@@ -2886,3 +2886,75 @@ NQ c3 (`USI:VOLD`) trails LIVE by **744** rather than 23. Since the buffer never
 resets, that means 744 live bars on which the last 24 live samples were identical
 — VOLD sitting flat long enough to collapse σ. It is a live source producing no
 usable z-score on a quarter of its live bars. Recorded; not touched.
+
+### Addendum — the collinearity is the primary consequence, not the third one
+
+Recorded after review, because the original ordering understated it. The three
+consequences above are not a list of increasing severity, they are two defects and
+one invalidity:
+
+A wrong-signed vote is a **wrong** vote — it can be corrected by flipping a
+constant, and until it is corrected it is noise pointing the wrong way. Putting
+gold's own extension inside gold's context is a **structurally invalid** vote: no
+constant fixes it, because the term is not measuring context at all.
+
+D-019 does not simply want three categories, it wants three *independent* claims.
+Category C exists because E is anti-correlated with Q by construction, so the
+engine needed evidence that was not E and not Q. Slot 4 put E inside C. **On GC the
+category was compromised in precisely the dimension it existed to be independent
+in**, so a GC setup could reach three categories while carrying only two distinct
+claims — the exact failure the category count is meant to prevent.
+
+That also means the withdrawal of GC's C values is not a precision issue to be
+re-measured more carefully. Those readings were not noisy, they were not measuring
+what the schema says C measures.
+
+---
+
+## D-062 — Standing rule: every `request.security` result carries a companion counter
+
+**Status:** standing rule, promoted from three instances.
+
+`request.security` has now produced three distinct silent failures in this engine:
+
+| | failure | what it returned |
+|---|---|---|
+| D-001 | `lookahead` defaults | future data on historical bars |
+| D-058 | `gaps_off` holds values forward | a stale print, indistinguishable from live |
+| D-061 | an empty symbol string | the chart's own symbol |
+
+**All three returned plausible numbers. None raised an error. None was caught by
+reading the call site.** Each was caught by a count whose expected value could be
+derived independently and did not match: `Z > LIVE` for the hold-forward, a
+23-bar warm-up offset for the self-reference.
+
+Reading the call site has now failed three times out of three. The arithmetic has
+succeeded three times out of three. So the rule is not "be careful with
+`request.security`" — that is what was already being done, and it did not work.
+
+> **Every `request.security` result carries a companion counter whose expected
+> value can be computed independently of the result itself, and the comparison is
+> published.**
+
+"Independently" is the load-bearing word. A counter derived from the same call
+inherits the same fault and agrees with it. The liveness probe works because it
+fetches a *different field* — the source's bar time — and the warm-up offset works
+because `ctxZbars` is known a priori from an input, not read back from the data.
+
+Concretely, for each such call:
+
+1. **A liveness denominator.** Did the source actually print on this bar, from its
+   own bar time. Anything derived from it can then be checked against it, and the
+   check is that the derived count **cannot exceed** it.
+2. **An identity check.** A slot that resolves to nothing must read zero, not
+   impersonate a source. An empty or self-referential symbol is disabled outright.
+3. **A derivable offset.** Where a warm-up or lookback is involved, its length is
+   known from inputs, so the expected gap between two counters is known before the
+   run and any deviation is a finding.
+
+Existing call sites audited against this: `ctxV1..4` and `ctxT1..4` comply
+(D-055/058/061). `atrDaily` and `m5IV` request **daily** timeframe, where holding
+one value across the day is the intended semantics rather than a defect, so a
+liveness denominator would be measuring nothing — noted so the exemption is
+explicit rather than an oversight. The M3/M4 intrabar calls are unbuilt and
+inherit this rule when they are written.
