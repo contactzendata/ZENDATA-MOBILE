@@ -444,7 +444,7 @@ regimeRangeX = input.float(1.20, "Regime: block range x ADR", minval = 0.2, step
 gammaUnknownHostile = input.bool(false, "Treat Unknown gamma as hostile", group = grpM7, tooltip = "D-018 says Unknown must not be treated as FAVOURABLE. That does not make it hostile. Off by default; turning it on is a deliberately conservative stance, not a correction.")
 ctxDebug    = input.bool(true, "Show M7 diagnostics in status table", group = grpM7)
 showCrossCheck = input.bool(false, "Show derived-vs-independent cross-check", group = grpM7, tooltip = "D-042's instrument. It confirmed the counters sound and its question is CLOSED, so it is off by default -- an 88-row diagnostic table is itself a source of misreadings (D-052). Turn it on only if a counter is suspected again.")
-ctxGC4      = input.string("", "GC - 4th context (optional)", group = grpM7, tooltip = "input.string so an empty default cannot fail symbol-picker validation. Left blank it simply reports unavailable.")
+ctxGC4      = input.string("", "GC - 4th context (optional)", group = grpM7, tooltip = "input.string so an empty default cannot fail symbol-picker validation. D-061: left blank this slot is now genuinely DISABLED. It previously was not -- request.security(\"\") resolves to the CHART'S OWN SYMBOL, so an empty default fed gold's own price into gold's context consensus as a fourth independent voice, live on every bar, with ctxD4 = +1 reading an extended gold price as evidence FOR a long reversal. If you fill this, note that ctxD4 is a guess for any symbol you choose and has never been tested.")
 ctxTF       = input.timeframe("5", "Context timeframe", group = grpM7, tooltip = "Held at >= 5m: internals are noisy at 1m and a gate that flickers is worse than no gate.")
 ctxTICK     = input.symbol("USI:TICK", "NQ - TICK", group = grpM7, tooltip = "Normal range +/-600; beyond +/-1000 marks breadth exhaustion. Context-dependent: in RANGE sessions extremes mark reversals, in TRENDS they confirm momentum.")
 ctxADD      = input.symbol("USI:ADD",  "NQ - advance/decline", group = grpM7)
@@ -1389,10 +1389,32 @@ ctxS2 = isGC ? ctxUS10Y : ctxADD
 ctxS3 = isGC ? ctxUS02Y : ctxVOLD
 ctxS4 = isGC ? ctxGC4   : ctxTRIN
 
-ctxV1 = f_sec(ctxS1, ctxTF, close)
-ctxV2 = f_sec(ctxS2, ctxTF, close)
-ctxV3 = f_sec(ctxS3, ctxTF, close)
-ctxV4 = f_sec(ctxS4, ctxTF, close)
+// ---- D-061. A slot must be genuinely absent, not silently self-referential ---
+// request.security("") does NOT return na -- it resolves to the CHART's OWN
+// symbol. The empty ctxGC4 default was therefore feeding gold's own price into
+// gold's context consensus as a fourth independent voice, live on every bar.
+// Measured before the fix: GC slot 4 read RAW = LIVE = 10546 of 10546 bars with
+// z trailing by exactly the 23-bar warm-up, which only the chart symbol can do.
+//
+// Two guards, both cheap. The empty test is exact. The self-reference test is
+// best-effort: it catches an input that matches syminfo.tickerid exactly, and
+// will miss "GC1!" typed against a tickerid of "COMEX:GC1!" -- it is a backstop
+// for the obvious case, not a substitute for reading the RAW/LIVE row.
+f_ctxSlotOK(string sym) =>
+    str.length(str.replace_all(sym, " ", "")) > 0 and sym != syminfo.tickerid
+
+ctxOK1 = f_ctxSlotOK(ctxS1)
+ctxOK2 = f_ctxSlotOK(ctxS2)
+ctxOK3 = f_ctxSlotOK(ctxS3)
+ctxOK4 = f_ctxSlotOK(ctxS4)
+
+// The request itself cannot be made conditional, so the RESULT is discarded. A
+// disabled slot must read na everywhere downstream -- value, time and liveness --
+// or the diagnostic would keep reporting the phantom it was built to expose.
+ctxV1 = ctxOK1 ? f_sec(ctxS1, ctxTF, close) : na
+ctxV2 = ctxOK2 ? f_sec(ctxS2, ctxTF, close) : na
+ctxV3 = ctxOK3 ? f_sec(ctxS3, ctxTF, close) : na
+ctxV4 = ctxOK4 ? f_sec(ctxS4, ctxTF, close) : na
 
 // ---- D-055 LIVENESS PROBE. Instrument only: nothing below reads these. ------
 // request.security() with gaps_off HOLDS the last known value forward, so a
@@ -1406,14 +1428,14 @@ ctxV4 = f_sec(ctxS4, ctxTF, close)
 // when ctxTF is below the chart TF. It under-reports if ctxTF is ABOVE the chart
 // TF, where the source legitimately advances only once per HTF bar -- ctxTF is
 // 5m by default and the measurement runs on 5m, so they are aligned here.
-ctxT1 = f_sec(ctxS1, ctxTF, time * 1.0)
-ctxT2 = f_sec(ctxS2, ctxTF, time * 1.0)
-ctxT3 = f_sec(ctxS3, ctxTF, time * 1.0)
-ctxT4 = f_sec(ctxS4, ctxTF, time * 1.0)
-ctxL1 = not na(ctxT1) and ctxT1 > nz(ctxT1[1], 0.0)
-ctxL2 = not na(ctxT2) and ctxT2 > nz(ctxT2[1], 0.0)
-ctxL3 = not na(ctxT3) and ctxT3 > nz(ctxT3[1], 0.0)
-ctxL4 = not na(ctxT4) and ctxT4 > nz(ctxT4[1], 0.0)
+ctxT1 = ctxOK1 ? f_sec(ctxS1, ctxTF, time * 1.0) : na
+ctxT2 = ctxOK2 ? f_sec(ctxS2, ctxTF, time * 1.0) : na
+ctxT3 = ctxOK3 ? f_sec(ctxS3, ctxTF, time * 1.0) : na
+ctxT4 = ctxOK4 ? f_sec(ctxS4, ctxTF, time * 1.0) : na
+ctxL1 = ctxOK1 and not na(ctxT1) and ctxT1 > nz(ctxT1[1], 0.0)
+ctxL2 = ctxOK2 and not na(ctxT2) and ctxT2 > nz(ctxT2[1], 0.0)
+ctxL3 = ctxOK3 and not na(ctxT3) and ctxT3 > nz(ctxT3[1], 0.0)
+ctxL4 = ctxOK4 and not na(ctxT4) and ctxT4 > nz(ctxT4[1], 0.0)
 
 // Direction implied when the series is extreme HIGH.
 //   NQ  TICK/ADD/VOLD high = buying exhaustion -> SHORT (-1)

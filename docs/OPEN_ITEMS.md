@@ -170,7 +170,9 @@ weights rather than module logic.
 | **M7 regime gate ~72% of NQ bars** | unmeasured | State 2 dominates M7 far more than missing data does. `ctxSeparate` / `adxTrend` are placeholders. Not touched while the availability measurement is running. |
 | **GC context liveness** | **unmeasured, blocking** | `TVC:DXY` / `US10Y` / `US02Y` have not been checked for the same session-bound behaviour. Not assumed either way. GC's C column is suspect until the Data Window readout comes back from a GC run. |
 | **`ctxZreset`** (D-060) | **deliberately undecided**, off | Bounded decaying contamination vs an unconditional per-session cost. An argument, not a measurement; queues behind uncontaminated grades. |
-| **D-059** consensus divisor | **recorded, not fixed** | GC runs 3 slots to NQ's 4, so a lone extreme scores 33% higher on GC and needs a quarter less extremity to fill C. Also varies bar-to-bar now that availability is honest. Four options, none taken; the choice depends on GC's liveness numbers. |
+| **D-059** consensus divisor | **open, now with data** | Corrected by D-061: both instruments ran a divisor of 4, not 3 vs 4. Prospectively GC is 3 and NQ 4, but GC's three slots are live 94/86/79%, so neither divisor is stable. Four options recorded, none taken. |
+| **D-061** GC slot 4 self-reference | **fixed; GC C values withdrawn** | `request.security("")` resolves to the chart symbol, so gold's own price was a wrong-signed fourth vote in gold's own context. GC's C availability stands; its C scores do not. |
+| **`USI:VOLD` flat periods** | observed, not acted on | 744 live NQ bars produced no z because the last 24 live samples were identical. A live source with no usable z on ~25% of its live bars. |
 | **Category C is RTH-only on NQ** | **structural, not fixable** | Internals print on 28.0% of bars. The escape from the E∩Q anti-correlation does not exist outside the cash session. |
 | **L-fill by level class** | not built | Would test the round-number-density hypothesis for the NQ/GC L gap (D-054). Not built pre-emptively. |
 

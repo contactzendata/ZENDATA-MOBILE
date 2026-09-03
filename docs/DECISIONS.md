@@ -2778,3 +2778,111 @@ is precisely why the input exists and why this entry does not close.
 What would settle it: M7's contribution to graded setups in the first
 `ctxZlookMin` of the session, with the flag off and on. That measurement needs
 grades that are not contaminated, so it queues behind the re-runs.
+
+---
+
+## D-061 — `request.security("")` is not "no symbol". It is the chart's own symbol.
+
+**Status:** confirmed by arithmetic, fixed. Corrects D-059. GC's C *values* are
+withdrawn; GC's C *availability* stands.
+
+### What c4 was sourcing
+
+`ctxGC4` defaults to `""`, and the tooltip claimed *"left blank it simply reports
+unavailable."* That was my assumption and it was wrong. **`request.security` with
+an empty symbol string resolves to the current chart symbol.**
+
+The measurement proves it without needing the platform rule. `ctxZbars` is
+`f_bars(120)` = 24 samples on 5m, so a slot that never gaps must show Z trailing
+LIVE by exactly 23 warm-up bars:
+
+| slot | LIVE | Z | LIVE − Z |
+|---|---|---|---|
+| GC c1 DXY | 9930 | 9907 | 23 |
+| GC c2 US10Y | 9127 | 9104 | 23 |
+| GC c3 US02Y | 8287 | 8264 | 23 |
+| **GC c4** | **10546** | **10523** | **23** |
+| NQ c1 TICK | 2965 | 2942 | 23 |
+| NQ c3 VOLD | 2965 | 2221 | 744 |
+
+GC c4 printed on **10546 of 10546 bars — every bar of the gold chart** — with a
+clean warm-up and no gaps anywhere. Nothing external does that against gold's own
+session. It is gold.
+
+### Why this is worse than a wasted slot
+
+1. **Self-reference.** Gold's own price was one of four votes in gold's context
+   consensus, on essentially every bar.
+2. **The sign is backwards.** `ctxD4 = 1` for GC means *"series high → LONG gold
+   reversal"*, which is right for DXY (dollar strong → gold pressed → fade the
+   weakness) and exactly inverted for gold itself: gold extended **high** should
+   argue for a **short** reversal. So the term did not add noise, it added a
+   systematically wrong-signed vote at ¼ weight, capable of flipping `ctxEvDir`
+   whenever the three macro slots were split.
+3. **It collapsed the independence C exists for.** C was added because E is
+   anti-correlated with Q by construction. A slot carrying the instrument's own
+   extension is *collinear with M1 and M5* — so on GC, category C was partly
+   re-counting E evidence under a different letter. That is the one property C
+   was built to have, and on GC it did not have it.
+
+### Correcting D-059
+
+D-059 computed the divisor asymmetry as GC 3 against NQ 4. **Both were 4.** The
+table was therefore not a description of any measurement taken, and every number
+in it was wrong for the runs it was written about — as anticipated when the c4
+anomaly was raised.
+
+D-059's arithmetic becomes **correct prospectively**: after this fix GC genuinely
+runs three slots and NQ four, so a lone extreme does score 0.333 on GC against
+0.250 on NQ. The asymmetry it describes is real *from now on*; it simply was not
+the state of the world when it was written.
+
+A further wrinkle the fix makes visible: GC's three macro slots have different
+liveness — 9930 / 9127 / 8287 of 10546 — so GC's divisor varies between 1, 2 and
+3 rather than sitting at 3. Combined with the bar-to-bar variance already recorded
+in D-059, neither instrument has a stable divisor. That strengthens the case for
+settling D-059 rather than documenting around it, and it now has data behind it.
+
+### What comes out, and what does not
+
+**Withdrawn — GC's C values.** Every GC reading of `ctxEvid`, `m7Score`, `m7Dir`,
+the C fill-rate column and any gate count downstream of C was computed with the
+contaminated fourth slot in both numerator and divisor. Both GC runs.
+
+**Stands — GC's C availability.** `c1`–`c3` LIVE at 9930 / 9127 / 8287 of 10546
+(94.2% / 86.5% / 78.6%) is a measurement of the macro series themselves and owes
+nothing to slot 4. **GC's macro context is genuinely near-continuous, and NQ's
+internals genuinely are not.** The structural finding — 94% against 28% — survives
+intact. Only the scores computed from it do not.
+
+**Stands — everything on NQ.** `ctxTICK/ADD/VOLD/TRIN` are all non-empty, so no NQ
+slot was ever self-referential.
+
+### The fix
+
+An empty (or whitespace-only) symbol now disables its slot outright — value, time
+and liveness all `na` — so a disabled slot reads RAW 0 / LIVE 0 / Z 0 rather than
+impersonating a source. The request itself cannot be made conditional in Pine, so
+the result is discarded rather than the call avoided.
+
+Added alongside it: a slot whose symbol equals `syminfo.tickerid` is also
+disabled. That is **best-effort** — it catches an exact match and will miss `GC1!`
+typed against a tickerid of `COMEX:GC1!`. It is a backstop for the obvious case,
+not a substitute for reading the RAW/LIVE row.
+
+### The general lesson, which is the third instance
+
+`request.security` has now produced three distinct silent failures in this engine:
+it holds values forward so staleness looks live (D-058), it resolves an empty
+symbol to the chart (D-061), and `lookahead` defaults would repaint if not pinned
+(D-001). **Every one of them returns plausible numbers rather than an error.** The
+defence that worked in all three cases was the same: a denominator that makes the
+claim falsifiable — LIVE against RAW, and here a warm-up offset that could only
+have one explanation.
+
+### One observation, not acted on
+
+NQ c3 (`USI:VOLD`) trails LIVE by **744** rather than 23. Since the buffer never
+resets, that means 744 live bars on which the last 24 live samples were identical
+— VOLD sitting flat long enough to collapse σ. It is a live source producing no
+usable z-score on a quarter of its live bars. Recorded; not touched.
